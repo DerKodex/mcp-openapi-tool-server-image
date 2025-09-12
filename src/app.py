@@ -18,6 +18,7 @@ STARTUP_TIMEOUT = int(os.environ.get("STARTUP_TIMEOUT", "30"))
 MCP_SERVERS = os.environ.get("MCP_SERVERS", "").strip()
 MCP_RPC_URL = os.environ.get("MCP_RPC_URL", "").strip()  # single-server fallback
 
+
 def parse_servers(spec: str) -> Dict[str, str]:
     out: Dict[str, str] = {}
     for part in [p.strip() for p in spec.split(",") if p.strip()]:
@@ -25,6 +26,7 @@ def parse_servers(spec: str) -> Dict[str, str]:
             k, v = part.split("=", 1)
             out[k.strip()] = v.strip()
     return out
+
 
 SERVERS_CFG = parse_servers(MCP_SERVERS)
 if not SERVERS_CFG:
@@ -39,8 +41,8 @@ if not SERVERS_CFG:
 # -------------------------
 app = FastAPI(
     title="MCP OpenAPI Bridge (Granular + Multi-Server)",
-    version="0.4.0",
-    description="Self-discovering OpenAPI façade for MCP servers with granular, example-rich endpoints."
+    version="0.4.1",
+    description="Self-discovering OpenAPI façade for MCP servers with granular, example-rich endpoints.",
 )
 
 if ALLOW_ORIGINS:
@@ -52,21 +54,26 @@ if ALLOW_ORIGINS:
         allow_headers=["*"],
     )
 
+
 def require_api_key(x_api_key: Optional[str] = Header(default=None)):
     if not API_KEY:
         return
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="invalid api key")
 
+
 # -------------------------
 # HTTP client
 # -------------------------
 _client: Optional[httpx.AsyncClient] = None
+
+
 async def get_client() -> httpx.AsyncClient:
     global _client
     if _client is None:
         _client = httpx.AsyncClient(timeout=REQUEST_TIMEOUT)
     return _client
+
 
 # -------------------------
 # Per-server state
@@ -112,6 +119,7 @@ class ServerState:
                 tools[t["name"]] = t
         self.tools = tools
 
+
 SERVERS: Dict[str, ServerState] = {name: ServerState(name, url) for name, url in SERVERS_CFG.items()}
 
 # -------------------------
@@ -119,6 +127,7 @@ SERVERS: Dict[str, ServerState] = {name: ServerState(name, url) for name, url in
 # -------------------------
 def _safe(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_]", "_", name)
+
 
 def example_from_schema(schema: Dict[str, Any]) -> Any:
     if not isinstance(schema, dict):
@@ -173,6 +182,7 @@ def example_from_schema(schema: Dict[str, Any]) -> Any:
 
     return schema.get("default") or None
 
+
 def strip_fixed_fields(schema: Dict[str, Any], fixed: Dict[str, Any]) -> Dict[str, Any]:
     if not schema or schema.get("type") != "object":
         return schema
@@ -186,6 +196,7 @@ def strip_fixed_fields(schema: Dict[str, Any], fixed: Dict[str, Any]) -> Dict[st
     schema["required"] = list(req)
     return schema
 
+
 def iter_action_kind(schema: Dict[str, Any]) -> Tuple[List[str], List[str]]:
     if not isinstance(schema, Dict):
         return ([], [])
@@ -196,9 +207,13 @@ def iter_action_kind(schema: Dict[str, Any]) -> Tuple[List[str], List[str]]:
     kinds = props.get(kind_key, {}).get("enum", []) if kind_key else []
     return (actions, kinds)
 
+
 # Track what we’ve already mounted to avoid duplicates on /refresh
 _registered: set[str] = set()
 
+# -------------------------
+# Route builders
+# -------------------------
 def add_generic_routes(router: APIRouter, server: str):
     st = SERVERS[server]
 
@@ -210,19 +225,29 @@ def add_generic_routes(router: APIRouter, server: str):
         except Exception as e:
             return Response(content=f"not ready: {e}", status_code=503)
 
-    @router.post(f"/{server}/tools/list", summary=f"{server} raw MCP tool listing", dependencies=[Depends(require_api_key)])
+    @router.post(
+        f"/{server}/tools/list",
+        summary=f"{server} raw MCP tool listing",
+        dependencies=[Depends(require_api_key)],
+    )
     async def tools_list():
         await st.refresh_tools()
         return {"tools": list(st.tools.values())}
 
-    @router.post(f"/{server}/tools/call", summary=f"{server} raw MCP tool call", dependencies=[Depends(require_api_key)])
-    async def tools_call(name: str = Body(..., embed=True),
-                         arguments: Optional[Dict[str, Any]] = Body(default=None, embed=True)):
+    @router.post(
+        f"/{server}/tools/call",
+        summary=f"{server} raw MCP tool call",
+        dependencies=[Depends(require_api_key)],
+    )
+    async def tools_call(
+        name: str = Body(..., embed=True),
+        arguments: Optional[Dict[str, Any]] = Body(default=None, embed=True),
+    ):
         await st.ensure_initialized()
         return await st.rpc("tools/call", {"name": name, "arguments": arguments or {}})
 
+
 def add_schema_helpers(router: APIRouter, server: str, tool: Dict[str, Any]):
-    st = SERVERS[server]
     tname = tool["name"]
     pname = _safe(tname)
 
@@ -252,17 +277,23 @@ def add_schema_helpers(router: APIRouter, server: str, tool: Dict[str, Any]):
         tags=[f"{server}:{tname}"],
     )
 
+
 def add_tool_route(router: APIRouter, server: str, tool: Dict[str, Any]):
     st = SERVERS[server]
     tname = tool["name"]
     pname = _safe(tname)
     schema = tool.get("inputSchema") or {"type": "object"}
-    desc = (tool.get("description") or f"Call MCP tool {tname} on server {server}. "
-           f"Prefer granular endpoints below when they match your need.")
+    desc = (
+        tool.get("description")
+        or f"Call MCP tool {tname} on server {server}. Prefer granular endpoints below when they match your need."
+    )
 
-    async def handler(body: Dict[str, Any] = Body(default={}, embed=False), _tool=tname, _st=st) -> Any:
-        await _st.ensure_initialized()
-        return await _st.rpc("tools/call", {"name": _tool, "arguments": body or {}})
+    state = st
+    toolname = tname
+
+    async def handler(body: Optional[Dict[str, Any]] = Body(default=None, embed=False)) -> Any:
+        await state.ensure_initialized()
+        return await state.rpc("tools/call", {"name": toolname, "arguments": body or {}})
 
     route = APIRoute(
         path=f"/{server}/tool/{pname}",
@@ -284,18 +315,14 @@ def add_tool_route(router: APIRouter, server: str, tool: Dict[str, Any]):
                 "content": {
                     "application/json": {
                         "schema": schema,
-                        "examples": {
-                            "typical": {
-                                "summary": "Typical call",
-                                "value": example_from_schema(schema) or {}
-                            }
-                        }
+                        "examples": {"typical": {"summary": "Typical call", "value": example_from_schema(schema) or {}}},
                     }
-                }
-            }
+                },
+            },
         },
     )
     router.routes.append(route)
+
 
 def add_granular_routes(router: APIRouter, server: str, tool: Dict[str, Any]):
     st = SERVERS[server]
@@ -313,14 +340,17 @@ def add_granular_routes(router: APIRouter, server: str, tool: Dict[str, Any]):
         reduced_schema = strip_fixed_fields(schema, fixed)
         op_id = f"{server}_{tname}_{_safe(action)}"
 
-        async def handler_action(
-            body: Dict[str, Any] = Body(default={}, embed=False),
-            _fixed=fixed, _tool=tname, _st=st
-        ) -> Any:
-            args = body or {}
-            args.update(_fixed)
-            await _st.ensure_initialized()
-            return await _st.rpc("tools/call", {"name": _tool, "arguments": args})
+        state = st
+        toolname = tname
+        fixed_local = dict(fixed)
+
+        async def handler_action(body: Optional[Dict[str, Any]] = Body(default=None, embed=False)) -> Any:
+            args = {}
+            if body:
+                args.update(body)
+            args.update(fixed_local)
+            await state.ensure_initialized()
+            return await state.rpc("tools/call", {"name": toolname, "arguments": args})
 
         ex = example_from_schema(reduced_schema) or {}
         path = f"/{server}/tool/{pname}/{_safe(action)}"
@@ -344,12 +374,10 @@ def add_granular_routes(router: APIRouter, server: str, tool: Dict[str, Any]):
                     "content": {
                         "application/json": {
                             "schema": reduced_schema,
-                            "examples": {
-                                "typical": {"summary": "Typical", "value": ex}
-                            }
+                            "examples": {"typical": {"summary": "Typical", "value": ex}},
                         }
-                    }
-                }
+                    },
+                },
             },
         )
         router.routes.append(route)
@@ -374,14 +402,17 @@ def add_granular_routes(router: APIRouter, server: str, tool: Dict[str, Any]):
 
             reduced_schema = strip_fixed_fields(schema, fixed)
 
-            async def handler_action_kind(
-                body: Dict[str, Any] = Body(default={}, embed=False),
-                _fixed=fixed, _tool=tname, _st=st
-            ) -> Any:
-                args = body or {}
-                args.update(_fixed)
-                await _st.ensure_initialized()
-                return await _st.rpc("tools/call", {"name": _tool, "arguments": args})
+            state = st
+            toolname = tname
+            fixed_local = dict(fixed)
+
+            async def handler_action_kind(body: Optional[Dict[str, Any]] = Body(default=None, embed=False)) -> Any:
+                args = {}
+                if body:
+                    args.update(body)
+                args.update(fixed_local)
+                await state.ensure_initialized()
+                return await state.rpc("tools/call", {"name": toolname, "arguments": args})
 
             ex = example_from_schema(reduced_schema) or {}
             route = APIRoute(
@@ -404,15 +435,14 @@ def add_granular_routes(router: APIRouter, server: str, tool: Dict[str, Any]):
                         "content": {
                             "application/json": {
                                 "schema": reduced_schema,
-                                "examples": {
-                                    "typical": {"summary": "Typical", "value": ex}
-                                }
+                                "examples": {"typical": {"summary": "Typical", "value": ex}},
                             }
-                        }
-                    }
+                        },
+                    },
                 },
             )
             router.routes.append(route)
+
 
 # -------------------------
 # Startup / refresh
@@ -433,6 +463,7 @@ def install_routes_for_server(server: str):
             _registered.add(key_base + "::granular")
     app.include_router(router)
 
+
 @app.on_event("startup")
 async def startup():
     deadline = time.time() + STARTUP_TIMEOUT
@@ -450,6 +481,7 @@ async def startup():
         if last_err:
             raise RuntimeError(f"[{name}] startup failed: {last_err}")
 
+
 @app.get("/healthz", tags=["health"])
 async def healthz():
     try:
@@ -459,9 +491,11 @@ async def healthz():
     except Exception as e:
         return Response(status_code=503, content=f"not ready: {e}")
 
+
 @app.get("/servers", tags=["info"])
 async def servers():
     return {"servers": {k: v.rpc_url for k, v in SERVERS.items()}}
+
 
 @app.post("/refresh", tags=["admin"], dependencies=[Depends(require_api_key)])
 async def refresh():
