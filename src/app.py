@@ -291,7 +291,7 @@ async def mcp_call_tool(session, tool_name: str, args: Dict[str, Any]) -> Dict[s
 
 app = FastAPI(
     title="MCP OpenAPI Bridge (Generic, Self-Discovering)",
-    version="3.1.4",
+    version="3.1.5",
     description=textwrap.dedent(
         """\
         A generic, self-discovering OpenAPI façade for MCP servers.
@@ -312,7 +312,7 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"],
 )
 
-# --- Small, surgical: path normalizer (accept placeholders, spaces, unknown aliases)
+# --- Path normalizer (accept placeholders, spaces, unknown aliases)
 @app.middleware("http")
 async def normalize_odd_paths(request: Request, call_next):
     raw_path = request.scope.get("path") or ""
@@ -330,7 +330,6 @@ async def normalize_odd_paths(request: Request, call_next):
     if marker in decoded:
         head, tail = decoded.split(marker, 1)
         tail = tail.replace("  ", " ").strip()
-        # If there are spaces and not already split, convert spaces to slashes
         if " " in tail:
             tail = "/".join([p for p in tail.split(" ") if p])
         decoded = head + marker + tail
@@ -340,18 +339,15 @@ async def normalize_odd_paths(request: Request, call_next):
         decoded = "/mcp" + decoded
 
     # If server segment is unknown, rewrite to /mcp/… so routing always matches
-    # Pattern: "/{seg}/tool/..."
     if decoded.startswith("/") and "/tool/" in decoded:
-        first = decoded.split("/", 2)[1]  # segment after first slash
+        first = decoded.split("/", 2)[1]
         if first and first not in DISCOVERY.servers:
             decoded = "/mcp/" + decoded.split("/", 2)[2]
 
-    # Patch the path in scope if changed
     if decoded != raw_path:
         request.scope["path"] = decoded
 
     return await call_next(request)
-# -----------------------------------------------------------------------------
 
 
 @app.on_event("startup")
@@ -361,11 +357,9 @@ async def on_startup():
         cfg_obj = ServerConfig(**cfg)
         DISCOVERY.servers[cfg_obj.alias] = ServerState(cfg_obj)
 
-    # small compat alias for callers that hard-code /mcp/...
-    if "mcp" not in DISCOVERY.servers and DISCOVERY.servers:
-        first_alias, first_state = next(iter(DISCOVERY.servers.items()))
-        DISCOVERY.servers["mcp"] = first_state
-        print(f"[compat] Created alias 'mcp' -> '{first_alias}'", file=sys.stderr)
+    # Ensure a default 'mcp' alias ALWAYS exists, even if no servers provided.  # <<<
+    if "mcp" not in DISCOVERY.servers:
+        DISCOVERY.servers["mcp"] = ServerState(ServerConfig(alias="mcp"))  # cmd=None, will 503 on use  # <<<
 
     await do_discover(wait_seconds=int(os.getenv("MCP_DISCOVERY_WAIT", "0")))
 
@@ -374,10 +368,10 @@ async def do_discover(wait_seconds: int = 0) -> Dict[str, Any]:
     for alias, st in list(DISCOVERY.servers.items()):
         try:
             if st.cfg.mode == "stdio":
-                if not st.connected:
+                if not st.connected and st.cfg.cmd:
                     st.client = await mcp_connect_stdio(st.cfg)
                     st.connected = True
-                tools_raw = await mcp_list_tools(st.client)
+                tools_raw = await mcp_list_tools(st.client) if st.connected else []
             else:
                 tools_raw = []
 
@@ -590,16 +584,17 @@ async def ensure_connected(server: str) -> ServerState:
         first_alias, st = next(iter(DISCOVERY.servers.items()))
         print(f"[compat] Alias '{server}' not found; falling back to '{first_alias}'", file=sys.stderr)
 
+    # Don't 404 here — return 503 so the endpoint is considered present.        # <<<
     if not st:
-        raise HTTPException(404, f"Unknown server '{server}'")
+        raise HTTPException(503, "No MCP server configured. Set MCP_SERVERS env to a valid stdio MCP server.")  # <<<
 
     if not st.connected or not st.client:
         try:
-            if st.cfg.mode == "stdio":
+            if st.cfg.mode == "stdio" and st.cfg.cmd:
                 st.client = await mcp_connect_stdio(st.cfg)
                 st.connected = True
             else:
-                raise RuntimeError(f"Server '{st.cfg.alias}' not in stdio mode")
+                raise RuntimeError("Missing stdio cmd for MCP server")
         except Exception as e:
             raise HTTPException(503, f"Server '{st.cfg.alias}' is not connected: {e}")
 
