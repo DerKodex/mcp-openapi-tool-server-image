@@ -1,14 +1,15 @@
 import os, time, asyncio, re, json
-from typing import Any, Dict, Optional, List, Tuple
-from fastapi import FastAPI, Body, Response, HTTPException, Depends, Header
+from typing import Any, Dict, Optional, List, Tuple, Union
+from fastapi import FastAPI, Body, Response, HTTPException, Depends, Header, Request
 from fastapi.routing import APIRoute
 from fastapi import APIRouter
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import httpx
 
-# -------------------------
+# =========================
 # Config
-# -------------------------
+# =========================
 API_KEY = os.environ.get("API_KEY", "").strip()
 ALLOW_ORIGINS = os.environ.get("CORS_ALLOW_ORIGINS", "*")
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "30"))
@@ -36,13 +37,23 @@ if not SERVERS_CFG:
         # Useful for dev; can be overridden by env
         SERVERS_CFG = {"mcp": "http://localhost:8080/mcp"}
 
-# -------------------------
+# =========================
 # App
-# -------------------------
+# =========================
 app = FastAPI(
     title="MCP OpenAPI Bridge (Granular + Multi-Server)",
-    version="0.4.1",
-    description="Self-discovering OpenAPI façade for MCP servers with granular, example-rich endpoints.",
+    version="0.5.0",
+    description=(
+        "A self-discovering OpenAPI façade for MCP servers. "
+        "It generates detailed, example-rich endpoints for each MCP tool and adds granular paths when it detects "
+        "`action` and/or `kind` enums in the tool schema.\n\n"
+        "## How models should call these endpoints\n"
+        "- You may POST either `{...arguments...}` **or** `{ \"args\": { ...arguments... } }`.\n"
+        "- If a tool needs **no arguments**, you can POST an **empty body** `{}` (or omit the body entirely).\n"
+        "- Prefer granular routes like `/SERVER/tool/TOOL/get/pods` when they exist; they fix fields for you.\n"
+        "- Use `/SERVER/tool/TOOL/example` to fetch a minimal example object and `/SERVER/tool/TOOL/schema` to see the JSON Schema.\n"
+        "- If you get an error, read the `resolution` hints included in the response."
+    ),
 )
 
 if ALLOW_ORIGINS:
@@ -62,9 +73,9 @@ def require_api_key(x_api_key: Optional[str] = Header(default=None)):
         raise HTTPException(status_code=401, detail="invalid api key")
 
 
-# -------------------------
+# =========================
 # HTTP client
-# -------------------------
+# =========================
 _client: Optional[httpx.AsyncClient] = None
 
 
@@ -75,9 +86,9 @@ async def get_client() -> httpx.AsyncClient:
     return _client
 
 
-# -------------------------
+# =========================
 # Per-server state
-# -------------------------
+# =========================
 class ServerState:
     def __init__(self, name: str, rpc_url: str):
         self.name = name
@@ -93,14 +104,39 @@ class ServerState:
         payload = {"jsonrpc": "2.0", "id": str(int(time.time() * 1000)), "method": method}
         if params is not None:
             payload["params"] = params
-        resp = await client.post(self.rpc_url, json=payload, headers=headers)
-        resp.raise_for_status()
+        try:
+            resp = await client.post(self.rpc_url, json=payload, headers=headers)
+            resp.raise_for_status()
+        except httpx.ConnectError as e:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "message": f"Failed to connect to MCP server at {self.rpc_url}",
+                    "error": str(e),
+                    "resolution": [
+                        "Verify the MCP server Service/Endpoint is reachable from this pod.",
+                        f"Check that {self.rpc_url} is correct.",
+                        "Ensure NetworkPolicies allow this pod to reach the MCP service on TCP/8080 (or your port).",
+                    ],
+                },
+            )
         sid = resp.headers.get("mcp-session-id")
         if sid:
             self.session_id = sid
         data = resp.json()
         if "error" in data:
-            raise HTTPException(status_code=502, detail={"mcp_error": data["error"]})
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "message": "MCP server returned an error",
+                    "mcp_error": data["error"],
+                    "resolution": [
+                        "Confirm the tool name and argument keys match the MCP tool schema.",
+                        "Try calling /SERVER/tools/list to discover available tools.",
+                        "If RBAC- or namespace-related, try the admin server or adjust tool arguments (e.g., namespace).",
+                    ],
+                },
+            )
         return data["result"]
 
     async def ensure_initialized(self):
@@ -122,9 +158,9 @@ class ServerState:
 
 SERVERS: Dict[str, ServerState] = {name: ServerState(name, url) for name, url in SERVERS_CFG.items()}
 
-# -------------------------
-# Helpers (granular)
-# -------------------------
+# =========================
+# Helpers
+# =========================
 def _safe(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_]", "_", name)
 
@@ -208,12 +244,82 @@ def iter_action_kind(schema: Dict[str, Any]) -> Tuple[List[str], List[str]]:
     return (actions, kinds)
 
 
+def describe_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """Produce a verbose, model-friendly description of a JSON schema: required keys, optional keys, enums, and notes."""
+    desc: Dict[str, Any] = {"type": schema.get("type", "object")}
+    props = schema.get("properties", {}) if isinstance(schema, dict) else {}
+    required = set(schema.get("required", []))
+    fields: Dict[str, Dict[str, Any]] = {}
+    for k, v in props.items():
+        fields[k] = {
+            "required": k in required,
+            "type": v.get("type", "any"),
+            "enum": v.get("enum", None),
+            "default": v.get("default", None),
+            "description": v.get("description", None),
+        }
+    desc["fields"] = fields
+    desc["requiredFields"] = sorted(list(required))
+    # quick hints
+    hints = []
+    if "namespace" in props:
+        hints.append("If the tool supports Kubernetes, include `namespace` for namespace-scoped queries.")
+    if "kind" in props and props["kind"].get("enum"):
+        hints.append(f"`kind` accepts one of: {props['kind']['enum']}")
+    if "action" in props and props["action"].get("enum"):
+        hints.append(f"`action` accepts one of: {props['action']['enum']}")
+    if not required:
+        hints.append("This tool can be called with **no arguments**; send `{}` or omit the body.")
+    desc["usageHints"] = hints
+    return desc
+
+
+def normalize_body(body: Optional[Union[Dict[str, Any], list, str, int, float, bool, None]]) -> Dict[str, Any]:
+    """
+    Accept multiple shapes to be model-friendly:
+    - None -> {}
+    - {"args": {...}} -> {...}
+    - {...} -> {...}
+    Any other type -> {}
+    """
+    if body is None:
+        return {}
+    if isinstance(body, dict):
+        if "args" in body and isinstance(body["args"], dict):
+            return body["args"]
+        return body
+    # If a model accidentally sends a primitive/array, treat as no args.
+    return {}
+
+
+def make_request_body(schema: Dict[str, Any], required_default: bool) -> Dict[str, Any]:
+    """
+    Advertise both direct-body and {args:{}} body forms, and make it optional so tools can be called with no args.
+    """
+    # If schema is empty object, still expose oneOf to teach the "args" form.
+    direct = schema or {"type": "object"}
+    wrapped = {"type": "object", "properties": {"args": direct}, "required": ["args"]}
+    return {
+        "required": required_default and bool(direct.get("required")),  # still false for most, so body can be omitted
+        "content": {
+            "application/json": {
+                "schema": {"oneOf": [direct, wrapped]},
+                "examples": {
+                    "direct": {"summary": "Direct body", "value": example_from_schema(direct) or {}},
+                    "wrapped": {"summary": "Wrapped in args", "value": {"args": example_from_schema(direct) or {}}},
+                    "empty": {"summary": "No arguments", "value": {}},
+                },
+            }
+        },
+    }
+
+
 # Track what we’ve already mounted to avoid duplicates on /refresh
 _registered: set[str] = set()
 
-# -------------------------
+# =========================
 # Route builders
-# -------------------------
+# =========================
 def add_generic_routes(router: APIRouter, server: str):
     st = SERVERS[server]
 
@@ -224,6 +330,23 @@ def add_generic_routes(router: APIRouter, server: str):
             return {"ok": True, "server": server, "tools": list(st.tools.keys())}
         except Exception as e:
             return Response(content=f"not ready: {e}", status_code=503)
+
+    @router.get(
+        f"/{server}/usage",
+        summary=f"{server} model usage guide",
+        tags=["usage"],
+    )
+    async def usage_server():
+        return {
+            "howToUse": [
+                "POST either a direct JSON body `{...}` or a wrapped body `{ \"args\": { ... } }`.",
+                "If no arguments are needed, POST `{}` or omit the body.",
+                "Prefer granular endpoints like `/SERVER/tool/TOOL/get/pods` when available.",
+                "Call `/SERVER/tools/list` to discover tools (requires API key if enabled).",
+                "Use `/SERVER/tool/TOOL/schema` and `/SERVER/tool/TOOL/example` to learn arguments.",
+            ],
+            "tip": "If you receive an 'args required' type error from a client, switch to the wrapped body form: `{ \"args\": { ... } }`.",
+        }
 
     @router.post(
         f"/{server}/tools/list",
@@ -238,13 +361,35 @@ def add_generic_routes(router: APIRouter, server: str):
         f"/{server}/tools/call",
         summary=f"{server} raw MCP tool call",
         dependencies=[Depends(require_api_key)],
+        openapi_extra={
+            "x-instructions": (
+                "You can pass arguments directly as the request body, or wrapped inside an `args` object. "
+                "Both `{...}` and `{ \"args\": { ... } }` are accepted. You may also send `{}` for no-arg tools."
+            ),
+            "requestBody": make_request_body({"type": "object"}, required_default=False),
+        },
     )
     async def tools_call(
-        name: str = Body(..., embed=True),
-        arguments: Optional[Dict[str, Any]] = Body(default=None, embed=True),
+        body: Optional[Dict[str, Any]] = Body(default=None, embed=False),
+        name: Optional[str] = Header(default=None, description="Optional tool name header alternative"),
+        tool: Optional[str] = Header(default=None, description="Alternative header for tool name"),
     ):
+        args = normalize_body(body)
+        tool_name = args.pop("name", None) or name or tool  # allow passing name in args or headers
+        if not tool_name:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": "Tool name not provided.",
+                    "resolution": [
+                        "Pass the tool name in the JSON body as `{\"name\":\"<tool>\", ...}` or",
+                        "Use the `name:` or `tool:` HTTP header to specify the tool name.",
+                        "Or call a specific tool endpoint like `/SERVER/tool/TOOL`.",
+                    ],
+                },
+            )
         await st.ensure_initialized()
-        return await st.rpc("tools/call", {"name": name, "arguments": arguments or {}})
+        return await st.rpc("tools/call", {"name": tool_name, "arguments": args})
 
 
 def add_schema_helpers(router: APIRouter, server: str, tool: Dict[str, Any]):
@@ -258,6 +403,21 @@ def add_schema_helpers(router: APIRouter, server: str, tool: Dict[str, Any]):
         ex = example_from_schema(tool.get("inputSchema") or {"type": "object"})
         return {"name": tname, "arguments": ex or {}}
 
+    async def help_handler():
+        schema = tool.get("inputSchema") or {"type": "object"}
+        return {
+            "tool": tname,
+            "server": server,
+            "description": tool.get("description", "No description provided by MCP server."),
+            "schema": describe_schema(schema),
+            "howToUse": [
+                f"POST to `/{server}/tool/{_safe(tname)}` with either direct body or `{{\"args\":{{...}}}}`.",
+                f"Fetch an example body from `/{server}/tool/{_safe(tname)}/example`.",
+                f"View schema at `/{server}/tool/{_safe(tname)}/schema`.",
+                "If granular endpoints exist (action/kind), prefer those—they pre-fill some fields.",
+            ],
+        }
+
     router.add_api_route(
         path=f"/{server}/tool/{pname}/schema",
         endpoint=schema_handler,
@@ -265,7 +425,7 @@ def add_schema_helpers(router: APIRouter, server: str, tool: Dict[str, Any]):
         name=f"{server}:{tname} schema",
         summary=f"{server} → {tname} schema",
         operation_id=f"{server}_{tname}_schema",
-        tags=[f"{server}:{tname}"],
+        tags=[f"{server}:{tname}", "schema"],
     )
     router.add_api_route(
         path=f"/{server}/tool/{pname}/example",
@@ -274,7 +434,16 @@ def add_schema_helpers(router: APIRouter, server: str, tool: Dict[str, Any]):
         name=f"{server}:{tname} example",
         summary=f"{server} → {tname} example",
         operation_id=f"{server}_{tname}_example",
-        tags=[f"{server}:{tname}"],
+        tags=[f"{server}:{tname}", "example"],
+    )
+    router.add_api_route(
+        path=f"/{server}/tool/{pname}/help",
+        endpoint=help_handler,
+        methods=["GET"],
+        name=f"{server}:{tname} help",
+        summary=f"{server} → {tname} help",
+        operation_id=f"{server}_{tname}_help",
+        tags=[f"{server}:{tname}", "help"],
     )
 
 
@@ -292,8 +461,9 @@ def add_tool_route(router: APIRouter, server: str, tool: Dict[str, Any]):
     toolname = tname
 
     async def handler(body: Optional[Dict[str, Any]] = Body(default=None, embed=False)) -> Any:
+        args = normalize_body(body)
         await state.ensure_initialized()
-        return await state.rpc("tools/call", {"name": toolname, "arguments": body or {}})
+        return await state.rpc("tools/call", {"name": toolname, "arguments": args})
 
     route = APIRoute(
         path=f"/{server}/tool/{pname}",
@@ -301,24 +471,16 @@ def add_tool_route(router: APIRouter, server: str, tool: Dict[str, Any]):
         methods=["POST"],
         name=f"{server}:{tname}",
         summary=desc,
-        operation_id=f"{server}_{tname}",  # visible as function name in some planners
+        operation_id=f"{server}_{tname}",
         tags=[f"{server}:{tname}"],
         dependencies=[Depends(require_api_key)],
         openapi_extra={
             "x-instructions": (
-                "Generic form of the tool. "
-                "Use a more specific /{server}/tool/{tool}/{action}[/{kind}] endpoint if available. "
-                "Send JSON matching the schema; omit fields fixed by granular endpoints."
+                "You may POST either a direct JSON body or `{ \"args\": { ... } }`. "
+                "If no arguments are needed, POST `{}` or omit the body. "
+                "Use granular endpoints like `/SERVER/tool/TOOL/{action}/{kind}` when available."
             ),
-            "requestBody": {
-                "required": True,
-                "content": {
-                    "application/json": {
-                        "schema": schema,
-                        "examples": {"typical": {"summary": "Typical call", "value": example_from_schema(schema) or {}}},
-                    }
-                },
-            },
+            "requestBody": make_request_body(schema, required_default=False),
         },
     )
     router.routes.append(route)
@@ -329,6 +491,7 @@ def add_granular_routes(router: APIRouter, server: str, tool: Dict[str, Any]):
     schema = tool.get("inputSchema") or {"type": "object"}
     actions, kinds = iter_action_kind(schema)
     if not actions and not kinds:
+        # still add a /help for completeness
         return
 
     tname = tool["name"]
@@ -345,9 +508,7 @@ def add_granular_routes(router: APIRouter, server: str, tool: Dict[str, Any]):
         fixed_local = dict(fixed)
 
         async def handler_action(body: Optional[Dict[str, Any]] = Body(default=None, embed=False)) -> Any:
-            args = {}
-            if body:
-                args.update(body)
+            args = normalize_body(body)
             args.update(fixed_local)
             await state.ensure_initialized()
             return await state.rpc("tools/call", {"name": toolname, "arguments": args})
@@ -360,27 +521,46 @@ def add_granular_routes(router: APIRouter, server: str, tool: Dict[str, Any]):
             methods=["POST"],
             name=f"{server}:{tname}:{action}",
             summary=f"{server} → {tname} → {action}",
-            description=(f"Fixes `action: \"{action}\"`. Provide only the remaining fields in the body."),
+            description=(f"Fixes `action: \"{action}\"`. Provide only the remaining fields in the body, if any."),
             operation_id=op_id,
             tags=[f"{server}:{tname}", action],
             dependencies=[Depends(require_api_key)],
             openapi_extra={
                 "x-instructions": (
                     f"Use this when the desired action is '{action}'. "
-                    "Do not include the fixed field `action` in the request body; it is implied by the path."
+                    "You may POST `{}` for action-only calls or add remaining fields. "
+                    "Direct body or `{ \"args\": { ... } }` are both accepted."
                 ),
-                "requestBody": {
-                    "required": True,
-                    "content": {
-                        "application/json": {
-                            "schema": reduced_schema,
-                            "examples": {"typical": {"summary": "Typical", "value": ex}},
-                        }
-                    },
-                },
+                "requestBody": make_request_body(reduced_schema, required_default=False),
             },
         )
         router.routes.append(route)
+
+        # Action help
+        async def handler_action_help():
+            return {
+                "tool": tname,
+                "server": server,
+                "action": action,
+                "fixed": fixed_local,
+                "remainingSchema": describe_schema(reduced_schema),
+                "exampleBody": ex,
+                "howToUse": [
+                    f"POST to `{path}` with optional remaining fields.",
+                    "You can send `{}` if no additional fields are required.",
+                    "Body can be direct or wrapped as `{ \"args\": { ... } }`.",
+                ],
+            }
+
+        router.add_api_route(
+            path=f"{path}/help",
+            endpoint=handler_action_help,
+            methods=["GET"],
+            name=f"{server}:{tname}:{action}:help",
+            summary=f"{server} → {tname} → {action} help",
+            operation_id=f"{op_id}_help",
+            tags=[f"{server}:{tname}", action, "help"],
+        )
 
     # Action + kind (or kind only): /{server}/tool/{tool}/{action}/{kind}
     for action in actions or ["_"]:
@@ -405,48 +585,65 @@ def add_granular_routes(router: APIRouter, server: str, tool: Dict[str, Any]):
             state = st
             toolname = tname
             fixed_local = dict(fixed)
+            path = f"/{server}/tool/{pname}/{suffix}"
 
             async def handler_action_kind(body: Optional[Dict[str, Any]] = Body(default=None, embed=False)) -> Any:
-                args = {}
-                if body:
-                    args.update(body)
+                args = normalize_body(body)
                 args.update(fixed_local)
                 await state.ensure_initialized()
                 return await state.rpc("tools/call", {"name": toolname, "arguments": args})
 
             ex = example_from_schema(reduced_schema) or {}
             route = APIRoute(
-                path=f"/{server}/tool/{pname}/{suffix}",
+                path=path,
                 endpoint=handler_action_kind,
                 methods=["POST"],
                 name=f"{server}:{tname}:{summary}",
                 summary=summary,
-                description=f"Convenience endpoint. {desc} Provide only remaining fields.",
+                description=f"Convenience endpoint. {desc} Provide only remaining fields (if any).",
                 operation_id=op_id,
                 tags=tags,
                 dependencies=[Depends(require_api_key)],
                 openapi_extra={
                     "x-instructions": (
                         "Prefer this endpoint when both action and resource kind are known. "
-                        "Omit any fixed fields; they are implied by the path."
+                        "You can POST `{}` for no-arg calls, or include the remaining fields. "
+                        "Direct body or `{ \"args\": { ... } }` are both accepted."
                     ),
-                    "requestBody": {
-                        "required": True,
-                        "content": {
-                            "application/json": {
-                                "schema": reduced_schema,
-                                "examples": {"typical": {"summary": "Typical", "value": ex}},
-                            }
-                        },
-                    },
+                    "requestBody": make_request_body(reduced_schema, required_default=False),
                 },
             )
             router.routes.append(route)
 
+            # Help for action/kind
+            async def handler_action_kind_help():
+                return {
+                    "tool": tname,
+                    "server": server,
+                    "fixed": fixed_local,
+                    "remainingSchema": describe_schema(reduced_schema),
+                    "exampleBody": ex,
+                    "howToUse": [
+                        f"POST to `{path}` with optional remaining fields.",
+                        "You can send `{}` if no additional fields are required.",
+                        "Body can be direct or wrapped as `{ \"args\": { ... } }`.",
+                    ],
+                }
 
-# -------------------------
+            router.add_api_route(
+                path=f"{path}/help",
+                endpoint=handler_action_kind_help,
+                methods=["GET"],
+                name=f"{server}:{tname}:{summary}:help",
+                summary=f"{summary} help",
+                operation_id=f"{op_id}_help",
+                tags=tags + ["help"],
+            )
+
+
+# =========================
 # Startup / refresh
-# -------------------------
+# =========================
 def install_routes_for_server(server: str):
     """Idempotently mount routes for a server & its tools."""
     st = SERVERS[server]
@@ -503,3 +700,46 @@ async def refresh():
         await st.refresh_tools()
         install_routes_for_server(name)
     return {"ok": True, "servers": {k: list(v.tools.keys()) for k, v in SERVERS.items()}}
+
+
+# =========================
+# Error handlers with guidance
+# =========================
+@app.exception_handler(HTTPException)
+async def http_exc_handler(request: Request, exc: HTTPException):
+    # If the detail is already a dict with resolution tips, just return it.
+    if isinstance(exc.detail, dict):
+        payload = exc.detail
+    else:
+        payload = {"message": str(exc.detail)}
+    # Add generic guidance if missing
+    if "resolution" not in payload:
+        tips = [
+            "If this is an argument error, POST either a direct body `{...}` or `{ \"args\": { ... } }`.",
+            "Call `/SERVER/tools/list` and `/SERVER/tool/TOOL/schema` to inspect available tools and fields.",
+            "Use `/SERVER/tool/TOOL/example` to get a minimal valid body.",
+            "Prefer granular endpoints like `/SERVER/tool/TOOL/get/pods` when available.",
+        ]
+        # Hint for auth
+        if exc.status_code == 401:
+            tips.insert(0, "Include the `X-Api-Key` header if the bridge was configured with API_KEY.")
+        if exc.status_code == 422:
+            tips.insert(0, "Ensure the request body is a JSON object (or `{ \"args\": { ... } }`).")
+        payload["resolution"] = tips
+    return JSONResponse(status_code=exc.status_code, content=payload)
+
+
+@app.exception_handler(Exception)
+async def unhandled_exc_handler(request: Request, exc: Exception):
+    return JSONResponse(
+        status_code=500,
+        content={
+            "message": f"Unhandled error: {type(exc).__name__}",
+            "error": str(exc),
+            "resolution": [
+                "Retry the request with a simpler body or `{}`.",
+                "Check bridge pod logs for stack traces.",
+                "Verify MCP server availability and NetworkPolicy.",
+            ],
+        },
+    )
