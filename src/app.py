@@ -1,11 +1,13 @@
 # app.py
 import os, time, asyncio, re, json
 from typing import Any, Dict, Optional, List, Tuple, Union
-from fastapi import FastAPI, Body, Response, HTTPException, Depends, Header, Request, Query, Path
+from fastapi import (
+    FastAPI, Body, Response, HTTPException, Depends, Header,
+    Request, Query, Path
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.openapi.utils import get_openapi
-from starlette.routing import Match
 import httpx
 
 # =========================
@@ -37,14 +39,14 @@ SERVERS_CFG = parse_servers(MCP_SERVERS) or ({"mcp": MCP_RPC_URL} if MCP_RPC_URL
 # =========================
 app = FastAPI(
     title="MCP OpenAPI Bridge (Generic, Self-Discovering)",
-    version="2.0.0",
+    version="2.2.0",
     description=(
         "A generic, self-discovering OpenAPI façade for MCP servers.\n"
         "It discovers tools, prompts, and resources from MCP and exposes:\n"
         "• One generic GET/POST endpoint per tool\n"
         "• Auto-generated granular endpoints for each `action`/`kind` enum combination\n"
         "All endpoints accept GET (query) and POST (JSON); request bodies are optional.\n"
-        "Use `{}` for empty POST bodies. If you cannot send a body, use GET with `?args={...}` or individual `?key=value`."
+        "Use `{}` for empty POST bodies. If you cannot send a body, use GET with `?args={...}` or `?key=value`."
     ),
 )
 
@@ -128,7 +130,7 @@ class ServerState:
                     "mcp_error": data["error"],
                     "resolution": [
                         "Confirm tool name and argument keys match the tool schema.",
-                        "Call `/SERVER/tools/list` and `/SERVER/tool/TOOL/schema` to verify fields.",
+                        "Call `/{SERVER}/tools/list` and `/{SERVER}/tool/{TOOL}/schema` to verify fields.",
                         "If RBAC/namespace related, try the admin server or pass `namespace`.",
                     ],
                 },
@@ -151,8 +153,6 @@ class ServerState:
         try:
             prompts_result = await self.rpc("prompts/list")
             self.prompts = prompts_result.get("prompts", prompts_result if isinstance(prompts_result, list) else [])
-        except HTTPException:
-            self.prompts = []
         except Exception:
             self.prompts = []
 
@@ -160,8 +160,6 @@ class ServerState:
         try:
             res_result = await self.rpc("resources/list")
             self.resources = res_result.get("resources", res_result if isinstance(res_result, list) else [])
-        except HTTPException:
-            self.resources = []
         except Exception:
             self.resources = []
 
@@ -287,6 +285,61 @@ def iter_action_kind(schema: Dict[str, Any]) -> Tuple[List[str], List[str]]:
     kinds = props.get(kind_key, {}).get("enum", []) if kind_key else []
     return (actions, kinds)
 
+# ---- Argstring composer (for kubectl-like tools) ----
+_CONVENIENCE_KEYS = ["namespace","name","labels","labelSelector","fieldSelector","container","sinceSeconds"]
+def _looks_kubectl_like(tool_name: str, description: str, schema: Dict[str, Any]) -> bool:
+    text = (tool_name + " " + (description or "")).lower()
+    has_ops = any(k in (schema.get("properties") or {}) for k in ("operation","action"))
+    has_resource = any(k in (schema.get("properties") or {}) for k in ("resource","kind"))
+    has_args = (schema.get("properties") or {}).get("args",{}).get("type") == "string"
+    return has_ops and has_resource and has_args and ("kubectl" in text or "kubernetes" in text)
+
+def _append_flag(parts: List[str], flag: str, value: Optional[str]):
+    if value is None or value == "": return
+    if " " in value:
+        parts.append(f"{flag} '{value}'")
+    else:
+        parts.append(f"{flag} {value}")
+
+def enrich_argstring(call_args: Dict[str, Any], schema: Dict[str, Any], tool_name: str, description: str):
+    """If the tool requires args:string and caller passed convenience params,
+       auto-compose args (e.g., name + -n namespace + selectors)."""
+    props = (schema or {}).get("properties", {})
+    if props.get("args", {}).get("type") != "string":
+        return
+    if not _looks_kubectl_like(tool_name, description, schema):
+        return
+    # Already provided args? keep and just append missing pieces
+    arg_parts: List[str] = []
+    raw = str(call_args.get("args") or "").strip()
+    if raw:
+        arg_parts.append(raw)
+
+    name = call_args.pop("name", None)
+    namespace = call_args.pop("namespace", None)
+    labels = call_args.pop("labels", None) or call_args.pop("labelSelector", None)
+    field_selector = call_args.pop("fieldSelector", None)
+    container = call_args.pop("container", None)
+    since_seconds = call_args.pop("sinceSeconds", None)
+
+    # name first (positional)
+    if name: arg_parts.insert(0, name)
+    # namespace
+    _append_flag(arg_parts, "-n", namespace)
+    # selectors
+    if labels: _append_flag(arg_parts, "-l", labels)
+    if field_selector: _append_flag(arg_parts, "--field-selector", field_selector)
+    # logs-specific convenience
+    if container: _append_flag(arg_parts, "-c", container)
+    if since_seconds is not None:
+        try:
+            ss = int(since_seconds)
+            _append_flag(arg_parts, "--since", f"{ss}s")
+        except Exception:
+            pass
+
+    call_args["args"] = " ".join(arg_parts).strip()
+
 # =========================
 # Discovery loop
 # =========================
@@ -316,7 +369,7 @@ async def startup():
     asyncio.create_task(background_poller())
 
 # =========================
-# Health / discovery endpoints
+# Health / discovery / tool list
 # =========================
 @app.get("/livez", tags=["health"])
 async def livez(): return {"ok": True}
@@ -338,6 +391,14 @@ async def healthz():
 
 @app.get("/servers", tags=["info"])
 async def servers_info(): return {"servers": {k: v.rpc_url for k, v in SERVERS.items()}}
+
+@app.get("/{server}/tools/list", tags=["discovery"], dependencies=PUBLIC_OR_AUTH)
+async def tools_list(server: str):
+    st = SERVERS.get(server)
+    if not st:
+        raise HTTPException(status_code=404, detail={"message": f"Unknown server '{server}'"})
+    # ensure recent snapshot
+    return {"tools": list(st.tools.values())}
 
 @app.post("/discover", tags=["discovery"], dependencies=PUBLIC_OR_AUTH)
 async def discover_endpoint(wait: Optional[int] = Query(default=0, description="Seconds to wait (max 10) for discovery")):
@@ -390,9 +451,10 @@ async def tool_dispatch(
         raise HTTPException(status_code=404, detail={"message": f"Tool '{tool_name}' not found on server '{server}'."})
 
     schema = tool.get("inputSchema") or {"type":"object"}
+    description = tool.get("description", "")
     call_args = normalize_body(body, schema, args, request)
 
-    # handle helper suffixes
+    # helper suffixes
     if suffix == ["schema"]:
         return schema
     if suffix == ["example"]:
@@ -401,7 +463,7 @@ async def tool_dispatch(
         return {
             "tool": tool_name,
             "server": server,
-            "description": tool.get("description", "No description provided by MCP server."),
+            "description": description or "No description provided by MCP server.",
             "schema": describe_schema(schema),
             "howToUse": [
                 f"POST {PUBLIC_BASE_URL}/{server}/tool/{_safe(tool_name)} with JSON; if no args, send {{}}.",
@@ -414,7 +476,6 @@ async def tool_dispatch(
         await st.ensure_initialized()
         return await st.rpc("tools/call", {"name": tool_name, "arguments": {}})
     if suffix == ["invoke"]:
-        # GET form = same as base GET
         await st.ensure_initialized()
         return await st.rpc("tools/call", {"name": tool_name, "arguments": call_args})
 
@@ -425,8 +486,11 @@ async def tool_dispatch(
         fixed["action"] = suffix[0]
     if len(suffix) >= 2:
         fixed["kind"] = suffix[1]
-
     call_args.update(fixed)
+
+    # Compose argstring (kubectl-like tools)
+    enrich_argstring(call_args, schema, tool_name, description)
+
     await st.ensure_initialized()
     return await st.rpc("tools/call", {"name": tool_name, "arguments": call_args})
 
@@ -442,6 +506,7 @@ async def http_exc_handler(request: Request, exc: HTTPException):
             "Fallbacks: GET '/try' or '/invoke' for zero-arg, or pass `?args={...}` / `?key=value`.",
             "Discover tools via `/{SERVER}/tools/list` (GET) and inspect fields with `/tool/{TOOL}/schema`.",
             "Use `/tool/{TOOL}/example` or granular endpoints like `/{SERVER}/tool/{TOOL}/{action}/{kind}`.",
+            "If the tool requires `args` (string), pass it OR provide convenience params like `namespace`, `name`, etc.; the bridge will construct the argstring.",
         ]
         if exc.status_code == 401:
             tips.insert(0, "Include the `X-Api-Key` header if the bridge was configured with API_KEY.")
@@ -469,19 +534,36 @@ async def unhandled_exc_handler(request: Request, exc: Exception):
 # =========================
 # OpenAPI builder (non-blocking) – synthesize spec from MCP data
 # =========================
-_COMMON_QUERY_PARAMS = [
-    {"name": "args","in": "query","required": False,
-     "description": "JSON-encoded arguments fallback, e.g. ?args={\"namespace\":\"ollama\",\"kind\":\"pods\",\"action\":\"get\"}",
-     "schema": {"type": "string"}},
+_COMMON_CONVENIENCE = [
+    {"name": "namespace", "in": "query", "required": False, "schema": {"type":"string"},
+     "description": "Convenience param; auto-translated into argstring (e.g., '-n <namespace>')."},
+    {"name": "name", "in": "query", "required": False, "schema": {"type":"string"},
+     "description": "Convenience param; resource name; placed positionally before flags in argstring."},
+    {"name": "labels", "in": "query", "required": False, "schema": {"type":"string"},
+     "description": "Convenience param; label selector; becomes '-l <labels>'."},
+    {"name": "labelSelector", "in": "query", "required": False, "schema": {"type":"string"},
+     "description": "Convenience alias for 'labels'."},
+    {"name": "fieldSelector", "in": "query", "required": False, "schema": {"type":"string"},
+     "description": "Convenience param; becomes '--field-selector <expr>'."},
+    {"name": "container", "in": "query", "required": False, "schema": {"type":"string"},
+     "description": "Convenience param for logs; becomes '-c <container>'."},
+    {"name": "sinceSeconds", "in": "query", "required": False, "schema": {"type":"integer"},
+     "description": "Convenience param for logs; becomes '--since <N>s'."},
+    {"name": "args", "in": "query", "required": False, "schema": {"type":"string"},
+     "description": "Raw argstring fallback (JSON body still preferred)."},
 ]
 
-def _op_params_with_schema(schema: Dict[str, Any]) -> List[Dict[str, Any]]:
-    params = list(_COMMON_QUERY_PARAMS)
+def _op_params_with_schema(schema: Dict[str, Any], argstring_required: bool, include_convenience=True) -> List[Dict[str, Any]]:
+    params: List[Dict[str, Any]] = []
+    # Query fallbacks for actual schema fields
     props = (schema or {}).get("properties", {}) if isinstance(schema, dict) else {}
     for k, v in props.items():
         params.append({"name": k, "in": "query", "required": False,
                        "description": v.get("description", f"Query param for '{k}'"),
                        "schema": {"type": v.get("type","string")}})
+    if include_convenience and argstring_required:
+        # Convenience NL params → argstring composer
+        params.extend(_COMMON_CONVENIENCE)
     return params
 
 def _make_request_body(schema: Dict[str, Any], required: bool=False) -> Dict[str, Any]:
@@ -501,26 +583,47 @@ def _make_request_body(schema: Dict[str, Any], required: bool=False) -> Dict[str
         },
     }
 
-def _nl_examples_from(tool_name: str, schema: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _parse_examples_from_description(desc: str) -> List[str]:
+    """Extract example lines from MCP tool descriptions (best-effort)."""
+    out: List[str] = []
+    for line in (desc or "").splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith("- "):
+            out.append(s[2:])
+        elif "operation=" in s or "args=" in s or "resource=" in s:
+            out.append(s)
+    return out[:12]
+
+def _nl_examples_from(tool_name: str, schema: Dict[str, Any], description: str) -> List[Dict[str, Any]]:
     actions, kinds = iter_action_kind(schema)
+    props = schema.get("properties", {}) if isinstance(schema, dict) else {}
+    has_ns = "namespace" in props or _looks_kubectl_like(tool_name, description, schema)
     exs: List[Dict[str, Any]] = []
-    if "namespace" in (schema.get("properties") or {}):
-        if actions and "get" in actions and (not kinds or "pods" in kinds):
+    if has_ns:
+        if (("action" in props or "operation" in props) and ("kind" in props or "resource" in props)):
             exs.append({
                 "intent": "List all pods in the ollama namespace",
                 "calls": [
                     {"GET": f"/{{SERVER}}/tool/{_safe(tool_name)}/get/pods?namespace=ollama"},
                     {"POST": f"/{{SERVER}}/tool/{_safe(tool_name)}/get/pods", "body": {"namespace":"ollama"}},
-                    {"POST": f"/{{SERVER}}/tool/{_safe(tool_name)}", "body": {"action":"get","kind":"pods","namespace":"ollama"}},
-                ]
+                    {"POST": f"/{{SERVER}}/tool/{_safe(tool_name)}", "body": {"action":"get","kind":"pods","namespace":"ollama","args":""}},
+                ],
+                "notes": ["If the tool requires `args` (string), the bridge will compose '-n ollama' automatically from `namespace`."]
             })
-        exs.append({
-            "intent": "Describe the apisix pod in the apisix namespace",
-            "calls": [
-                {"GET": f"/{{SERVER}}/tool/{_safe(tool_name)}/describe/pods?namespace=apisix&name=apisix"},
-                {"POST": f"/{{SERVER}}/tool/{_safe(tool_name)}/describe/pods", "body": {"namespace":"apisix","name":"apisix"}},
-            ]
-        })
+            exs.append({
+                "intent": "Describe the apisix pod in the apisix namespace",
+                "calls": [
+                    {"GET": f"/{{SERVER}}/tool/{_safe(tool_name)}/describe/pods?namespace=apisix&name=apisix"},
+                    {"POST": f"/{{SERVER}}/tool/{_safe(tool_name)}/describe/pods", "body": {"namespace":"apisix","name":"apisix"}},
+                ],
+                "notes": ["`name` becomes positional; `namespace` becomes '-n apisix' in argstring if needed."]
+            })
+    # Also surface raw lines from description as hints
+    parsed = _parse_examples_from_description(description)
+    if parsed:
+        exs.append({"intent": "Examples from MCP description", "lines": parsed})
     return exs
 
 def _compose_paths_from_mcp() -> Tuple[Dict[str, Any], Dict[str, Any]]:
@@ -530,63 +633,71 @@ def _compose_paths_from_mcp() -> Tuple[Dict[str, Any], Dict[str, Any]]:
     for server, st in SERVERS.items():
         for tname, t in st.tools.items():
             schema = t.get("inputSchema") or {"type":"object"}
+            desc = t.get("description", "") or ""
             safe = _safe(tname)
             tool_base = f"/{server}/tool/{safe}"
             actions, kinds = iter_action_kind(schema)
-
-            # Schema component per tool
             comp_name = f"Args_{_safe(server)}_{safe}"
             components["schemas"][comp_name] = schema
+            props = schema.get("properties", {}) if isinstance(schema, dict) else {}
+            argstring_required = props.get("args", {}).get("type") == "string"
 
-            # Base GET/POST + helpers
+            # Base GET/POST
             for method in ("get","post"):
+                opid = f"{server}_{safe}_base_{method}"
                 op = {
                     "tags": [f"{server}:{tname}"],
-                    "summary": t.get("description", f"{server} → {tname}"),
-                    "operationId": f"{server}_{safe}_{method}",
+                    "summary": t.get("title", tname),
+                    "operationId": opid,
                     "description": (
-                        (t.get("description") or "") + "\n\n"
+                        (desc or tname) + "\n\n"
                         "CALLING RULES:\n"
                         "• Prefer POST with a JSON object body. If you have no arguments, send `{}`.\n"
                         "• If you cannot send a body: pass `?args={...}` or individual `?key=value`.\n"
                         "• Granular paths like '/{server}/tool/{tool}/{action}[/{kind}]' imply fixed fields."
+                        + ("\n• This tool expects an argstring. You may pass convenience params (`namespace`, `name`, etc.); the bridge will compose it." if argstring_required else "")
                     ).strip(),
-                    "parameters": _op_params_with_schema(schema),
+                    "parameters": _op_params_with_schema(schema, argstring_required),
                     "responses": {"200": {"description": "OK"}},
+                    "x-usage": {
+                        "schema": describe_schema(schema),
+                        "argstringRequired": argstring_required,
+                        "naturalExamples": _nl_examples_from(tname, schema, desc),
+                    },
                 }
                 if method == "post":
                     op["requestBody"] = _make_request_body(schema, required=False)
                 paths.setdefault(tool_base, {})[method] = op
 
-            # /invoke, /schema, /example, /help, /try
+            # helpers
             paths.setdefault(f"{tool_base}/invoke", {})["get"]  = {
                 "tags": [f"{server}:{tname}", "invoke"],
-                "summary": f"{server} → {tname} (GET /invoke)",
+                "summary": f"{tname} (GET /invoke)",
                 "operationId": f"{server}_{safe}_invoke",
-                "parameters": _op_params_with_schema(schema),
+                "parameters": _op_params_with_schema(schema, argstring_required),
                 "responses": {"200": {"description": "OK"}},
             }
             paths.setdefault(f"{tool_base}/schema", {})["get"]  = {
                 "tags": [f"{server}:{tname}", "schema"],
-                "summary": f"{server} → {tname} schema",
+                "summary": f"{tname} schema",
                 "operationId": f"{server}_{safe}_schema",
                 "responses": {"200": {"description": "OK"}},
             }
             paths.setdefault(f"{tool_base}/example", {})["get"] = {
                 "tags": [f"{server}:{tname}", "example"],
-                "summary": f"{server} → {tname} example",
+                "summary": f"{tname} example",
                 "operationId": f"{server}_{safe}_example",
                 "responses": {"200": {"description": "OK"}},
             }
             paths.setdefault(f"{tool_base}/help", {})["get"]    = {
                 "tags": [f"{server}:{tname}", "help"],
-                "summary": f"{server} → {tname} help",
+                "summary": f"{tname} help",
                 "operationId": f"{server}_{safe}_help",
                 "responses": {"200": {"description": "OK"}},
             }
             paths.setdefault(f"{tool_base}/try", {})["get"]     = {
                 "tags": [f"{server}:{tname}", "try"],
-                "summary": f"{server} → {tname} zero-arg try",
+                "summary": f"{tname} zero-arg try",
                 "description": "Calls this tool with `{}` (no arguments).",
                 "operationId": f"{server}_{safe}_try",
                 "responses": {"200": {"description": "OK"}},
@@ -598,21 +709,27 @@ def _compose_paths_from_mcp() -> Tuple[Dict[str, Any], Dict[str, Any]]:
                 for action in actions or []:
                     p = f"{tool_base}/{_safe(action)}"
                     for method in ("get","post"):
+                        opid = f"{server}_{safe}_{_safe(action)}_{method}"
                         op = {
                             "tags": [f"{server}:{tname}", action],
-                            "summary": f"{server} → {tname} → {action}",
-                            "operationId": f"{server}_{safe}_{_safe(action)}_{method}",
-                            "description": f"Fixes `action: \"{action}\"`. Provide only remaining fields.",
-                            "parameters": _op_params_with_schema(schema),
+                            "summary": f"{tname} → {action}",
+                            "operationId": opid,
+                            "description": f"Fixes `action: \"{action}\"`. Provide only remaining fields."
+                                           + ("\nConvenience params (`namespace`, `name`, etc.) are accepted and composed into the argstring." if argstring_required else ""),
+                            "parameters": _op_params_with_schema(schema, argstring_required),
                             "responses": {"200": {"description": "OK"}},
-                            "x-naturalExamples": _nl_examples_from(tname, schema),
+                            "x-usage": {
+                                "schema": describe_schema(schema),
+                                "argstringRequired": argstring_required,
+                                "naturalExamples": _nl_examples_from(tname, schema, desc),
+                            },
                         }
                         if method == "post":
                             op["requestBody"] = _make_request_body(schema, required=False)
                         paths.setdefault(p, {})[method] = op
                     paths.setdefault(f"{p}/try", {})["get"] = {
                         "tags": [f"{server}:{tname}", action, "try"],
-                        "summary": f"{server} → {tname} → {action} zero-arg try",
+                        "summary": f"{tname} → {action} zero-arg try",
                         "operationId": f"{server}_{safe}_{_safe(action)}_try",
                         "responses": {"200": {"description": "OK"}},
                     }
@@ -628,24 +745,30 @@ def _compose_paths_from_mcp() -> Tuple[Dict[str, Any], Dict[str, Any]]:
                     suffix = f"{_safe(kind)}" if action == "_" else f"{_safe(action)}/{_safe(kind)}"
                     p = f"{tool_base}/{suffix}"
                     for method in ("get","post"):
+                        opid = f"{server}_{safe}_{suffix.replace('/','_')}_{method}"
                         op = {
                             "tags": [f"{server}:{tname}", *( [] if action=="_" else [action] ), kind],
-                            "summary": f"{server} → {tname} → {(kind if action=='_' else action+'/'+kind)}",
-                            "operationId": f"{server}_{safe}_{suffix.replace('/','_')}_{method}",
+                            "summary": f"{tname} → {(kind if action=='_' else action+'/'+kind)}",
+                            "operationId": opid,
                             "description": (
                                 (f"Fixes `kind: \"{kind}\"`." if action=="_" else f"Fixes `action: \"{action}\"` and `kind: \"{kind}\"`. ")
                                 + "Provide only remaining fields."
+                                + ("\nConvenience params (`namespace`, `name`, etc.) are accepted and composed into the argstring." if argstring_required else "")
                             ),
-                            "parameters": _op_params_with_schema(schema),
+                            "parameters": _op_params_with_schema(schema, argstring_required),
                             "responses": {"200": {"description": "OK"}},
-                            "x-naturalExamples": _nl_examples_from(tname, schema),
+                            "x-usage": {
+                                "schema": describe_schema(schema),
+                                "argstringRequired": argstring_required,
+                                "naturalExamples": _nl_examples_from(tname, schema, desc),
+                            },
                         }
                         if method == "post":
                             op["requestBody"] = _make_request_body(schema, required=False)
                         paths.setdefault(p, {})[method] = op
                     paths.setdefault(f"{p}/try", {})["get"] = {
                         "tags": [f"{server}:{tname}", *( [] if action=="_" else [action] ), kind, "try"],
-                        "summary": f"{server} → {tname} → {(kind if action=='_' else action+'/'+kind)} zero-arg try",
+                        "summary": f"{tname} → {(kind if action=='_' else action+'/'+kind)} zero-arg try",
                         "operationId": f"{server}_{safe}_{suffix.replace('/','_')}_try",
                         "responses": {"200": {"description": "OK"}},
                     }
@@ -670,10 +793,11 @@ def custom_openapi():
             "callDiscipline": [
                 "Use **GET with query** or **POST with JSON**. If no args, POST `{}`.",
                 "Prefer granular endpoints `/{SERVER}/tool/{TOOL}/{action}[/{kind}]` when enums exist.",
+                "If the tool requires `args` (string), you can either provide it directly OR pass convenience params; the bridge will compose the argstring.",
             ],
             "bodyShapes": ["Direct body: `{ ... }`","Wrapped body: `{ \"args\": { ... } }`"],
             "discovery": [
-                "List tools: `GET /{SERVER}/tools/list` (synthesized from MCP).",
+                "List tools: `GET /{SERVER}/tools/list`.",
                 "Per-tool schema: `GET /{SERVER}/tool/{TOOL}/schema`.",
                 "Per-tool example: `GET /{SERVER}/tool/{TOOL}/example`.",
                 "Per-tool help: `GET /{SERVER}/tool/{TOOL}/help`.",
@@ -681,24 +805,24 @@ def custom_openapi():
             ],
             "typicalFlow": [
                 "1) Read `/openapi.json` and `/discovery/status`.",
-                "2) Choose a tool whose schema matches the user request.",
-                "3) Use granular path when available; otherwise call the base tool with minimal JSON.",
+                "2) Choose a tool whose schema/description matches the user request.",
+                "3) Use a granular path when available (e.g., `/get/pods`).",
                 "4) If you cannot send a body, use GET with `?args={...}` or `?key=value`.",
             ],
             "errorFix": [
                 "If you see 'expected a request body', use GET or POST `{}`.",
+                "If a tool needs `args` (string): either send it, or pass convenience params like `namespace`, `name`, etc.",
                 "If you see a schema error, inspect `/schema`, `/example`, or try a granular endpoint.",
             ],
         },
     }
 
-    # Always include fixed routes (health/discovery)
-    fixed_schema = get_openapi(title=app.title, version=app.version, description=app.description, routes=app.routes)
-    for p, item in (fixed_schema.get("paths") or {}).items():
-        if p not in openapi["paths"]:
-            openapi["paths"][p] = item
+    # Include fixed routes (health/discovery) from FastAPI
+    fixed = get_openapi(title=app.title, version=app.version, description=app.description, routes=app.routes)
+    for p, item in (fixed.get("paths") or {}).items():
+        openapi["paths"].setdefault(p, item)
 
-    # Synthesize tool paths/components directly from MCP data (no blocking)
+    # Synthesize tool paths/components directly from MCP data
     tool_paths, comp = _compose_paths_from_mcp()
     openapi["paths"].update(tool_paths)
     openapi["components"]["schemas"].update(comp.get("schemas", {}))
@@ -714,12 +838,8 @@ def custom_openapi():
         for sname, st in SERVERS.items()
         for tname, t in st.tools.items()
     ]
-    openapi["x-mcp-prompts"] = {
-        sname: st.prompts for sname, st in SERVERS.items() if st.prompts
-    }
-    openapi["x-mcp-resources"] = {
-        sname: st.resources for sname, st in SERVERS.items() if st.resources
-    }
+    openapi["x-mcp-prompts"] = { sname: st.prompts for sname, st in SERVERS.items() if st.prompts }
+    openapi["x-mcp-resources"] = { sname: st.resources for sname, st in SERVERS.items() if st.resources }
 
     # Hint if nothing discovered yet
     if not any("/tool/" in p for p in openapi.get("paths", {}).keys()):
