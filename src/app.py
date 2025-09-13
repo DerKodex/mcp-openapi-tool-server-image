@@ -1,28 +1,26 @@
 # app.py
 import os, time, asyncio, re, json
 from typing import Any, Dict, Optional, List, Tuple, Union
-from fastapi import FastAPI, Body, Response, HTTPException, Depends, Header, Request, Query
-from fastapi.routing import APIRoute
-from fastapi import APIRouter
+from fastapi import FastAPI, Body, Response, HTTPException, Depends, Header, Request, Query, Path
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.openapi.utils import get_openapi
+from starlette.routing import Match
 import httpx
 
 # =========================
 # Config
 # =========================
-API_KEY = os.environ.get("API_KEY", "").strip()
-ALLOW_ORIGINS = os.environ.get("CORS_ALLOW_ORIGINS", "*")
-REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "30"))
-STARTUP_TIMEOUT = int(os.environ.get("STARTUP_TIMEOUT", "30"))
-REFRESH_INTERVAL = int(os.environ.get("REFRESH_INTERVAL", "10"))  # background poller seconds
-DISCOVERY_PUBLIC = os.environ.get("DISCOVERY_PUBLIC", "true").lower() in ("1","true","t","yes","y","on")
+API_KEY           = os.environ.get("API_KEY", "").strip()
+ALLOW_ORIGINS     = os.environ.get("CORS_ALLOW_ORIGINS", "*")
+REQUEST_TIMEOUT   = int(os.environ.get("REQUEST_TIMEOUT", "30"))
+REFRESH_INTERVAL  = int(os.environ.get("REFRESH_INTERVAL", "10"))  # seconds
+DISCOVERY_PUBLIC  = os.environ.get("DISCOVERY_PUBLIC", "true").lower() in ("1","true","t","yes","y","on")
+PUBLIC_BASE_URL   = os.environ.get("PUBLIC_BASE_URL", "http://localhost:8080")
 
 # Multiple servers: "ro=http://host:8080/mcp,admin=http://host:8080/mcp"
-MCP_SERVERS = os.environ.get("MCP_SERVERS", "").strip()
-MCP_RPC_URL = os.environ.get("MCP_RPC_URL", "").strip()  # single-server fallback
-
+MCP_SERVERS  = os.environ.get("MCP_SERVERS", "").strip()
+MCP_RPC_URL  = os.environ.get("MCP_RPC_URL", "").strip()  # single-server fallback
 
 def parse_servers(spec: str) -> Dict[str, str]:
     out: Dict[str, str] = {}
@@ -32,24 +30,18 @@ def parse_servers(spec: str) -> Dict[str, str]:
             out[k.strip()] = v.strip()
     return out
 
-
-SERVERS_CFG = parse_servers(MCP_SERVERS)
-if not SERVERS_CFG:
-    if MCP_RPC_URL:
-        SERVERS_CFG = {"mcp": MCP_RPC_URL}
-    else:
-        SERVERS_CFG = {"mcp": "http://localhost:8080/mcp"}
+SERVERS_CFG = parse_servers(MCP_SERVERS) or ({"mcp": MCP_RPC_URL} if MCP_RPC_URL else {"mcp": "http://localhost:8080/mcp"})
 
 # =========================
 # App
 # =========================
 app = FastAPI(
     title="MCP OpenAPI Bridge (Generic, Self-Discovering)",
-    version="1.7.0",
+    version="2.0.0",
     description=(
         "A generic, self-discovering OpenAPI façade for MCP servers.\n"
-        "It discovers tools and schemas, then exposes:\n"
-        "• One generic POST/GET endpoint per tool\n"
+        "It discovers tools, prompts, and resources from MCP and exposes:\n"
+        "• One generic GET/POST endpoint per tool\n"
         "• Auto-generated granular endpoints for each `action`/`kind` enum combination\n"
         "All endpoints accept GET (query) and POST (JSON); request bodies are optional.\n"
         "Use `{}` for empty POST bodies. If you cannot send a body, use GET with `?args={...}` or individual `?key=value`."
@@ -65,16 +57,13 @@ if ALLOW_ORIGINS:
         allow_headers=["*"],
     )
 
+def require_api_key(x_api_key: Optional[str] = Header(default=None)):
+    if not API_KEY:
+        return
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="invalid api key")
 
-def _auth_dep():
-    def require_api_key(x_api_key: Optional[str] = Header(default=None)):
-        if not API_KEY:
-            return
-        if x_api_key != API_KEY:
-            raise HTTPException(status_code=401, detail="invalid api key")
-    return require_api_key
-
-RequireAPIKey = None if DISCOVERY_PUBLIC else Depends(_auth_dep())
+PUBLIC_OR_AUTH = [] if DISCOVERY_PUBLIC else [Depends(require_api_key)]
 
 # =========================
 # HTTP client
@@ -86,16 +75,17 @@ async def get_client() -> httpx.AsyncClient:
         _client = httpx.AsyncClient(timeout=REQUEST_TIMEOUT)
     return _client
 
-
 # =========================
-# Per-server state
+# MCP state / RPC
 # =========================
 class ServerState:
     def __init__(self, name: str, rpc_url: str):
         self.name = name
         self.rpc_url = rpc_url
         self.session_id: Optional[str] = None
-        self.tools: Dict[str, Dict[str, Any]] = {}  # keyed by tool name
+        self.tools: Dict[str, Dict[str, Any]] = {}
+        self.prompts: List[Dict[str, Any]] = []
+        self.resources: List[Dict[str, Any]] = []
         self.ready: bool = False
         self.last_error: Optional[str] = None
 
@@ -119,7 +109,6 @@ class ServerState:
                     "message": f"Failed to connect to MCP server at {self.rpc_url}",
                     "error": str(e),
                     "resolution": [
-                        "Preferred: POST a JSON object body (use `{}` if no arguments).",
                         "Verify the MCP service DNS/port, Endpoint, and NetworkPolicy.",
                         f"Check that {self.rpc_url} is correct and reachable from this pod.",
                     ],
@@ -138,7 +127,6 @@ class ServerState:
                     "message": "MCP server returned an error",
                     "mcp_error": data["error"],
                     "resolution": [
-                        "Always send a JSON object body: `{}` for none, or `{ \"args\": { ... } }`.",
                         "Confirm tool name and argument keys match the tool schema.",
                         "Call `/SERVER/tools/list` and `/SERVER/tool/TOOL/schema` to verify fields.",
                         "If RBAC/namespace related, try the admin server or pass `namespace`.",
@@ -152,18 +140,33 @@ class ServerState:
             return
         await self.rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {}})
 
-    async def refresh_tools(self):
+    async def refresh_all(self):
         await self.ensure_initialized()
-        result = await self.rpc("tools/list")
-        tools: Dict[str, Dict[str, Any]] = {}
-        tool_list = result.get("tools", result if isinstance(result, list) else [])
-        for t in tool_list:
-            if isinstance(t, dict) and "name" in t:
-                tools[t["name"]] = t
-        self.tools = tools
+        # tools
+        tools_result = await self.rpc("tools/list")
+        tool_list = tools_result.get("tools", tools_result if isinstance(tools_result, list) else [])
+        self.tools = {t["name"]: t for t in tool_list if isinstance(t, dict) and "name" in t}
+
+        # prompts (best-effort)
+        try:
+            prompts_result = await self.rpc("prompts/list")
+            self.prompts = prompts_result.get("prompts", prompts_result if isinstance(prompts_result, list) else [])
+        except HTTPException:
+            self.prompts = []
+        except Exception:
+            self.prompts = []
+
+        # resources (best-effort)
+        try:
+            res_result = await self.rpc("resources/list")
+            self.resources = res_result.get("resources", res_result if isinstance(res_result, list) else [])
+        except HTTPException:
+            self.resources = []
+        except Exception:
+            self.resources = []
+
         self.ready = True
         self.last_error = None
-
 
 SERVERS: Dict[str, ServerState] = {name: ServerState(name, url) for name, url in SERVERS_CFG.items()}
 
@@ -173,9 +176,9 @@ SERVERS: Dict[str, ServerState] = {name: ServerState(name, url) for name, url in
 def _safe(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_]", "_", name)
 
-def example_from_schema(schema: Dict[str, Any]) -> Any:
+def example_from_schema(schema: Any) -> Any:
     if not isinstance(schema, dict):
-        return None
+        return {}
     if "example" in schema:
         return schema["example"]
     t = schema.get("type")
@@ -188,10 +191,9 @@ def example_from_schema(schema: Dict[str, Any]) -> Any:
         required = set(schema.get("required", []))
         obj = {}
         for k, v in props.items():
-            if "default" in v:
-                obj[k] = v["default"]; continue
+            if "default" in v: obj[k] = v["default"]; continue
             ex = example_from_schema(v)
-            if ex is None:
+            if ex == {}:
                 vt = v.get("type")
                 if vt == "string":
                     ex = (v.get("enum") or ["value"])[0]
@@ -214,13 +216,14 @@ def example_from_schema(schema: Dict[str, Any]) -> Any:
     if t == "string":  return schema.get("default") or "value"
     if t in ("integer", "number"): return schema.get("default") or 1
     if t == "boolean": return schema.get("default") or True
-    return schema.get("default") or None
+    return schema.get("default") or {}
 
-def describe_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
-    desc: Dict[str, Any] = {"type": schema.get("type", "object")}
-    props = schema.get("properties", {}) if isinstance(schema, dict) else {}
+def describe_schema(schema: Any) -> Dict[str, Any]:
+    if not isinstance(schema, dict):
+        return {"type": "object", "fields": {}, "requiredFields": []}
+    props = schema.get("properties", {})
     required = set(schema.get("required", []))
-    fields: Dict[str, Dict[str, Any]] = {}
+    fields = {}
     for k, v in props.items():
         fields[k] = {
             "required": k in required,
@@ -228,23 +231,9 @@ def describe_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
             "enum": v.get("enum", None),
             "default": v.get("default", None),
             "description": v.get("description", None),
+            "examples": v.get("examples", None),
         }
-    desc["fields"] = fields
-    desc["requiredFields"] = sorted(list(required))
-    hints = []
-    if "namespace" in props:
-        hints.append("If the tool targets Kubernetes, include `namespace` for namespace-scoped queries.")
-    if "kind" in props and props["kind"].get("enum"):
-        hints.append(f"`kind` accepts one of: {props['kind']['enum']}")
-    if "action" in props and props["action"].get("enum"):
-        hints.append(f"`action` accepts one of: {props['action']['enum']}")
-    if not required:
-        hints.append("This tool can be called with no arguments; you may send `{}` or use GET /…/try or /…/invoke.")
-    desc["usageHints"] = hints
-    return desc
-
-def merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
-    out = dict(a); out.update(b); return out
+    return {"type": schema.get("type", "object"), "fields": fields, "requiredFields": sorted(list(required))}
 
 def parse_args_query(args_q: Optional[str]) -> Dict[str, Any]:
     if not args_q: return {}
@@ -276,258 +265,17 @@ def normalize_body(
     body: Optional[Union[Dict[str, Any], list, str, int, float, bool, None]],
     schema: Optional[Dict[str, Any]],
     args_q: Optional[str],
-    request: Optional[Request] = None
+    request: Optional[Request]
 ) -> Dict[str, Any]:
     base: Dict[str, Any] = {}
     if isinstance(body, dict):
         base = body.get("args", body) if isinstance(body.get("args"), dict) else body or {}
     from_args = parse_args_query(args_q)
-    base = merge(base, from_args)
+    base.update(from_args)
     if request is not None:
         qp = {k: v for k, v in request.query_params.items() if k not in ("args",)}
-        base = merge(base, coerce_query_params(schema or {"type":"object"}, qp))
+        base.update(coerce_query_params(schema or {"type":"object"}, qp))
     return base or {}
-
-def make_request_body(schema: Dict[str, Any], required: bool = False) -> Dict[str, Any]:
-    direct = schema or {"type": "object"}
-    wrapped = {"type": "object", "properties": {"args": direct}, "required": ["args"]}
-    return {
-        "required": required,
-        "content": {
-            "application/json": {
-                "schema": {"oneOf": [direct, wrapped]},
-                "examples": {
-                    "empty":  {"summary": "No arguments", "value": {}},
-                    "direct": {"summary": "Direct body", "value": example_from_schema(direct) or {}},
-                    "wrapped": {"summary": "Wrapped in args", "value": {"args": example_from_schema(direct) or {}}},
-                },
-            }
-        },
-    }
-
-_COMMON_QUERY_PARAMS = [
-    {"name": "args","in": "query","required": False,"description": "JSON args fallback, e.g. ?args={\"namespace\":\"ollama\",\"kind\":\"pods\",\"action\":\"get\"}","schema": {"type": "string"}},
-    {"name": "namespace","in": "query","required": False,"description": "Kubernetes namespace (e.g., 'ollama').","schema": {"type": "string"}},
-    {"name": "name","in": "query","required": False,"description": "Resource name (pod/deployment/etc.).","schema": {"type": "string"}},
-    {"name": "kind","in": "query","required": False,"description": "Resource kind (pods, deployments, services, events, namespaces).","schema": {"type": "string"}},
-    {"name": "action","in": "query","required": False,"description": "Action/verb (get, describe, logs, delete, apply).","schema": {"type": "string"}},
-    {"name": "labels","in": "query","required": False,"description": "Comma-separated label selector (e.g., app=ollama,tier=backend).","schema": {"type": "string"}},
-    {"name": "fieldSelector","in": "query","required": False,"description": "Kubernetes field selector string.","schema": {"type": "string"}},
-    {"name": "limit","in": "query","required": False,"description": "Max items to return.","schema": {"type": "integer"}},
-    {"name": "container","in": "query","required": False,"description": "Container name (for logs).","schema": {"type": "string"}},
-    {"name": "sinceSeconds","in": "query","required": False,"description": "Only return logs newer than X seconds.","schema": {"type": "integer"}},
-]
-
-_registered: set[str] = set()
-_discovery_lock = asyncio.Lock()
-_last_discovery: float = 0.0
-
-# =========================
-# Route builders
-# =========================
-def add_generic_routes(router: APIRouter, server: str):
-    st = SERVERS[server]
-
-    @router.get("/", tags=["usage"], summary="Root Quickstart")
-    async def root_quickstart():
-        return {
-            "howToUse": [
-                "Use GET with query **or** POST with JSON. If you have no args, POST `{}`.",
-                "Prefer granular paths like `/{server}/tool/{tool}/{action}[/{kind}]` when enums exist.",
-                "If you see 'Request body expected', retry with `{}` or use the GET form.",
-            ],
-        }
-
-    @router.get(f"/{server}/healthz", summary=f"{server} health")
-    async def healthz_server():
-        return {
-            "ok": st.ready,
-            "server": server,
-            "rpc_url": st.rpc_url,
-            "tools": list(st.tools.keys()),
-            "last_error": st.last_error,
-        }
-
-    @router.get(f"/{server}/usage", summary=f"{server} model usage guide", tags=["usage"])
-    async def usage_server():
-        return {
-            "howToUse": [
-                "Preferred: POST with a JSON body (use `{}` if no args).",
-                "Fallbacks: GET '/try' or '/invoke' for zero-arg calls.",
-                "Or put JSON in query: '?args={...}', or individual '?key=value' params.",
-                "You may POST either a direct body `{...}` or wrapped `{ \"args\": { ... } }`.",
-                "Prefer granular endpoints like `/{SERVER}/tool/{TOOL}/get/pods` when available.",
-                "Discover tools with `/openapi.json` and `GET /{SERVER}/tools/list`.",
-                "Inspect fields with `GET /{SERVER}/tool/{TOOL}/schema` and examples with `/example`.",
-            ],
-        }
-
-    # tools/list: GET public if DISCOVERY_PUBLIC, POST otherwise same
-    @router.get(
-        f"/{server}/tools/list",
-        summary=f"{server} MCP tool listing (GET)",
-        tags=["discovery"],
-        dependencies=[] if DISCOVERY_PUBLIC else [Depends(_auth_dep())],
-    )
-    async def tools_list_get():
-        await st.refresh_tools()
-        return {"tools": list(st.tools.values())}
-
-    @router.post(
-        f"/{server}/tools/list",
-        summary=f"{server} MCP tool listing (POST)",
-        tags=["discovery"],
-        dependencies=[] if DISCOVERY_PUBLIC else [Depends(_auth_dep())],
-        openapi_extra={"requestBody": make_request_body({"type":"object"})},
-    )
-    async def tools_list_post(_body: Optional[Dict[str, Any]] = Body(default=None, embed=False)):
-        await st.refresh_tools()
-        return {"tools": list(st.tools.values())}
-
-    @router.post(
-        f"/{server}/tools/call",
-        summary=f"{server} raw MCP tool call",
-        tags=["advanced"],
-        dependencies=[] if DISCOVERY_PUBLIC else [Depends(_auth_dep())],
-        openapi_extra={
-            "x-instructions": (
-                "Call a tool by name. Provide arguments directly or under an `args` object. "
-                "If you cannot send a body, pass `name` and arguments via query: "
-                "`?name=TOOL&args={...}` or `?name=TOOL&namespace=vault`."
-            ),
-            "requestBody": make_request_body({"type": "object"}),
-        },
-    )
-    async def tools_call(
-        request: Request,
-        body: Optional[Dict[str, Any]] = Body(default=None, embed=False),
-        name: Optional[str] = Header(default=None, description="Optional tool name header alternative"),
-        tool: Optional[str] = Header(default=None, description="Alternative header for tool name"),
-        q_name: Optional[str] = Query(default=None, description="Tool name (query fallback)"),
-        args: Optional[str] = Query(default=None, description="JSON-encoded args (query fallback)"),
-    ):
-        base_args = normalize_body(body, {"type":"object"}, args, request)
-        tool_name = base_args.pop("name", None) or name or tool or q_name
-        if not tool_name:
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "message": "Tool name not provided.",
-                    "resolution": [
-                        "Pass the tool name in the JSON body as `{ \"name\": \"<tool>\", ... }`, or",
-                        "Use the `name:` or `tool:` header, or",
-                        "Set `?name=<tool>` in the query string, or",
-                        "Call a specific tool endpoint like `/{SERVER}/tool/{TOOL}`.",
-                    ],
-                },
-            )
-        await st.ensure_initialized()
-        return await st.rpc("tools/call", {"name": tool_name, "arguments": base_args})
-
-
-def add_schema_helpers(router: APIRouter, server: str, tool: Dict[str, Any]):
-    tname = tool["name"]
-    pname = _safe(tname)
-
-    async def schema_handler():
-        return tool.get("inputSchema") or {"type": "object"}
-
-    async def example_handler():
-        ex = example_from_schema(tool.get("inputSchema") or {"type": "object"})
-        return {"name": tname, "arguments": ex or {}}
-
-    async def help_handler():
-        schema = tool.get("inputSchema") or {"type": "object"}
-        return {
-            "tool": tname,
-            "server": server,
-            "description": tool.get("description", "No description provided by MCP server."),
-            "schema": describe_schema(schema),
-            "howToUse": [
-                f"POST to `/{server}/tool/{pname}`. Always send a JSON body; if no args, send `{{}}`.",
-                "Fallbacks: GET '/try' for zero-arg, or pass `?args={...}` / `?key=value`, or GET '/invoke'.",
-                "You may send a direct body or `{ \"args\": { ... } }`.",
-                f"Fetch an example body from `/{server}/tool/{pname}/example`.",
-                f"View schema at `/{server}/tool/{pname}/schema`.",
-                "If granular endpoints exist (action/kind), prefer those—they pre-fill some fields.",
-            ],
-        }
-
-    async def try_handler():
-        return await SERVERS[server].rpc("tools/call", {"name": tname, "arguments": {}})
-
-    router.add_api_route(f"/{server}/tool/{pname}/schema", schema_handler, ["GET"],
-                         name=f"{server}:{tname} schema", summary=f"{server} → {tname} schema",
-                         operation_id=f"{server}_{tname}_schema", tags=[f"{server}:{tname}", "schema"],
-                         dependencies=[] if DISCOVERY_PUBLIC else [Depends(_auth_dep())])
-    router.add_api_route(f"/{server}/tool/{pname}/example", example_handler, ["GET"],
-                         name=f"{server}:{tname} example", summary=f"{server} → {tname} example",
-                         operation_id=f"{server}_{tname}_example", tags=[f"{server}:{tname}", "example"],
-                         dependencies=[] if DISCOVERY_PUBLIC else [Depends(_auth_dep())])
-    router.add_api_route(f"/{server}/tool/{pname}/help", help_handler, ["GET"],
-                         name=f"{server}:{tname} help", summary=f"{server} → {tname} help",
-                         operation_id=f"{server}_{tname}_help", tags=[f"{server}:{tname}", "help"],
-                         dependencies=[] if DISCOVERY_PUBLIC else [Depends(_auth_dep())])
-    router.add_api_route(f"/{server}/tool/{pname}/try", try_handler, ["GET"],
-                         name=f"{server}:{tname} try", summary=f"{server} → {tname} zero-arg try",
-                         description="GET calls this tool with `{}`.", operation_id=f"{server}_{tname}_try",
-                         tags=[f"{server}:{tname}", "try"],
-                         dependencies=[] if DISCOVERY_PUBLIC else [Depends(_auth_dep())])
-
-
-def add_tool_route(router: APIRouter, server: str, tool: Dict[str, Any]):
-    st = SERVERS[server]
-    tname = tool["name"]; pname = _safe(tname)
-    schema = tool.get("inputSchema") or {"type": "object"}
-    desc = tool.get("description") or f"Call MCP tool {tname} on server {server}. Prefer granular endpoints when possible."
-    state = st; toolname = tname
-
-    async def handler_post(
-        request: Request,
-        body: Optional[Dict[str, Any]] = Body(default=None, embed=False),
-        args: Optional[str] = Query(default=None, description="JSON-encoded args (query fallback)"),
-    ) -> Any:
-        call_args = normalize_body(body, schema, args, request)
-        await state.ensure_initialized()
-        return await state.rpc("tools/call", {"name": toolname, "arguments": call_args})
-
-    async def handler_get(
-        request: Request,
-        args: Optional[str] = Query(default=None, description="JSON-encoded args (query fallback)"),
-    ) -> Any:
-        call_args = normalize_body({}, schema, args, request)
-        await state.ensure_initialized()
-        return await state.rpc("tools/call", {"name": toolname, "arguments": call_args})
-
-    # POST
-    router.routes.append(APIRoute(
-        path=f"/{server}/tool/{pname}",
-        endpoint=handler_post, methods=["POST"],
-        name=f"{server}:{tname}",
-        summary=desc, operation_id=f"{server}_{tname}",
-        tags=[f"{server}:{tname}"],
-        dependencies=[] if DISCOVERY_PUBLIC else [Depends(_auth_dep())],
-        openapi_extra={"x-source-description": tool.get("description", None),
-                       "requestBody": make_request_body(schema)},
-    ))
-    # GET & /invoke aliases
-    router.routes.append(APIRoute(
-        path=f"/{server}/tool/{pname}",
-        endpoint=handler_get, methods=["GET"],
-        name=f"{server}:{tname} (GET)",
-        summary=f"{desc} (GET query allowed)", operation_id=f"{server}_{tname}_get",
-        tags=[f"{server}:{tname}"],
-        dependencies=[] if DISCOVERY_PUBLIC else [Depends(_auth_dep())],
-    ))
-    router.routes.append(APIRoute(
-        path=f"/{server}/tool/{pname}/invoke",
-        endpoint=handler_get, methods=["GET"],
-        name=f"{server}:{tname} invoke",
-        summary=f"{desc} (GET /invoke)", operation_id=f"{server}_{tname}_invoke",
-        tags=[f"{server}:{tname}", "invoke"],
-        dependencies=[] if DISCOVERY_PUBLIC else [Depends(_auth_dep())],
-    ))
-
 
 def iter_action_kind(schema: Dict[str, Any]) -> Tuple[List[str], List[str]]:
     if not isinstance(schema, Dict):
@@ -535,193 +283,23 @@ def iter_action_kind(schema: Dict[str, Any]) -> Tuple[List[str], List[str]]:
     props = schema.get("properties", {})
     action_key = next((k for k in ["action","verb","operation","op"] if k in props), None)
     actions = props.get(action_key, {}).get("enum", []) if action_key else []
-    kind_key = next((k for k in ["kind","resource","resources"] if k in props), None)
+    kind_key = next((k for k in ["kind","resource","resources","type"] if k in props), None)
     kinds = props.get(kind_key, {}).get("enum", []) if kind_key else []
     return (actions, kinds)
 
-def add_granular_routes(router: APIRouter, server: str, tool: Dict[str, Any]):
-    st = SERVERS[server]
-    schema = tool.get("inputSchema") or {"type": "object"}
-    actions, kinds = iter_action_kind(schema)
-    if not actions and not kinds:
-        return
-    tname = tool["name"]; pname = _safe(tname)
-
-    def reduced_without(schema_in: Dict[str, Any], keys: List[str]) -> Dict[str, Any]:
-        reduced = json.loads(json.dumps(schema_in))
-        props = reduced.setdefault("properties", {})
-        req = set(reduced.get("required", []))
-        for k in keys:
-            props.pop(k, None); req.discard(k)
-        reduced["required"] = list(req)
-        return reduced
-
-    # Action-only
-    for action in actions or []:
-        fixed = {"action": action}
-        reduced_schema = reduced_without(schema, ["action"])
-        op_id = f"{server}_{tname}_{_safe(action)}"
-        state = st; toolname = tname; fixed_local = dict(fixed)
-        base_path = f"/{server}/tool/{pname}/{_safe(action)}"
-
-        async def handler_post(
-            request: Request,
-            body: Optional[Dict[str, Any]] = Body(default=None, embed=False),
-            args: Optional[str] = Query(default=None),
-        ) -> Any:
-            call_args = normalize_body(body, reduced_schema, args, request)
-            call_args.update(fixed_local)
-            await state.ensure_initialized()
-            return await state.rpc("tools/call", {"name": toolname, "arguments": call_args})
-
-        async def handler_get(
-            request: Request,
-            args: Optional[str] = Query(default=None),
-        ) -> Any:
-            call_args = normalize_body({}, reduced_schema, args, request)
-            call_args.update(fixed_local)
-            await state.ensure_initialized()
-            return await state.rpc("tools/call", {"name": toolname, "arguments": call_args})
-
-        router.routes.append(APIRoute(
-            path=base_path, endpoint=handler_post, methods=["POST"],
-            name=f"{server}:{tname}:{action}",
-            summary=f"{server} → {tname} → {action}",
-            description=f"Fixes `action: \"{action}\"`. Provide only remaining fields.",
-            operation_id=op_id, tags=[f"{server}:{tname}", action],
-            dependencies=[] if DISCOVERY_PUBLIC else [Depends(_auth_dep())],
-            openapi_extra={"requestBody": make_request_body(reduced_schema)},
-        ))
-        router.routes.append(APIRoute(
-            path=base_path, endpoint=handler_get, methods=["GET"],
-            name=f"{server}:{tname}:{action} (GET)",
-            summary=f"{server} → {tname} → {action} (GET query allowed)",
-            operation_id=f"{op_id}_get", tags=[f"{server}:{tname}", action],
-            dependencies=[] if DISCOVERY_PUBLIC else [Depends(_auth_dep())],
-        ))
-        router.routes.append(APIRoute(
-            path=f"{base_path}/invoke", endpoint=handler_get, methods=["GET"],
-            name=f"{server}:{tname}:{action}:invoke",
-            summary=f"{server} → {tname} → {action} (GET /invoke)",
-            operation_id=f"{op_id}_invoke", tags=[f"{server}:{tname}", action, "invoke"],
-            dependencies=[] if DISCOVERY_PUBLIC else [Depends(_auth_dep())],
-        ))
-
-        if not reduced_schema.get("required"):
-            async def handler_try():
-                return await st.rpc("tools/call", {"name": tname, "arguments": dict(fixed_local)})
-            router.add_api_route(
-                path=f"{base_path}/try", endpoint=handler_try, methods=["GET"],
-                name=f"{server}:{tname}:{action}:try",
-                summary=f"{server} → {tname} → {action} zero-arg try",
-                description="GET calls this action with `{}` (fixed fields implied).",
-                operation_id=f"{op_id}_try", tags=[f"{server}:{tname}", action, "try"],
-                dependencies=[] if DISCOVERY_PUBLIC else [Depends(_auth_dep())],
-            )
-
-    # Action + kind (or kind only)
-    for action in actions or ["_"]:
-        for kind in kinds or []:
-            if action == "_":
-                fixed = {"kind": kind}; suffix = _safe(kind)
-                summary = f"{server} → {tname} → {kind}"
-                desc = f"Fixes `kind: \"{kind}\"`."
-                tags = [f"{server}:{tname}", kind]
-                op_id = f"{server}_{tname}_{_safe(kind)}"
-                reduced_schema = reduced_without(schema, ["kind"])
-            else:
-                fixed = {"action": action, "kind": kind}
-                suffix = f"{_safe(action)}/{_safe(kind)}"
-                summary = f"{server} → {tname} → {action}/{kind}"
-                desc = f"Fixes `action: \"{action}\"` and `kind: \"{kind}\"`."
-                tags = [f"{server}:{tname}", action, kind]
-                op_id = f"{server}_{tname}_{_safe(action)}_{_safe(kind)}"
-                reduced_schema = reduced_without(schema, ["action","kind"])
-
-            state = st; toolname = tname; fixed_local = dict(fixed)
-            base_path = f"/{server}/tool/{pname}/{suffix}"
-
-            async def handler_post(
-                request: Request,
-                body: Optional[Dict[str, Any]] = Body(default=None, embed=False),
-                args: Optional[str] = Query(default=None),
-            ) -> Any:
-                call_args = normalize_body(body, reduced_schema, args, request)
-                call_args.update(fixed_local)
-                await state.ensure_initialized()
-                return await state.rpc("tools/call", {"name": toolname, "arguments": call_args})
-
-            async def handler_get(
-                request: Request,
-                args: Optional[str] = Query(default=None),
-            ) -> Any:
-                call_args = normalize_body({}, reduced_schema, args, request)
-                call_args.update(fixed_local)
-                await state.ensure_initialized()
-                return await state.rpc("tools/call", {"name": toolname, "arguments": call_args})
-
-            router.routes.append(APIRoute(
-                path=base_path, endpoint=handler_post, methods=["POST"],
-                name=f"{server}:{tname}:{summary}", summary=summary,
-                description=f"Convenience endpoint. {desc} Provide only remaining fields.",
-                operation_id=op_id, tags=tags,
-                dependencies=[] if DISCOVERY_PUBLIC else [Depends(_auth_dep())],
-                openapi_extra={"requestBody": make_request_body(reduced_schema)},
-            ))
-            router.routes.append(APIRoute(
-                path=base_path, endpoint=handler_get, methods=["GET"],
-                name=f"{server}:{tname}:{summary} (GET)",
-                summary=f"{summary} (GET query allowed)",
-                operation_id=f"{op_id}_get", tags=tags,
-                dependencies=[] if DISCOVERY_PUBLIC else [Depends(_auth_dep())],
-            ))
-            router.routes.append(APIRoute(
-                path=f"{base_path}/invoke", endpoint=handler_get, methods=["GET"],
-                name=f"{server}:{tname}:{summary}:invoke",
-                summary=f"{summary} (GET /invoke)",
-                operation_id=f"{op_id}_invoke", tags=tags + ["invoke"],
-                dependencies=[] if DISCOVERY_PUBLIC else [Depends(_auth_dep())],
-            ))
-
-            if not reduced_schema.get("required"):
-                async def handler_try():
-                    return await st.rpc("tools/call", {"name": tname, "arguments": dict(fixed_local)})
-                router.add_api_route(
-                    path=f"{base_path}/try", endpoint=handler_try, methods=["GET"],
-                    name=f"{server}:{tname}:{summary}:try",
-                    summary=f"{summary} zero-arg try",
-                    description="GET calls this action/kind with `{}` (fixed fields implied).",
-                    operation_id=f"{op_id}_try", tags=tags + ["try"],
-                    dependencies=[] if DISCOVERY_PUBLIC else [Depends(_auth_dep())],
-                )
-
 # =========================
-# Discovery installer
+# Discovery loop
 # =========================
-def install_routes_for_server(server: str):
-    st = SERVERS[server]
-    router = APIRouter()
-    add_generic_routes(router, server)
-    for tool in st.tools.values():
-        key_base = f"{server}::{tool['name']}"
-        if key_base + "::base" not in _registered:
-            add_schema_helpers(router, server, tool)
-            add_tool_route(router, server, tool)
-            _registered.add(key_base + "::base")
-        if key_base + "::granular" not in _registered:
-            add_granular_routes(router, server, tool)
-            _registered.add(key_base + "::granular")
-    app.include_router(router)
+_discovery_lock = asyncio.Lock()
+_last_discovery: float = 0.0
 
 async def discover_once():
     global _last_discovery
     async with _discovery_lock:
         for name, st in SERVERS.items():
             try:
-                await st.refresh_tools()
-                install_routes_for_server(name)
+                await st.refresh_all()
             except Exception:
-                # errors recorded on st.last_error
                 pass
         _last_discovery = time.time()
 
@@ -737,8 +315,31 @@ async def background_poller():
 async def startup():
     asyncio.create_task(background_poller())
 
-# On-demand discovery (non-blocking for openapi)
-@app.post("/discover", tags=["discovery"], dependencies=[] if DISCOVERY_PUBLIC else [Depends(_auth_dep())])
+# =========================
+# Health / discovery endpoints
+# =========================
+@app.get("/livez", tags=["health"])
+async def livez(): return {"ok": True}
+
+@app.get("/readyz", tags=["health"])
+async def readyz():
+    any_ready = any(st.ready for st in SERVERS.values())
+    return JSONResponse(
+        status_code=200 if any_ready else 503,
+        content={"ok": any_ready,
+                 "servers": {k: {"ready": v.ready, "tools": list(v.tools.keys()), "last_error": v.last_error} for k,v in SERVERS.items()}},
+    )
+
+@app.get("/healthz", tags=["health"])
+async def healthz():
+    return {"ok": any(st.ready for st in SERVERS.values()),
+            "servers": {k: {"ready": v.ready, "rpc_url": v.rpc_url, "tools": list(v.tools.keys()), "last_error": v.last_error}
+                        for k,v in SERVERS.items()}}
+
+@app.get("/servers", tags=["info"])
+async def servers_info(): return {"servers": {k: v.rpc_url for k, v in SERVERS.items()}}
+
+@app.post("/discover", tags=["discovery"], dependencies=PUBLIC_OR_AUTH)
 async def discover_endpoint(wait: Optional[int] = Query(default=0, description="Seconds to wait (max 10) for discovery")):
     wait = max(0, min(int(wait or 0), 10))
     task = asyncio.create_task(discover_once())
@@ -752,64 +353,100 @@ async def discover_endpoint(wait: Optional[int] = Query(default=0, description="
 @app.get("/discovery/status", tags=["discovery"])
 async def discovery_status():
     return {"lastDiscovery": _last_discovery,
-            "servers": {k: {"ready": v.ready, "tools": list(v.tools.keys()), "last_error": v.last_error} for k, v in SERVERS.items()}}
+            "servers": {k: {"ready": v.ready, "tools": list(v.tools.keys()),
+                            "prompts": [p.get('name') for p in v.prompts],
+                            "resources": [r.get('uri','') for r in v.resources],
+                            "last_error": v.last_error}
+                        for k, v in SERVERS.items()}}
 
 # =========================
-# Health
+# Generic dispatcher for ALL tools & granular forms
 # =========================
-@app.get("/livez", tags=["health"])
-async def livez():
-    return {"ok": True}
+@app.api_route("/{server}/tool/{tool_path:path}", methods=["GET","POST"], tags=["tools"], dependencies=PUBLIC_OR_AUTH)
+async def tool_dispatch(
+    request: Request,
+    server: str = Path(..., description="Server alias (e.g., 'mcp', 'ro', 'admin')"),
+    tool_path: str = Path(..., description="Tool name or tool plus suffix, e.g., 'kubectl_resources', 'kubectl_resources/get/pods', 'kubectl_resources/invoke'"),
+    args: Optional[str] = Query(default=None, description="JSON-encoded args fallback"),
+    body: Optional[Dict[str, Any]] = Body(default=None, embed=False),
+):
+    st = SERVERS.get(server)
+    if not st or tool_path.strip() == "":
+        raise HTTPException(status_code=404, detail={"message": "Unknown server or tool."})
 
-@app.get("/readyz", tags=["health"])
-async def readyz():
-    any_ready = any(st.ready for st in SERVERS.values())
-    status = 200 if any_ready else 503
-    return JSONResponse(
-        status_code=status,
-        content={
-            "ok": any_ready,
-            "servers": {k: {"ready": v.ready, "tools": list(v.tools.keys()), "last_error": v.last_error} for k, v in SERVERS.items()},
-        },
-    )
+    # Split tool path: tool[/action][/kind or special]
+    parts = [p for p in tool_path.split("/") if p != ""]
+    tool_name = parts[0]
+    suffix = parts[1:]  # e.g. ['get','pods'] or ['invoke'] or ['try']
 
-@app.get("/healthz", tags=["health"])
-async def healthz():
-    return {
-        "ok": any(st.ready for st in SERVERS.values()),
-        "servers": {k: {"ready": v.ready, "rpc_url": v.rpc_url, "tools": list(v.tools.keys()), "last_error": v.last_error}
-                    for k, v in SERVERS.items()},
-    }
+    tool = st.tools.get(tool_name)
+    if not tool:
+        # try match by safe-name
+        rev = { _safe(k): k for k in st.tools.keys() }
+        real = rev.get(tool_name)
+        if real: tool = st.tools.get(real); tool_name = real
 
-@app.get("/servers", tags=["info"])
-async def servers():
-    return {"servers": {k: v.rpc_url for k, v in SERVERS.items()}}
+    if not tool:
+        raise HTTPException(status_code=404, detail={"message": f"Tool '{tool_name}' not found on server '{server}'."})
 
-@app.post("/refresh", tags=["admin"], dependencies=[] if DISCOVERY_PUBLIC else [Depends(_auth_dep())])
-async def refresh():
-    await discover_once()
-    return {"ok": True, "servers": {k: list(v.tools.keys()) for k, v in SERVERS.items()}}
+    schema = tool.get("inputSchema") or {"type":"object"}
+    call_args = normalize_body(body, schema, args, request)
+
+    # handle helper suffixes
+    if suffix == ["schema"]:
+        return schema
+    if suffix == ["example"]:
+        return {"name": tool_name, "arguments": example_from_schema(schema)}
+    if suffix == ["help"]:
+        return {
+            "tool": tool_name,
+            "server": server,
+            "description": tool.get("description", "No description provided by MCP server."),
+            "schema": describe_schema(schema),
+            "howToUse": [
+                f"POST {PUBLIC_BASE_URL}/{server}/tool/{_safe(tool_name)} with JSON; if no args, send {{}}.",
+                f"GET  {PUBLIC_BASE_URL}/{server}/tool/{_safe(tool_name)}?args={{...}} (if body unsupported).",
+                f"Try zero-arg: GET {PUBLIC_BASE_URL}/{server}/tool/{_safe(tool_name)}/try",
+                "Prefer granular forms like '/{server}/tool/{tool}/{action}[/{kind}]' when available.",
+            ],
+        }
+    if suffix == ["try"]:
+        await st.ensure_initialized()
+        return await st.rpc("tools/call", {"name": tool_name, "arguments": {}})
+    if suffix == ["invoke"]:
+        # GET form = same as base GET
+        await st.ensure_initialized()
+        return await st.rpc("tools/call", {"name": tool_name, "arguments": call_args})
+
+    # granular: /{tool}/{action}[/{kind}]
+    actions, kinds = iter_action_kind(schema)
+    fixed: Dict[str, Any] = {}
+    if len(suffix) >= 1 and suffix[0] not in ("schema","example","help","try","invoke"):
+        fixed["action"] = suffix[0]
+    if len(suffix) >= 2:
+        fixed["kind"] = suffix[1]
+
+    call_args.update(fixed)
+    await st.ensure_initialized()
+    return await st.rpc("tools/call", {"name": tool_name, "arguments": call_args})
 
 # =========================
-# Error handlers
+# Error handlers with guidance
 # =========================
 @app.exception_handler(HTTPException)
 async def http_exc_handler(request: Request, exc: HTTPException):
-    if isinstance(exc.detail, dict):
-        payload = exc.detail
-    else:
-        payload = {"message": str(exc.detail)}
+    payload = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}
     if "resolution" not in payload:
         tips = [
             "Preferred: POST a JSON object body (use `{}` if no arguments).",
-            "Fallbacks: GET '/try' or '/invoke' for zero-arg, or pass `?args={...}` / individual `?key=value`.",
-            "Discover tools via `/{SERVER}/tools/list` and inspect fields with `/tool/{TOOL}/schema`.",
-            "Use `/tool/{TOOL}/example` or granular endpoints.",
+            "Fallbacks: GET '/try' or '/invoke' for zero-arg, or pass `?args={...}` / `?key=value`.",
+            "Discover tools via `/{SERVER}/tools/list` (GET) and inspect fields with `/tool/{TOOL}/schema`.",
+            "Use `/tool/{TOOL}/example` or granular endpoints like `/{SERVER}/tool/{TOOL}/{action}/{kind}`.",
         ]
         if exc.status_code == 401:
             tips.insert(0, "Include the `X-Api-Key` header if the bridge was configured with API_KEY.")
         if exc.status_code == 422:
-            tips.insert(0, "Ensure the body is a JSON object (or use GET '/try' / '/invoke' / `?args={...}` as a fallback).")
+            tips.insert(0, "Ensure the request is JSON or use GET with `?args={...}` as a fallback.")
         payload["resolution"] = tips
     return JSONResponse(status_code=exc.status_code, content=payload)
 
@@ -830,151 +467,269 @@ async def unhandled_exc_handler(request: Request, exc: Exception):
     )
 
 # =========================
-# OpenAPI (non-blocking)
+# OpenAPI builder (non-blocking) – synthesize spec from MCP data
 # =========================
-def _build_k8s_cookbook() -> List[Dict[str, Any]]:
-    cookbook: List[Dict[str, Any]] = []
-    for server, st in SERVERS.items():
-        for t in st.tools.values():
-            name = t.get("name", "")
-            schema = t.get("inputSchema") or {}
-            props = schema.get("properties", {}) if isinstance(schema, dict) else {}
-            if ("kube" in name or "kubectl" in name or "k8" in name) and ("kind" in props or "action" in props):
-                tool_path = f"/{server}/tool/{_safe(name)}"
-                cookbook.extend([
-                    {
-                        "intent": "List all pods in the <namespace> namespace",
-                        "preferred": f"POST {tool_path}/get/pods",
-                        "body": {"namespace": "<namespace>"},
-                        "alternatives": [
-                            {"call": f"GET  {tool_path}/get/pods?namespace=<namespace>"},
-                            {"call": f"GET  {tool_path}/get/pods/invoke?namespace=<namespace>"},
-                            {"call": f"POST {tool_path}", "body": {"action":"get","kind":"pods","namespace":"<namespace>"}},
-                            {"call": f"GET  {tool_path}?namespace=<namespace>&action=get&kind=pods"},
-                            {"call": f"GET  {tool_path}?args=%7B%22namespace%22%3A%22<namespace>%22%2C%22kind%22%3A%22pods%22%2C%22action%22%3A%22get%22%7D"},
-                        ],
-                    },
-                    {
-                        "intent": "Describe the <pod> pod in the <namespace> namespace",
-                        "preferred": f"POST {tool_path}/get/pods",
-                        "body": {"namespace": "<namespace>", "name": "<pod>"},
-                    },
-                    {
-                        "intent": "Get logs for the <pod> pod in the <namespace> namespace",
-                        "preferred": f"POST {tool_path}/logs/pods",
-                        "body": {"namespace": "<namespace>", "name": "<pod>", "container": "<optional>"},
-                    },
-                ])
-    return cookbook
+_COMMON_QUERY_PARAMS = [
+    {"name": "args","in": "query","required": False,
+     "description": "JSON-encoded arguments fallback, e.g. ?args={\"namespace\":\"ollama\",\"kind\":\"pods\",\"action\":\"get\"}",
+     "schema": {"type": "string"}},
+]
 
-def _augment_operation_docs(openapi_schema: Dict[str, Any]):
-    paths = openapi_schema.get("paths", {})
-    for path, methods in list(paths.items()):
-        if "/tool/" not in path:
-            continue
-        for verb, op in list(methods.items()):
-            if verb.lower() not in ("post", "get"):
-                continue
-            if verb.lower() == "post":
-                rb = op.get("requestBody") or {}
-                rb["required"] = False
-                op["requestBody"] = rb
-            existing = {(p.get("name"), p.get("in")) for p in op.get("parameters", [])}
-            params = op.setdefault("parameters", [])
-            for qp in _COMMON_QUERY_PARAMS:
-                key = (qp["name"], qp["in"])
-                if key not in existing:
-                    params.append(qp)
-            guidance = (
-                "CALLING RULES:\n"
-                "• Prefer POST with a JSON object body. If you have no arguments, send `{}`.\n"
-                "• If you cannot send a body: use `?args={...}` or individual `?key=value` such as `?namespace=ollama`.\n"
-                "• Prefer granular paths like '/{server}/tool/{tool}/get/pods' when action/kind are implied.\n"
-                "• If you see 'Request body expected', retry the same call with an empty body `{}` or use GET.\n"
-            )
-            op["description"] = ((op.get("description") or "") + "\n\n" + guidance).strip()
+def _op_params_with_schema(schema: Dict[str, Any]) -> List[Dict[str, Any]]:
+    params = list(_COMMON_QUERY_PARAMS)
+    props = (schema or {}).get("properties", {}) if isinstance(schema, dict) else {}
+    for k, v in props.items():
+        params.append({"name": k, "in": "query", "required": False,
+                       "description": v.get("description", f"Query param for '{k}'"),
+                       "schema": {"type": v.get("type","string")}})
+    return params
 
-def _build_tool_catalog() -> List[Dict[str, Any]]:
-    catalog: List[Dict[str, Any]] = []
-    for server, st in SERVERS.items():
-        for t in st.tools.values():
-            name = t.get("name","")
-            schema = t.get("inputSchema") or {"type":"object"}
-            desc = t.get("description") or "No description provided by MCP server."
-            actions, kinds = iter_action_kind(schema)
-            catalog.append({
-                "server": server,
-                "tool": name,
-                "description": desc,
-                "schema": describe_schema(schema),
-                "granular": {
-                    "actions": actions,
-                    "kinds": kinds,
-                    "paths": {
-                        "generic": f"/{server}/tool/{_safe(name)}",
-                        "invoke": f"/{server}/tool/{_safe(name)}/invoke",
-                        "example": f"/{server}/tool/{_safe(name)}/example",
-                        "schema":  f"/{server}/tool/{_safe(name)}/schema",
-                        "help":    f"/{server}/tool/{_safe(name)}/help",
-                        "try":     f"/{server}/tool/{_safe(name)}/try",
-                    }
+def _make_request_body(schema: Dict[str, Any], required: bool=False) -> Dict[str, Any]:
+    direct = schema or {"type": "object"}
+    wrapped = {"type": "object", "properties": {"args": direct}, "required": ["args"]}
+    return {
+        "required": required,
+        "content": {
+            "application/json": {
+                "schema": {"oneOf": [direct, wrapped]},
+                "examples": {
+                    "empty":  {"summary": "No arguments", "value": {}},
+                    "direct": {"summary": "Direct body", "value": example_from_schema(direct) or {}},
+                    "wrapped": {"summary": "Wrapped in args", "value": {"args": example_from_schema(direct) or {}}},
                 },
+            }
+        },
+    }
+
+def _nl_examples_from(tool_name: str, schema: Dict[str, Any]) -> List[Dict[str, Any]]:
+    actions, kinds = iter_action_kind(schema)
+    exs: List[Dict[str, Any]] = []
+    if "namespace" in (schema.get("properties") or {}):
+        if actions and "get" in actions and (not kinds or "pods" in kinds):
+            exs.append({
+                "intent": "List all pods in the ollama namespace",
+                "calls": [
+                    {"GET": f"/{{SERVER}}/tool/{_safe(tool_name)}/get/pods?namespace=ollama"},
+                    {"POST": f"/{{SERVER}}/tool/{_safe(tool_name)}/get/pods", "body": {"namespace":"ollama"}},
+                    {"POST": f"/{{SERVER}}/tool/{_safe(tool_name)}", "body": {"action":"get","kind":"pods","namespace":"ollama"}},
+                ]
             })
-    return catalog
+        exs.append({
+            "intent": "Describe the apisix pod in the apisix namespace",
+            "calls": [
+                {"GET": f"/{{SERVER}}/tool/{_safe(tool_name)}/describe/pods?namespace=apisix&name=apisix"},
+                {"POST": f"/{{SERVER}}/tool/{_safe(tool_name)}/describe/pods", "body": {"namespace":"apisix","name":"apisix"}},
+            ]
+        })
+    return exs
+
+def _compose_paths_from_mcp() -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    paths: Dict[str, Any] = {}
+    components: Dict[str, Any] = {"schemas": {}}
+
+    for server, st in SERVERS.items():
+        for tname, t in st.tools.items():
+            schema = t.get("inputSchema") or {"type":"object"}
+            safe = _safe(tname)
+            tool_base = f"/{server}/tool/{safe}"
+            actions, kinds = iter_action_kind(schema)
+
+            # Schema component per tool
+            comp_name = f"Args_{_safe(server)}_{safe}"
+            components["schemas"][comp_name] = schema
+
+            # Base GET/POST + helpers
+            for method in ("get","post"):
+                op = {
+                    "tags": [f"{server}:{tname}"],
+                    "summary": t.get("description", f"{server} → {tname}"),
+                    "operationId": f"{server}_{safe}_{method}",
+                    "description": (
+                        (t.get("description") or "") + "\n\n"
+                        "CALLING RULES:\n"
+                        "• Prefer POST with a JSON object body. If you have no arguments, send `{}`.\n"
+                        "• If you cannot send a body: pass `?args={...}` or individual `?key=value`.\n"
+                        "• Granular paths like '/{server}/tool/{tool}/{action}[/{kind}]' imply fixed fields."
+                    ).strip(),
+                    "parameters": _op_params_with_schema(schema),
+                    "responses": {"200": {"description": "OK"}},
+                }
+                if method == "post":
+                    op["requestBody"] = _make_request_body(schema, required=False)
+                paths.setdefault(tool_base, {})[method] = op
+
+            # /invoke, /schema, /example, /help, /try
+            paths.setdefault(f"{tool_base}/invoke", {})["get"]  = {
+                "tags": [f"{server}:{tname}", "invoke"],
+                "summary": f"{server} → {tname} (GET /invoke)",
+                "operationId": f"{server}_{safe}_invoke",
+                "parameters": _op_params_with_schema(schema),
+                "responses": {"200": {"description": "OK"}},
+            }
+            paths.setdefault(f"{tool_base}/schema", {})["get"]  = {
+                "tags": [f"{server}:{tname}", "schema"],
+                "summary": f"{server} → {tname} schema",
+                "operationId": f"{server}_{safe}_schema",
+                "responses": {"200": {"description": "OK"}},
+            }
+            paths.setdefault(f"{tool_base}/example", {})["get"] = {
+                "tags": [f"{server}:{tname}", "example"],
+                "summary": f"{server} → {tname} example",
+                "operationId": f"{server}_{safe}_example",
+                "responses": {"200": {"description": "OK"}},
+            }
+            paths.setdefault(f"{tool_base}/help", {})["get"]    = {
+                "tags": [f"{server}:{tname}", "help"],
+                "summary": f"{server} → {tname} help",
+                "operationId": f"{server}_{safe}_help",
+                "responses": {"200": {"description": "OK"}},
+            }
+            paths.setdefault(f"{tool_base}/try", {})["get"]     = {
+                "tags": [f"{server}:{tname}", "try"],
+                "summary": f"{server} → {tname} zero-arg try",
+                "description": "Calls this tool with `{}` (no arguments).",
+                "operationId": f"{server}_{safe}_try",
+                "responses": {"200": {"description": "OK"}},
+            }
+
+            # Granular: /{action} and /{action}/{kind}
+            if actions or kinds:
+                # action only
+                for action in actions or []:
+                    p = f"{tool_base}/{_safe(action)}"
+                    for method in ("get","post"):
+                        op = {
+                            "tags": [f"{server}:{tname}", action],
+                            "summary": f"{server} → {tname} → {action}",
+                            "operationId": f"{server}_{safe}_{_safe(action)}_{method}",
+                            "description": f"Fixes `action: \"{action}\"`. Provide only remaining fields.",
+                            "parameters": _op_params_with_schema(schema),
+                            "responses": {"200": {"description": "OK"}},
+                            "x-naturalExamples": _nl_examples_from(tname, schema),
+                        }
+                        if method == "post":
+                            op["requestBody"] = _make_request_body(schema, required=False)
+                        paths.setdefault(p, {})[method] = op
+                    paths.setdefault(f"{p}/try", {})["get"] = {
+                        "tags": [f"{server}:{tname}", action, "try"],
+                        "summary": f"{server} → {tname} → {action} zero-arg try",
+                        "operationId": f"{server}_{safe}_{_safe(action)}_try",
+                        "responses": {"200": {"description": "OK"}},
+                    }
+
+                # action + kind, or kind only
+                aks = []
+                if actions and kinds:
+                    aks = [(a,k) for a in actions for k in kinds]
+                elif kinds:
+                    aks = [("_", k) for k in kinds]
+
+                for action, kind in aks:
+                    suffix = f"{_safe(kind)}" if action == "_" else f"{_safe(action)}/{_safe(kind)}"
+                    p = f"{tool_base}/{suffix}"
+                    for method in ("get","post"):
+                        op = {
+                            "tags": [f"{server}:{tname}", *( [] if action=="_" else [action] ), kind],
+                            "summary": f"{server} → {tname} → {(kind if action=='_' else action+'/'+kind)}",
+                            "operationId": f"{server}_{safe}_{suffix.replace('/','_')}_{method}",
+                            "description": (
+                                (f"Fixes `kind: \"{kind}\"`." if action=="_" else f"Fixes `action: \"{action}\"` and `kind: \"{kind}\"`. ")
+                                + "Provide only remaining fields."
+                            ),
+                            "parameters": _op_params_with_schema(schema),
+                            "responses": {"200": {"description": "OK"}},
+                            "x-naturalExamples": _nl_examples_from(tname, schema),
+                        }
+                        if method == "post":
+                            op["requestBody"] = _make_request_body(schema, required=False)
+                        paths.setdefault(p, {})[method] = op
+                    paths.setdefault(f"{p}/try", {})["get"] = {
+                        "tags": [f"{server}:{tname}", *( [] if action=="_" else [action] ), kind, "try"],
+                        "summary": f"{server} → {tname} → {(kind if action=='_' else action+'/'+kind)} zero-arg try",
+                        "operationId": f"{server}_{safe}_{suffix.replace('/','_')}_try",
+                        "responses": {"200": {"description": "OK"}},
+                    }
+
+    return paths, components
 
 def custom_openapi():
-    # DO NOT block here; just emit what we have right now.
-    openapi_schema = get_openapi(
-        title=app.title,
-        version=app.version,
-        description=app.description,
-        routes=app.routes,
-    )
-    openapi_schema["x-model-instructions"] = {
-        "callDiscipline": [
-            "Use **GET with query** or **POST with JSON**. If no args, POST `{}`.",
-            "Prefer granular endpoints `/{SERVER}/tool/{TOOL}/{action}[/{kind}]` when enums exist.",
-        ],
-        "bodyShapes": ["Direct body: `{ ... }`", "Wrapped body: `{ \"args\": { ... } }`"],
-        "discovery": [
-            "List tools: `GET or POST /{SERVER}/tools/list` (GET is public if DISCOVERY_PUBLIC=true).",
-            "Per-tool schema: `GET /{SERVER}/tool/{TOOL}/schema`.",
-            "Per-tool example: `GET /{SERVER}/tool/{TOOL}/example`.",
-            "Per-tool help: `GET /{SERVER}/tool/{TOOL}/help`.",
-            "Zero-argument test: `GET /{SERVER}/tool/{TOOL}/try` when available.",
-        ],
-        "typicalFlow": [
-            "1) Read `/openapi.json` and `/SERVER/tools/list`.",
-            "2) For a user intent like “<action> <kind> …”, pick the granular path `/{SERVER}/tool/{TOOL}/{action}/{kind}`.",
-            "3) If unsure which fields are required, call `/schema` or `/example` first.",
-            "4) Prefer GET if you cannot send a body; otherwise POST `{}` or the minimal JSON.",
-        ],
-        "errorFix": [
-            "If you see 'expected a request body', use GET or POST `{}`.",
-            "If you see a schema error, inspect `/schema`, `/example`, or try a granular endpoint.",
-        ],
+    # Base skeleton
+    openapi = {
+        "openapi": "3.1.0",
+        "info": {
+            "title": app.title,
+            "version": app.version,
+            "description": app.description,
+        },
+        "servers": [{"url": PUBLIC_BASE_URL}],
+        "paths": {},
+        "components": {"schemas": {}, "securitySchemes": {
+            "XApiKey": {"type": "apiKey","in": "header","name": "X-Api-Key","description":"Optional API key (if configured)."}
+        }},
+        "x-model-instructions": {
+            "callDiscipline": [
+                "Use **GET with query** or **POST with JSON**. If no args, POST `{}`.",
+                "Prefer granular endpoints `/{SERVER}/tool/{TOOL}/{action}[/{kind}]` when enums exist.",
+            ],
+            "bodyShapes": ["Direct body: `{ ... }`","Wrapped body: `{ \"args\": { ... } }`"],
+            "discovery": [
+                "List tools: `GET /{SERVER}/tools/list` (synthesized from MCP).",
+                "Per-tool schema: `GET /{SERVER}/tool/{TOOL}/schema`.",
+                "Per-tool example: `GET /{SERVER}/tool/{TOOL}/example`.",
+                "Per-tool help: `GET /{SERVER}/tool/{TOOL}/help`.",
+                "Zero-argument test: `GET /{SERVER}/tool/{TOOL}/try`."
+            ],
+            "typicalFlow": [
+                "1) Read `/openapi.json` and `/discovery/status`.",
+                "2) Choose a tool whose schema matches the user request.",
+                "3) Use granular path when available; otherwise call the base tool with minimal JSON.",
+                "4) If you cannot send a body, use GET with `?args={...}` or `?key=value`.",
+            ],
+            "errorFix": [
+                "If you see 'expected a request body', use GET or POST `{}`.",
+                "If you see a schema error, inspect `/schema`, `/example`, or try a granular endpoint.",
+            ],
+        },
     }
-    openapi_schema["x-cookbook"] = _build_k8s_cookbook()
-    openapi_schema["x-mcp-tool-catalog"] = _build_tool_catalog()
-    openapi_schema.setdefault("components", {}).setdefault("securitySchemes", {})
-    openapi_schema["components"]["securitySchemes"]["XApiKey"] = {
-        "type": "apiKey",
-        "in": "header",
-        "name": "X-Api-Key",
-        "description": "Optional API key; set if the bridge was started with API_KEY.",
-    }
-    _augment_operation_docs(openapi_schema)
 
-    # If no tools yet, include a gentle hint (but still return immediately)
-    if not any("/tool/" in p for p in openapi_schema.get("paths", {}).keys()):
-        openapi_schema["x-note"] = {
-            "message": "No tool routes are installed yet. The bridge discovers tools asynchronously.",
+    # Always include fixed routes (health/discovery)
+    fixed_schema = get_openapi(title=app.title, version=app.version, description=app.description, routes=app.routes)
+    for p, item in (fixed_schema.get("paths") or {}).items():
+        if p not in openapi["paths"]:
+            openapi["paths"][p] = item
+
+    # Synthesize tool paths/components directly from MCP data (no blocking)
+    tool_paths, comp = _compose_paths_from_mcp()
+    openapi["paths"].update(tool_paths)
+    openapi["components"]["schemas"].update(comp.get("schemas", {}))
+
+    # MCP catalog (tools + prompts + resources)
+    openapi["x-mcp-tool-catalog"] = [
+        {
+            "server": sname,
+            "tool": tname,
+            "description": t.get("description", "No description provided by MCP server."),
+            "schema": describe_schema(t.get("inputSchema") or {"type":"object"}),
+        }
+        for sname, st in SERVERS.items()
+        for tname, t in st.tools.items()
+    ]
+    openapi["x-mcp-prompts"] = {
+        sname: st.prompts for sname, st in SERVERS.items() if st.prompts
+    }
+    openapi["x-mcp-resources"] = {
+        sname: st.resources for sname, st in SERVERS.items() if st.resources
+    }
+
+    # Hint if nothing discovered yet
+    if not any("/tool/" in p for p in openapi.get("paths", {}).keys()):
+        openapi["x-note"] = {
+            "message": "No tool paths synthesized yet. Discovery runs asynchronously.",
             "actions": [
-                "Call `GET /discovery/status` to check progress.",
-                "Optionally call `POST /discover?wait=3` to prompt a discovery cycle.",
+                "Call `POST /discover?wait=3` to prompt a discovery cycle.",
                 "Then re-fetch `/openapi.json`."
             ]
         }
-    return openapi_schema
+    return openapi
 
 app.openapi = custom_openapi
