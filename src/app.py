@@ -23,8 +23,9 @@ import re
 import sys
 import textwrap
 from typing import Any, Dict, List, Optional
+from urllib.parse import unquote
 
-from fastapi import FastAPI, Body, Query, Path, HTTPException
+from fastapi import FastAPI, Body, Query, Path, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -158,22 +159,22 @@ def build_k8s_output_guidance(tool_name: str) -> Dict[str, Any]:
             "For 'api-resources'/'api-versions', `format=json` works when supported; otherwise text table."
         ],
         "parsingHints": {
-            "describe/pods (text)": {
-                "extract": [
-                    {"field": "name", "regex": r"^Name:\s+([^\s]+)"},
-                    {"field": "namespace", "regex": r"^Namespace:\s+([^\s]+)"},
-                    {"field": "node", "regex": r"^Node:\s+([^\s]+)"},
-                    {"field": "podIP", "regex": r"^IP:\s+([^\s]+)"},
-                    {"field": "phase", "regex": r"^Status:\s+([A-Za-z]+)"},
-                ],
-                "lineMode": True
-            },
-            "logs (text)": {
-                "extract": [
-                    {"field": "lines", "note": "Split by newline; may contain timestamps."}
-                ]
+                "describe/pods (text)": {
+                    "extract": [
+                        {"field": "name", "regex": r"^Name:\s+([^\s]+)"},
+                        {"field": "namespace", "regex": r"^Namespace:\s+([^\s]+)"},
+                        {"field": "node", "regex": r"^Node:\s+([^\s]+)"},
+                        {"field": "podIP", "regex": r"^IP:\s+([^\s]+)"},
+                        {"field": "phase", "regex": r"^Status:\s+([A-Za-z]+)"},
+                    ],
+                    "lineMode": True
+                },
+                "logs (text)": {
+                    "extract": [
+                        {"field": "lines", "note": "Split by newline; may contain timestamps."}
+                    ]
+                }
             }
-        }
     }
 
 
@@ -290,7 +291,7 @@ async def mcp_call_tool(session, tool_name: str, args: Dict[str, Any]) -> Dict[s
 
 app = FastAPI(
     title="MCP OpenAPI Bridge (Generic, Self-Discovering)",
-    version="3.1.2",
+    version="3.1.3",
     description=textwrap.dedent(
         """\
         A generic, self-discovering OpenAPI façade for MCP servers.
@@ -310,6 +311,39 @@ app.add_middleware(
     allow_origins=["*"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"],
 )
+
+# --- Small, surgical: path normalizer to accept placeholders and spaces ------
+@app.middleware("http")
+async def normalize_odd_paths(request: Request, call_next):
+    # Unquote once so %3Cserver-alias%3E, %20, etc become plain text
+    raw_path = request.scope.get("path") or ""
+    decoded = unquote(raw_path)
+
+    # If caller used literal placeholders, map them to /mcp/...
+    for bad in ("<server-alias>", "<server>", "server-alias", "server"):
+        prefix = f"/{bad}/"
+        if decoded.startswith(prefix):
+            decoded = "/mcp/" + decoded[len(prefix):]
+            break
+
+    # If caller put spaces after /tool/, e.g., /tool/kubectl/get pods -> get/pods
+    # Only touch the segment after '/tool/'.
+    marker = "/tool/"
+    if marker in decoded:
+        head, tail = decoded.split(marker, 1)
+        # Replace runs of spaces with slashes (safe for 'get pods', 'describe pod', etc.)
+        tail = tail.replace("  ", " ").strip()
+        if " " in tail and "/" not in tail.split("/", 1)[-1]:
+            # Convert spaces to slashes in the remainder
+            tail = "/".join([p for p in tail.split(" ") if p])
+        decoded = head + marker + tail
+
+    # If changed, patch the path in scope
+    if decoded != raw_path:
+        request.scope["path"] = decoded
+
+    return await call_next(request)
+# -----------------------------------------------------------------------------
 
 
 @app.on_event("startup")
@@ -543,7 +577,7 @@ async def resolve_arg_payload(
 
 async def ensure_connected(server: str) -> ServerState:
     """
-    Small compat shim to avoid 404/503 on hard-coded '/mcp/...':
+    Small compat shim to avoid 404/503 on odd aliases:
     - If the requested alias isn't found but any server is configured,
       transparently fall back to the *first configured* server.
     - If the chosen server isn't connected yet, attempt to connect now.
@@ -551,7 +585,6 @@ async def ensure_connected(server: str) -> ServerState:
     st = DISCOVERY.servers.get(server)
 
     if not st and DISCOVERY.servers:
-        # fall back to first configured server (keeps /mcp/... working)
         first_alias, st = next(iter(DISCOVERY.servers.items()))
         print(f"[compat] Alias '{server}' not found; falling back to '{first_alias}'", file=sys.stderr)
 
@@ -559,7 +592,6 @@ async def ensure_connected(server: str) -> ServerState:
         raise HTTPException(404, f"Unknown server '{server}'")
 
     if not st.connected or not st.client:
-        # try to connect on demand
         try:
             if st.cfg.mode == "stdio":
                 st.client = await mcp_connect_stdio(st.cfg)
@@ -663,7 +695,6 @@ async def do_tool_call(
             "final_args": final_args
         }
 
-    # BEST-EFFORT CALL even if td is missing — do not 404
     try:
         print(f"[invoke] server={server} tool={tool} suffix='{suffix}' final_args={final_args}", file=sys.stderr)
         return await mcp_call_tool(st.client, tool, final_args)
