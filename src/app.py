@@ -1,27 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MCP OpenAPI Bridge — Generic, Self-Discovering
-----------------------------------------------
+MCP OpenAPI Bridge — Generic, Self-Discovering (resilient)
+----------------------------------------------------------
 - Discovers MCP servers + tools at runtime
 - Exposes generic and granular HTTP endpoints per tool
-- Builds a richly annotated OpenAPI with model guidance,
-  natural-language intents, parsing hints, format/dryrun helpers
-
-Transport:
-- Prefers the official "mcp" python client (stdio).
-- Also supports a "router" mode via another process (optional).
-- You can run multiple servers; configure with MCP_SERVERS env var.
-
-Install (if needed):
-  pip install fastapi uvicorn pydantic mcp[stdio]
+- Calls succeed even if discovery hasn't populated a tool yet
+- Rich OpenAPI with x-* guidance and examples
 
 Run:
-  UVICORN_WORKERS=1 uvicorn app:app --host 0.0.0.0 --port 8080
+  uvicorn app:app --host 0.0.0.0 --port 8080
 
 Env:
-  MCP_SERVERS='[{"alias":"mcp","mode":"stdio","cmd":["/path/to/mcp-server","--flag"]}]'
-  MCP_DISCOVERY_WAIT=2  (seconds to wait for discovery on POST /discover)
+  MCP_SERVERS='[{"alias":"mcp","mode":"stdio","cmd":["/path/to/mcp-server"]}]'
+  MCP_DISCOVERY_WAIT=2
 """
 
 import asyncio
@@ -37,7 +29,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-# ---- Optional MCP client (stdio) -------------------------------------------
+# ---- Optional MCP stdio client ---------------------------------------------
 try:
     from mcp.client.stdio import stdio_client
     from mcp.types import TextContent
@@ -52,7 +44,7 @@ except Exception:
 
 class ServerConfig(BaseModel):
     alias: str
-    mode: str = Field("stdio", description="stdio | custom(implement in code)")
+    mode: str = Field("stdio", description="stdio | custom")
     cmd: Optional[List[str]] = None
     env: Optional[Dict[str, str]] = None
 
@@ -298,7 +290,7 @@ async def mcp_call_tool(session, tool_name: str, args: Dict[str, Any]) -> Dict[s
 
 app = FastAPI(
     title="MCP OpenAPI Bridge (Generic, Self-Discovering)",
-    version="3.1.1",
+    version="3.1.2",
     description=textwrap.dedent(
         """\
         A generic, self-discovering OpenAPI façade for MCP servers.
@@ -542,6 +534,15 @@ async def resolve_arg_payload(
     return args_obj
 
 
+async def ensure_connected(server: str) -> ServerState:
+    st = DISCOVERY.servers.get(server)
+    if not st:
+        raise HTTPException(404, f"Unknown server '{server}'")
+    if not st.connected or not st.client:
+        raise HTTPException(503, f"Server '{server}' is not connected")
+    return st
+
+
 async def do_tool_call(
     server: str,
     tool_path: str,
@@ -550,34 +551,45 @@ async def do_tool_call(
     dryrun: bool,
     format_hint: Optional[str],
 ) -> Any:
-    st = DISCOVERY.servers.get(server)
-    if not st:
-        raise HTTPException(404, f"Unknown server '{server}'")
-    if not st.connected or not st.client:
-        raise HTTPException(503, f"Server '{server}' is not connected")
+    st = await ensure_connected(server)
 
     components = tool_path.split("/")
     tool = components[0]
     suffix = "/".join(components[1:]) if len(components) > 1 else ""
 
+    # Try to locate descriptor; if missing, refresh once, then fall back to "best-effort"
     td = st.tools.get(tool)
     if not td:
-        raise HTTPException(404, f"Server '{server}' has no tool '{tool}'")
+        print(f"[dispatch] Tool '{tool}' not in cache for server '{server}'. Refreshing discovery...", file=sys.stderr)
+        await do_discover(wait_seconds=0)
+        td = DISCOVERY.servers.get(server, ServerState(ServerConfig(alias=server))).tools.get(tool)
 
+    # Helper endpoints even without td: schema/example/help/try
     if suffix in ("schema", "example", "help"):
+        if td:
+            if suffix == "schema":
+                return td.input_schema or {}
+            if suffix == "example":
+                return {"naturalExamples": td.natural_examples}
+            if suffix == "help":
+                return {
+                    "name": tool,
+                    "description": td.description,
+                    "inferred_actions": td.inferred_actions,
+                    "inferred_kinds": td.inferred_kinds,
+                    "convenience_params": td.convenience_params,
+                    "outputGuidance": td.output_guidance,
+                    "usage": td.usage
+                }
+        # No descriptor: provide minimal help
         if suffix == "schema":
-            return td.input_schema or {}
+            return {}
         if suffix == "example":
-            return {"naturalExamples": td.natural_examples}
+            return {"naturalExamples": []}
         if suffix == "help":
             return {
-                "name": tool,
-                "description": td.description,
-                "inferred_actions": td.inferred_actions,
-                "inferred_kinds": td.inferred_kinds,
-                "convenience_params": td.convenience_params,
-                "outputGuidance": td.output_guidance,
-                "usage": td.usage
+                "name": tool, "description": "", "inferred_actions": [], "inferred_kinds": [],
+                "convenience_params": CONVENIENCE_PARAMS, "outputGuidance": {}, "usage": {}
             }
 
     if suffix == "try":
@@ -585,6 +597,7 @@ async def do_tool_call(
             return {"dryrun": True, "tool": tool, "args": {}}
         return await mcp_call_tool(st.client, tool, {})
 
+    # Build args from URL suffix when present (action/kind)
     args = {}
     convenience = {}
     if suffix and suffix not in ("invoke",):
@@ -606,7 +619,14 @@ async def do_tool_call(
 
     final_args = await resolve_arg_payload(args, query_args_fallback, convenience, format_hint)
 
+    # If still missing 'operation'/'resource' and we have a descriptor, inject defaults when sensible
+    if td and "operation" not in final_args and td.inferred_actions:
+        final_args["operation"] = td.inferred_actions[0]
+    if td and "resource" not in final_args and td.inferred_kinds:
+        final_args["resource"] = td.inferred_kinds[0]
+
     if dryrun:
+        print(f"[dryrun] server={server} tool={tool} suffix='{suffix}' final_args={final_args}", file=sys.stderr)
         return {
             "dryrun": True,
             "server": server,
@@ -614,7 +634,13 @@ async def do_tool_call(
             "final_args": final_args
         }
 
-    return await mcp_call_tool(st.client, tool, final_args)
+    # BEST-EFFORT CALL even if td is missing — do not 404
+    try:
+        print(f"[invoke] server={server} tool={tool} suffix='{suffix}' final_args={final_args}", file=sys.stderr)
+        return await mcp_call_tool(st.client, tool, final_args)
+    except Exception as e:
+        # Give a helpful error with context
+        raise HTTPException(502, f"Tool invocation failed for '{tool_path}': {e}")
 
 
 @app.post(
@@ -696,7 +722,7 @@ async def tool_dispatch_get(
 
 
 # =============================================================================
-# Per-tool helper endpoints (schema/example/help/try)
+# Per-tool helper endpoints (schema/example/help/try) for convenience
 # =============================================================================
 
 @app.get("/mcp/tool/{tool}/invoke", tags=["tools", "invoke"], summary="Invoke (GET /invoke)")
@@ -708,7 +734,7 @@ async def tool_invoke_get(tool: str, **kwargs):
 async def tool_schema(tool: str):
     st = DISCOVERY.servers.get("mcp")
     if not st or tool not in st.tools:
-        raise HTTPException(404, f"No such tool '{tool}' on server 'mcp'")
+        return {}
     return st.tools[tool].input_schema or {}
 
 
@@ -716,7 +742,7 @@ async def tool_schema(tool: str):
 async def tool_example(tool: str):
     st = DISCOVERY.servers.get("mcp")
     if not st or tool not in st.tools:
-        raise HTTPException(404, f"No such tool '{tool}' on server 'mcp'")
+        return {"naturalExamples": []}
     return {"naturalExamples": st.tools[tool].natural_examples}
 
 
@@ -724,7 +750,15 @@ async def tool_example(tool: str):
 async def tool_help(tool: str):
     st = DISCOVERY.servers.get("mcp")
     if not st or tool not in st.tools:
-        raise HTTPException(404, f"No such tool '{tool}' on server 'mcp'")
+        return {
+            "name": tool,
+            "description": "",
+            "inferred_actions": [],
+            "inferred_kinds": [],
+            "convenience_params": CONVENIENCE_PARAMS,
+            "outputGuidance": {},
+            "usage": {}
+        }
     td = st.tools[tool]
     return {
         "name": tool,
