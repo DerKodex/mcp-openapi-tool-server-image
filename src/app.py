@@ -14,6 +14,7 @@ Run:
 Env:
   MCP_SERVERS='[{"alias":"mcp","mode":"stdio","cmd":["/path/to/mcp-server"]}]'
   MCP_DISCOVERY_WAIT=2
+  MCP_FORWARD_URL='http://mcp-upstream:8080'   # OPTIONAL: HTTP fallback target
 """
 
 import asyncio
@@ -25,6 +26,7 @@ import textwrap
 from typing import Any, Dict, List, Optional
 from urllib.parse import unquote
 
+import httpx
 from fastapi import FastAPI, Body, Query, Path, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -84,6 +86,7 @@ class DiscoveryState:
 
 
 DISCOVERY = DiscoveryState()
+MCP_FORWARD_URL = os.getenv("MCP_FORWARD_URL")  # Optional HTTP fallback
 
 
 # =============================================================================
@@ -291,7 +294,7 @@ async def mcp_call_tool(session, tool_name: str, args: Dict[str, Any]) -> Dict[s
 
 app = FastAPI(
     title="MCP OpenAPI Bridge (Generic, Self-Discovering)",
-    version="3.1.6",
+    version="3.1.7",
     description=textwrap.dedent(
         """\
         A generic, self-discovering OpenAPI façade for MCP servers.
@@ -561,6 +564,28 @@ async def tools_list(server: str = Path(..., description="Server alias")):
 
 
 # =============================================================================
+# HTTP Fallback helper
+# =============================================================================
+
+async def forward_via_http(server: str, tool_path: str, method: str, params: Dict[str, Any], body: Optional[Dict[str, Any]]):
+    if not MCP_FORWARD_URL:
+        raise HTTPException(503, "No MCP server connected and MCP_FORWARD_URL not set for HTTP fallback")
+    url = MCP_FORWARD_URL.rstrip("/") + f"/{server}/tool/{tool_path}"
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            if method.upper() == "GET":
+                r = await client.get(url, params=params)
+            else:
+                r = await client.post(url, params=params, json=body or {})
+        # Try to return JSON if possible; otherwise return raw text
+        if r.headers.get("content-type", "").startswith("application/json"):
+            return JSONResponse(status_code=r.status_code, content=r.json())
+        return JSONResponse(status_code=r.status_code, content={"upstream_text": r.text})
+    except Exception as e:
+        raise HTTPException(503, f"HTTP fallback to {url} failed: {e}")
+
+
+# =============================================================================
 # Generic + Granular Tool Dispatch
 # =============================================================================
 
@@ -736,6 +761,10 @@ async def do_tool_call(
         raise HTTPException(502, f"Tool invocation failed for '{tool_path}': {e}")
 
 
+# =============================================================================
+# Generic dispatchers (with HTTP fallback on 503)
+# =============================================================================
+
 @app.post(
     "/{server}/tool/{tool_path:path}",
     tags=["tools"],
@@ -756,15 +785,29 @@ async def tool_dispatch_post(
             qargs = json.loads(args)
         except Exception:
             qargs = args
-    result = await do_tool_call(
-        server,
-        tool_path,
-        body or (qargs if isinstance(qargs, dict) else None),
-        None,
-        bool(dryrun),
-        format
-    )
-    return JSONResponse(result)
+    payload_body = body or (qargs if isinstance(qargs, dict) else None)
+
+    try:
+        result = await do_tool_call(
+            server,
+            tool_path,
+            payload_body,
+            None,
+            bool(dryrun),
+            format
+        )
+        return JSONResponse(result)
+    except HTTPException as e:
+        if e.status_code == 503:
+            params: Dict[str, Any] = {}
+            if format is not None:
+                params["format"] = format
+            if dryrun:
+                params["dryrun"] = dryrun
+            if isinstance(qargs, str):
+                params["args"] = qargs
+            return await forward_via_http(server, tool_path, "POST", params, payload_body)
+        raise
 
 
 @app.get(
@@ -810,11 +853,27 @@ async def tool_dispatch_get(
         if v is not None:
             body[k] = v
 
-    result = await do_tool_call(server, tool_path, body, qargs_fallback, bool(dryrun), format)
-    return JSONResponse(result)
+    try:
+        result = await do_tool_call(server, tool_path, body, qargs_fallback, bool(dryrun), format)
+        return JSONResponse(result)
+    except HTTPException as e:
+        if e.status_code == 503:
+            params: Dict[str, Any] = {}
+            if format is not None:
+                params["format"] = format
+            if dryrun:
+                params["dryrun"] = dryrun
+            if args is not None:
+                params["args"] = args
+            # include convenience params in query for GET forwarding
+            for k in ("namespace","name","labels","labelSelector","fieldSelector","container","sinceSeconds"):
+                if k in body:
+                    params[k] = body[k]
+            return await forward_via_http(server, tool_path, "GET", params, None)
+        raise
 
 
-# -------------------- explicit granular routes --------------------
+# -------------------- explicit granular routes (with HTTP fallback) --------------------
 
 @app.post(
     "/{server}/tool/{tool}/{action}/{kind}",
@@ -855,15 +914,28 @@ async def granular_post_kind(
         except Exception:
             pass
 
-    result = await do_tool_call(
-        server,
-        f"{tool}/{action}/{kind}",
-        body,
-        None,
-        bool(dryrun),
-        format,
-    )
-    return JSONResponse(result)
+    tool_path = f"{tool}/{action}/{kind}"
+    try:
+        result = await do_tool_call(
+            server,
+            tool_path,
+            body,
+            None,
+            bool(dryrun),
+            format,
+        )
+        return JSONResponse(result)
+    except HTTPException as e:
+        if e.status_code == 503:
+            params: Dict[str, Any] = {}
+            if format is not None:
+                params["format"] = format
+            if dryrun:
+                params["dryrun"] = dryrun
+            if args is not None:
+                params["args"] = args
+            return await forward_via_http(server, tool_path, "POST", params, body)
+        raise
 
 
 @app.get(
@@ -907,15 +979,30 @@ async def granular_get_kind(
         except Exception:
             qargs_fallback = args
 
-    result = await do_tool_call(
-        server,
-        f"{tool}/{action}/{kind}",
-        body,
-        qargs_fallback,
-        bool(dryrun),
-        format,
-    )
-    return JSONResponse(result)
+    tool_path = f"{tool}/{action}/{kind}"
+    try:
+        result = await do_tool_call(
+            server,
+            tool_path,
+            body,
+            qargs_fallback,
+            bool(dryrun),
+            format,
+        )
+        return JSONResponse(result)
+    except HTTPException as e:
+        if e.status_code == 503:
+            params: Dict[str, Any] = {}
+            if format is not None:
+                params["format"] = format
+            if dryrun:
+                params["dryrun"] = dryrun
+            if qargs_fallback is not None:
+                params["args"] = qargs_fallback
+            for k, v in body.items():
+                params[k] = v
+            return await forward_via_http(server, tool_path, "GET", params, None)
+        raise
 
 
 @app.post(
@@ -956,15 +1043,28 @@ async def granular_post_action(
         except Exception:
             pass
 
-    result = await do_tool_call(
-        server,
-        f"{tool}/{action}",
-        body,
-        None,
-        bool(dryrun),
-        format,
-    )
-    return JSONResponse(result)
+    tool_path = f"{tool}/{action}"
+    try:
+        result = await do_tool_call(
+            server,
+            tool_path,
+            body,
+            None,
+            bool(dryrun),
+            format,
+        )
+        return JSONResponse(result)
+    except HTTPException as e:
+        if e.status_code == 503:
+            params: Dict[str, Any] = {}
+            if format is not None:
+                params["format"] = format
+            if dryrun:
+                params["dryrun"] = dryrun
+            if args is not None:
+                params["args"] = args
+            return await forward_via_http(server, tool_path, "POST", params, body)
+        raise
 
 
 @app.get(
@@ -1007,15 +1107,30 @@ async def granular_get_action(
         except Exception:
             qargs_fallback = args
 
-    result = await do_tool_call(
-        server,
-        f"{tool}/{action}",
-        body,
-        qargs_fallback,
-        bool(dryrun),
-        format,
-    )
-    return JSONResponse(result)
+    tool_path = f"{tool}/{action}"
+    try:
+        result = await do_tool_call(
+            server,
+            tool_path,
+            body,
+            qargs_fallback,
+            bool(dryrun),
+            format,
+        )
+        return JSONResponse(result)
+    except HTTPException as e:
+        if e.status_code == 503:
+            params: Dict[str, Any] = {}
+            if format is not None:
+                params["format"] = format
+            if dryrun:
+                params["dryrun"] = dryrun
+            if qargs_fallback is not None:
+                params["args"] = qargs_fallback
+            for k, v in body.items():
+                params[k] = v
+            return await forward_via_http(server, tool_path, "GET", params, None)
+        raise
 
 # ------------------ end of explicit granular routes ------------------
 
