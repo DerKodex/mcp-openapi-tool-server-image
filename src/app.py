@@ -257,48 +257,88 @@ def compose_argstring(
 
 async def mcp_connect_stdio(cfg: ServerConfig):
     """
-    Create an MCP stdio client supporting both SDK shapes:
-    - Newer SDKs: stdio_client(...) -> async context manager (enter it)
-    - Older SDKs: stdio_client(...) -> awaitable (await it)
-    Also supports older SDKs that don't accept env= on stdio_client.
+    Create an MCP stdio client across SDK variants:
+    - Some expect stdio_client(command=<str>, args=[...], env={...}) and return an async CM.
+    - Others accept stdio_client(<list or str>) and return an awaitable.
+    - Some don't accept env=; we shim by temporarily injecting into os.environ.
     """
     if not MCP_AVAILABLE:
         raise RuntimeError("MCP python SDK not installed. pip install mcp[stdio]")
     if not cfg.cmd:
         raise RuntimeError(f"Server {cfg.alias}: stdio mode requires 'cmd'.")
 
-    def _make_client_factory():
-        try:
-            # Newer SDKs often support env= on stdio_client
-            return stdio_client(cfg.cmd, env=cfg.env or {})
-        except TypeError as e:
-            # Older SDKs: no env= kwarg; temporarily inject env for the spawn
-            if "unexpected keyword argument 'env'" not in str(e):
-                raise
+    # --- Normalize cmd into (<str> command, [args] list)
+    if isinstance(cfg.cmd, list):
+        if not cfg.cmd:
+            raise RuntimeError(f"Server {cfg.alias}: empty cmd list.")
+        _command, _args = str(cfg.cmd[0]), [str(x) for x in cfg.cmd[1:]]
+    elif isinstance(cfg.cmd, str):
+        _command, _args = cfg.cmd, []
+    else:
+        raise RuntimeError(f"Server {cfg.alias}: cmd must be list[str] or str, got {type(cfg.cmd)}")
+
+    def _call_variants(allow_env_kw: bool):
+        """
+        Yield possible constructor callables for stdio_client in descending preference.
+        If allow_env_kw is False, don't pass env= (for older SDKs).
+        """
+        env_kw = {} if not allow_env_kw else {"env": (cfg.env or {})}
+
+        # 1) Newer SDK shape: explicit command + args
+        def v1():
+            return stdio_client(command=_command, args=_args, **env_kw)
+
+        # 2) Some SDKs accept a single list or str positional
+        def v2():
+            cmd_pos = [_command] + _args if _args else _command
+            return stdio_client(cmd_pos, **env_kw)
+
+        # 3) Some SDKs accept command= with list (they split internally)
+        def v3():
+            cmd_as_list = [_command] + _args
+            return stdio_client(command=cmd_as_list, **env_kw)
+
+        return (v1, v2, v3)
+
+    # Try with env kwarg first; on TypeError fall back to env injection path
+    last_exc = None
+    for allow_env_kw in (True, False):
+        # If not allowed, we temporarily inject env into process for spawn
+        orig_env = None
+        if not allow_env_kw and cfg.env:
             orig_env = os.environ.copy()
-            try:
-                if cfg.env:
-                    os.environ.update(cfg.env)
-                return stdio_client(cfg.cmd)
-            finally:
+            os.environ.update(cfg.env)
+
+        try:
+            for ctor in _call_variants(allow_env_kw):
+                try:
+                    res = ctor()
+                    # Handle async context manager vs awaitable
+                    if hasattr(res, "__aenter__"):
+                        client = await res.__aenter__()  # type: ignore[attr-defined]
+                        try:
+                            setattr(client, "__mcp_ctx__", res)
+                        except Exception:
+                            pass
+                    else:
+                        client = await res
+                    await client.initialize()
+                    return client
+                except TypeError as te:
+                    # Wrong signature; try next variant
+                    last_exc = te
+                    continue
+                except AttributeError as ae:
+                    # e.g., "'list' object has no attribute 'command'" inside SDK
+                    last_exc = ae
+                    continue
+        finally:
+            if orig_env is not None:
                 os.environ.clear()
                 os.environ.update(orig_env)
 
-    res = _make_client_factory()
-
-    # If the SDK returns an async context manager, enter it; else await it.
-    if hasattr(res, "__aenter__"):
-        client = await res.__aenter__()  # type: ignore[attr-defined]
-        # Tag the client with its context so we can close it on shutdown
-        try:
-            setattr(client, "__mcp_ctx__", res)
-        except Exception:
-            pass
-    else:
-        client = await res  # older awaitable form
-
-    await client.initialize()
-    return client
+    # If we get here, all variants failed
+    raise RuntimeError(f"Failed to create stdio MCP client for '{cfg.alias}': {last_exc}")
 
 async def mcp_list_tools(session) -> List[Dict[str, Any]]:
     result = await session.list_tools()
