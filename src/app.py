@@ -43,7 +43,7 @@ if not SERVERS_CFG:
 # =========================
 app = FastAPI(
     title="MCP OpenAPI Bridge (Granular + Multi-Server)",
-    version="0.8.0",
+    version="0.9.0",
     description=(
         "A self-discovering OpenAPI façade for MCP servers. "
         "It generates detailed, example-rich endpoints for each MCP tool and adds granular paths when it detects "
@@ -280,16 +280,21 @@ def normalize_body(
         base = merge(base, coerce_query_params(schema or {"type":"object"}, qp))
     return base or {}
 
-def make_request_body(schema: Dict[str, Any]) -> Dict[str, Any]:
+# -------- OpenAPI helpers: request bodies & query fallbacks ----------
+def make_request_body(schema: Dict[str, Any], required: bool = False) -> Dict[str, Any]:
+    """
+    We declare requestBody as NOT required so tool planners won't abort when no body is present.
+    Handlers accept an empty body and also coerce query params (?namespace=..., ?args=...).
+    """
     direct = schema or {"type": "object"}
     wrapped = {"type": "object", "properties": {"args": direct}, "required": ["args"]}
     return {
-        "required": True,
+        "required": required,  # deliberately False by default
         "content": {
             "application/json": {
                 "schema": {"oneOf": [direct, wrapped]},
                 "examples": {
-                    "empty": {"summary": "No arguments", "value": {}},
+                    "empty":  {"summary": "No arguments", "value": {}},
                     "direct": {"summary": "Direct body", "value": example_from_schema(direct) or {}},
                     "wrapped": {"summary": "Wrapped in args", "value": {"args": example_from_schema(direct) or {}}},
                 },
@@ -299,6 +304,26 @@ def make_request_body(schema: Dict[str, Any]) -> Dict[str, Any]:
 
 def schema_has_required(schema: Dict[str, Any]) -> bool:
     return bool(isinstance(schema, dict) and schema.get("required"))
+
+# Common query params to inject into every tool POST in OpenAPI
+_COMMON_QUERY_PARAMS = [
+    {
+        "name": "args",
+        "in": "query",
+        "required": False,
+        "description": "JSON-encoded arguments fallback when you cannot send a body. Example: ?args={\"namespace\":\"ollama\",\"kind\":\"pods\",\"action\":\"get\"}",
+        "schema": {"type": "string"}
+    },
+    {"name": "namespace", "in": "query", "required": False, "description": "Kubernetes namespace (e.g., 'ollama').", "schema": {"type": "string"}},
+    {"name": "name",      "in": "query", "required": False, "description": "Resource name (pod/deployment/etc.).", "schema": {"type": "string"}},
+    {"name": "kind",      "in": "query", "required": False, "description": "Resource kind (pods, deployments, services, events, namespaces).", "schema": {"type": "string"}},
+    {"name": "action",    "in": "query", "required": False, "description": "Action/verb (get, describe, logs, delete, apply).", "schema": {"type": "string"}},
+    {"name": "labels",    "in": "query", "required": False, "description": "Comma-separated label selector (e.g., app=ollama,tier=backend).", "schema": {"type": "string"}},
+    {"name": "fieldSelector", "in": "query", "required": False, "description": "Kubernetes field selector string.", "schema": {"type": "string"}},
+    {"name": "limit",     "in": "query", "required": False, "description": "Max items to return.", "schema": {"type": "integer"}},
+    {"name": "container", "in": "query", "required": False, "description": "Container name (for logs).", "schema": {"type": "string"}},
+    {"name": "sinceSeconds","in": "query","required": False, "description": "Only return logs newer than X seconds.", "schema": {"type": "integer"}},
+]
 
 _registered: set[str] = set()  # Track mounted routes
 
@@ -724,7 +749,93 @@ async def unhandled_exc_handler(request: Request, exc: Exception):
 # =========================
 # Custom OpenAPI with explicit model guidance
 # =========================
-from fastapi.openapi.utils import get_openapi
+def _build_k8s_cookbook() -> List[Dict[str, Any]]:
+    cookbook: List[Dict[str, Any]] = []
+    for server, st in SERVERS.items():
+        for t in st.tools.values():
+            name = t.get("name", "")
+            schema = t.get("inputSchema") or {}
+            props = schema.get("properties", {}) if isinstance(schema, dict) else {}
+            if ("kube" in name or "kubectl" in name or "k8" in name) and ("kind" in props or "action" in props):
+                tool_path = f"/{server}/tool/{_safe(name)}"
+                cookbook.extend([
+                    {
+                        "intent": "List all pods in the <namespace> namespace",
+                        "preferred": f"POST {tool_path}/get/pods",
+                        "body": {"namespace": "<namespace>"},
+                        "alternatives": [
+                            {"call": f"POST {tool_path}", "body": {"action":"get","kind":"pods","namespace":"<namespace>"}},
+                            {"call": f"GET  {tool_path}/get/pods?namespace=<namespace>"},
+                            {"call": f"POST {tool_path}/get/pods?args=%7B%22namespace%22%3A%22<namespace>%22%7D"}
+                        ],
+                        "notes": [
+                            "If you cannot send a body, use the query-string variants.",
+                            "Replace <namespace> with 'ollama' to match the example prompt."
+                        ]
+                    },
+                    {
+                        "intent": "Describe the <pod> pod in the <namespace> namespace",
+                        "preferred": f"POST {tool_path}/get/pods",
+                        "body": {"namespace": "<namespace>", "name": "<pod>"},
+                    },
+                    {
+                        "intent": "Get logs for the <pod> pod in the <namespace> namespace",
+                        "preferred": f"POST {tool_path}/logs/pods",
+                        "body": {"namespace": "<namespace>", "name": "<pod>", "container": "<optional>"},
+                    },
+                ])
+    return cookbook
+
+def _augment_operation_docs(openapi_schema: Dict[str, Any]):
+    """
+    Make each tool POST extremely explicit:
+    - requestBody not required (but supported).
+    - Common K8s params in query.
+    - Natural-language examples ("list pods in ollama").
+    """
+    paths = openapi_schema.get("paths", {})
+    for path, methods in list(paths.items()):
+        if "/tool/" not in path:
+            continue
+        for verb, op in list(methods.items()):
+            if verb.lower() != "post":
+                continue
+
+            # Ensure requestBody exists and is NOT required
+            rb = op.get("requestBody") or {}
+            rb["required"] = False
+            op["requestBody"] = rb
+
+            # Add common query params if not present
+            existing = {(p.get("name"), p.get("in")) for p in op.get("parameters", [])}
+            params = op.setdefault("parameters", [])
+            for qp in _COMMON_QUERY_PARAMS:
+                key = (qp["name"], qp["in"])
+                if key not in existing:
+                    params.append(qp)
+
+            # Strengthen description and usage
+            guidance = (
+                "CALLING RULES:\n"
+                "• Preferred: POST a JSON object body. If you have no arguments, send `{}`.\n"
+                "• If you cannot send a body: use `?args={...}` or individual `?key=value` such as `?namespace=ollama`.\n"
+                "• Prefer granular paths like '/{server}/tool/{tool}/get/pods' when action/kind are implied.\n"
+                "• If you see 'Request body expected', retry the same call with an empty body `{}`.\n"
+            )
+            op["description"] = ((op.get("description") or "") + "\n\n" + guidance).strip()
+
+            # Add a canonical NL example
+            examples = op.setdefault("x-naturalExamples", [])
+            examples.append({
+                "intent": "List all pods in the ollama namespace",
+                "how": [
+                    "Extract `namespace=ollama` from the phrase.",
+                    "Use a granular endpoint if available: '/…/get/pods'.",
+                    "Otherwise call the generic tool with `{ \"action\":\"get\", \"kind\":\"pods\", \"namespace\":\"ollama\" }`.",
+                    "If you cannot send a body, pass `?namespace=ollama` or `?args={\"namespace\":\"ollama\",\"kind\":\"pods\",\"action\":\"get\"}`."
+                ]
+            })
+
 def custom_openapi():
     if app.openapi_schema:
         return app.openapi_schema
@@ -761,6 +872,7 @@ def custom_openapi():
             "If you see a schema error, consult `/schema`, `/example`, or use a granular endpoint.",
         ],
     }
+    openapi_schema["x-cookbook"] = _build_k8s_cookbook()
     openapi_schema.setdefault("components", {}).setdefault("securitySchemes", {})
     openapi_schema["components"]["securitySchemes"]["XApiKey"] = {
         "type": "apiKey",
@@ -768,6 +880,10 @@ def custom_openapi():
         "name": "X-Api-Key",
         "description": "Optional API key; set if the bridge was started with API_KEY.",
     }
+
+    # Per-operation augmentation
+    _augment_operation_docs(openapi_schema)
+
     app.openapi_schema = openapi_schema
     return app.openapi_schema
 
