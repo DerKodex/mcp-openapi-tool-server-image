@@ -15,6 +15,7 @@ Env:
   MCP_SERVERS='[{"alias":"mcp","mode":"stdio","cmd":["/path/to/mcp-server"]}]'
   MCP_DISCOVERY_WAIT=2
   MCP_FORWARD_URL='http://mcp-upstream:8080'   # OPTIONAL: HTTP fallback target
+  MCP_RPC_URL='http://mcp-upstream:8080'       # ALSO ACCEPTED as fallback base if MCP_FORWARD_URL not set
 """
 
 import asyncio
@@ -86,7 +87,8 @@ class DiscoveryState:
 
 
 DISCOVERY = DiscoveryState()
-MCP_FORWARD_URL = os.getenv("MCP_FORWARD_URL")  # Optional HTTP fallback
+# ---- SMALL CHANGE: accept either MCP_FORWARD_URL or MCP_RPC_URL
+MCP_FORWARD_URL = os.getenv("MCP_FORWARD_URL") or os.getenv("MCP_RPC_URL")  # Optional HTTP fallback
 
 
 # =============================================================================
@@ -294,7 +296,7 @@ async def mcp_call_tool(session, tool_name: str, args: Dict[str, Any]) -> Dict[s
 
 app = FastAPI(
     title="MCP OpenAPI Bridge (Generic, Self-Discovering)",
-    version="3.1.7",
+    version="3.1.8",  # tiny bump
     description=textwrap.dedent(
         """\
         A generic, self-discovering OpenAPI façade for MCP servers.
@@ -564,25 +566,52 @@ async def tools_list(server: str = Path(..., description="Server alias")):
 
 
 # =============================================================================
-# HTTP Fallback helper
+# HTTP Fallback helper  (SMALL, SURGICAL IMPROVEMENT)
 # =============================================================================
 
 async def forward_via_http(server: str, tool_path: str, method: str, params: Dict[str, Any], body: Optional[Dict[str, Any]]):
-    if not MCP_FORWARD_URL:
-        raise HTTPException(503, "No MCP server connected and MCP_FORWARD_URL not set for HTTP fallback")
-    url = MCP_FORWARD_URL.rstrip("/") + f"/{server}/tool/{tool_path}"
-    try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            if method.upper() == "GET":
-                r = await client.get(url, params=params)
-            else:
-                r = await client.post(url, params=params, json=body or {})
-        # Try to return JSON if possible; otherwise return raw text
-        if r.headers.get("content-type", "").startswith("application/json"):
-            return JSONResponse(status_code=r.status_code, content=r.json())
-        return JSONResponse(status_code=r.status_code, content={"upstream_text": r.text})
-    except Exception as e:
-        raise HTTPException(503, f"HTTP fallback to {url} failed: {e}")
+    """
+    Tiny, surgical change:
+    - Use MCP_FORWARD_URL or MCP_RPC_URL (whichever is set)
+    - Try a few very common upstream path variants and return the first success
+    """
+    base = MCP_FORWARD_URL
+    if not base:
+        raise HTTPException(503, "No MCP server connected and MCP_FORWARD_URL/MCP_RPC_URL not set for HTTP fallback")
+    base = base.rstrip("/")
+
+    # Candidate bases with/without /mcp
+    base_variants: List[str] = []
+    if base.endswith("/mcp"):
+        base_variants = [base, base[:-4]]
+    else:
+        base_variants = [base, base + "/mcp"]
+
+    # Candidate path shapes: with server prefix and without
+    path_variants = [
+        f"/{server}/tool/{tool_path}",
+        f"/tool/{tool_path}",
+    ]
+
+    last_error: Optional[str] = None
+    async with httpx.AsyncClient(timeout=60) as client:
+        for b in base_variants:
+            for p in path_variants:
+                url = b + p
+                try:
+                    if method.upper() == "GET":
+                        r = await client.get(url, params=params)
+                    else:
+                        r = await client.post(url, params=params, json=body or {})
+                    # Return JSON if possible; otherwise return raw text
+                    if r.headers.get("content-type", "").startswith("application/json"):
+                        return JSONResponse(status_code=r.status_code, content=r.json())
+                    return JSONResponse(status_code=r.status_code, content={"upstream_text": r.text})
+                except Exception as e:
+                    last_error = f"{url} -> {e}"
+                    # try next candidate
+
+    raise HTTPException(503, f"HTTP fallback failed. Last error: {last_error or 'no candidates succeeded'}")
 
 
 # =============================================================================
@@ -663,6 +692,7 @@ async def ensure_connected(server: str) -> ServerState:
             else:
                 raise RuntimeError("Missing stdio cmd for MCP server")
         except Exception as e:
+            # IMPORTANT: Raise 503 so HTTP fallback can kick in
             raise HTTPException(503, f"Server '{st.cfg.alias}' is not connected: {e}")
 
     return st
