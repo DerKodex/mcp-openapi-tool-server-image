@@ -721,6 +721,216 @@ async def tool_dispatch_get(
     return JSONResponse(result)
 
 
+# -------------------- NEW: explicit granular routes to avoid 404s --------------------
+
+@app.post(
+    "/{server}/tool/{tool}/{action}/{kind}",
+    tags=["tools"],
+    summary="Granular Tool Dispatch (POST)"
+)
+async def granular_post_kind(
+    server: str,
+    tool: str,
+    action: str,
+    kind: str,
+    args: Optional[str] = Query(None, description="JSON-encoded args fallback"),
+    dryrun: Optional[bool] = Query(False),
+    format: Optional[str] = Query(None, description="Output preference: json|yaml|text"),
+    body: Optional[Dict[str, Any]] = Body(None),
+    namespace: Optional[str] = Query(None),
+    name: Optional[str] = Query(None),
+    labels: Optional[str] = Query(None),
+    labelSelector: Optional[str] = Query(None),
+    fieldSelector: Optional[str] = Query(None),
+    container: Optional[str] = Query(None),
+    sinceSeconds: Optional[int] = Query(None),
+):
+    # Merge convenience query params into body just like GET handler
+    body = (body or {}).copy()
+    for k, v in {
+        "namespace": namespace, "name": name, "labels": labels,
+        "labelSelector": labelSelector, "fieldSelector": fieldSelector,
+        "container": container, "sinceSeconds": sinceSeconds,
+    }.items():
+        if v is not None:
+            body[k] = v
+
+    # Prefer body; if args is JSON dict, merge it too (parity with catch-all)
+    if args:
+        try:
+            parsed = json.loads(args)
+            if isinstance(parsed, dict):
+                body.update(parsed)
+        except Exception:
+            pass
+
+    result = await do_tool_call(
+        server,
+        f"{tool}/{action}/{kind}",
+        body,
+        None,
+        bool(dryrun),
+        format,
+    )
+    return JSONResponse(result)
+
+
+@app.get(
+    "/{server}/tool/{tool}/{action}/{kind}",
+    tags=["tools"],
+    summary="Granular Tool Dispatch (GET)"
+)
+async def granular_get_kind(
+    server: str,
+    tool: str,
+    action: str,
+    kind: str,
+    args: Optional[str] = Query(None, description="JSON-encoded args fallback"),
+    dryrun: Optional[bool] = Query(False),
+    format: Optional[str] = Query(None, description="Output preference: json|yaml|text"),
+    namespace: Optional[str] = Query(None),
+    name: Optional[str] = Query(None),
+    labels: Optional[str] = Query(None),
+    labelSelector: Optional[str] = Query(None),
+    fieldSelector: Optional[str] = Query(None),
+    container: Optional[str] = Query(None),
+    sinceSeconds: Optional[int] = Query(None),
+):
+    # Reuse the GET catch-all behavior by composing tool_path
+    # and passing through query convenience params (via body).
+    body: Dict[str, Any] = {}
+    for k, v in {
+        "namespace": namespace, "name": name, "labels": labels,
+        "labelSelector": labelSelector, "fieldSelector": fieldSelector,
+        "container": container, "sinceSeconds": sinceSeconds,
+    }.items():
+        if v is not None:
+            body[k] = v
+
+    qargs_fallback: Optional[str] = None
+    if args:
+        try:
+            data = json.loads(args)
+            if isinstance(data, dict):
+                body.update(data)
+            else:
+                qargs_fallback = args
+        except Exception:
+            qargs_fallback = args
+
+    result = await do_tool_call(
+        server,
+        f"{tool}/{action}/{kind}",
+        body,
+        qargs_fallback,
+        bool(dryrun),
+        format,
+    )
+    return JSONResponse(result)
+
+
+@app.post(
+    "/{server}/tool/{tool}/{action}",
+    tags=["tools"],
+    summary="Granular Tool Dispatch (POST, action only)"
+)
+async def granular_post_action(
+    server: str,
+    tool: str,
+    action: str,
+    args: Optional[str] = Query(None, description="JSON-encoded args fallback"),
+    dryrun: Optional[bool] = Query(False),
+    format: Optional[str] = Query(None, description="Output preference: json|yaml|text"),
+    body: Optional[Dict[str, Any]] = Body(None),
+    namespace: Optional[str] = Query(None),
+    name: Optional[str] = Query(None),
+    labels: Optional[str] = Query(None),
+    labelSelector: Optional[str] = Query(None),
+    fieldSelector: Optional[str] = Query(None),
+    container: Optional[str] = Query(None),
+    sinceSeconds: Optional[int] = Query(None),
+):
+    body = (body or {}).copy()
+    for k, v in {
+        "namespace": namespace, "name": name, "labels": labels,
+        "labelSelector": labelSelector, "fieldSelector": fieldSelector,
+        "container": container, "sinceSeconds": sinceSeconds,
+    }.items():
+        if v is not None:
+            body[k] = v
+
+    if args:
+        try:
+            parsed = json.loads(args)
+            if isinstance(parsed, dict):
+                body.update(parsed)
+        except Exception:
+            pass
+
+    result = await do_tool_call(
+        server,
+        f"{tool}/{action}",
+        body,
+        None,
+        bool(dryrun),
+        format,
+    )
+    return JSONResponse(result)
+
+
+@app.get(
+    "/{server}/tool/{tool}/{action}",
+    tags=["tools"],
+    summary="Granular Tool Dispatch (GET, action only)"
+)
+async def granular_get_action(
+    server: str,
+    tool: str,
+    action: str,
+    args: Optional[str] = Query(None, description="JSON-encoded args fallback"),
+    dryrun: Optional[bool] = Query(False),
+    format: Optional[str] = Query(None, description="Output preference: json|yaml|text"),
+    namespace: Optional[str] = Query(None),
+    name: Optional[str] = Query(None),
+    labels: Optional[str] = Query(None),
+    labelSelector: Optional[str] = Query(None),
+    fieldSelector: Optional[str] = Query(None),
+    container: Optional[str] = Query(None),
+    sinceSeconds: Optional[int] = Query(None),
+):
+    body: Dict[str, Any] = {}
+    for k, v in {
+        "namespace": namespace, "name": name, "labels": labels,
+        "labelSelector": labelSelector, "fieldSelector": fieldSelector,
+        "container": container, "sinceSeconds": sinceSeconds,
+    }.items():
+        if v is not None:
+            body[k] = v
+
+    qargs_fallback: Optional[str] = None
+    if args:
+        try:
+            data = json.loads(args)
+            if isinstance(data, dict):
+                body.update(data)
+            else:
+                qargs_fallback = args
+        except Exception:
+            qargs_fallback = args
+
+    result = await do_tool_call(
+        server,
+        f"{tool}/{action}",
+        body,
+        qargs_fallback,
+        bool(dryrun),
+        format,
+    )
+    return JSONResponse(result)
+
+# ------------------ end of NEW granular routes ------------------
+
+
 # =============================================================================
 # Per-tool helper endpoints (schema/example/help/try) for convenience
 # =============================================================================
