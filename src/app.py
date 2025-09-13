@@ -43,11 +43,16 @@ if not SERVERS_CFG:
 # =========================
 app = FastAPI(
     title="MCP OpenAPI Bridge (Granular + Multi-Server)",
-    version="0.9.0",
+    version="1.0.0",
     description=(
         "A self-discovering OpenAPI façade for MCP servers. "
         "It generates detailed, example-rich endpoints for each MCP tool and adds granular paths when it detects "
-        "`action` and/or `kind` enums in the tool schema."
+        "`action` and/or `kind` enums in the tool schema.\n\n"
+        "Quick intent→call cheatsheet:\n"
+        "• “list all pods in the ollama namespace” → GET /{SERVER}/tool/{TOOL}/get/pods?namespace=ollama\n"
+        "• “give details about the ollama pod in ollama” → GET /{SERVER}/tool/{TOOL}/get/pods?namespace=ollama&name=ollama\n"
+        "• “show logs for pod X in ns Y” → GET /{SERVER}/tool/{TOOL}/logs/pods?namespace=Y&name=X\n"
+        "You can also POST JSON bodies; when in doubt, send `{}`."
     ),
 )
 
@@ -62,6 +67,7 @@ if ALLOW_ORIGINS:
 
 
 def require_api_key(x_api_key: Optional[str] = Header(default=None)):
+    # No-op if API_KEY unset; otherwise enforce.
     if not API_KEY:
         return
     if x_api_key != API_KEY:
@@ -282,14 +288,10 @@ def normalize_body(
 
 # -------- OpenAPI helpers: request bodies & query fallbacks ----------
 def make_request_body(schema: Dict[str, Any], required: bool = False) -> Dict[str, Any]:
-    """
-    We declare requestBody as NOT required so tool planners won't abort when no body is present.
-    Handlers accept an empty body and also coerce query params (?namespace=..., ?args=...).
-    """
     direct = schema or {"type": "object"}
     wrapped = {"type": "object", "properties": {"args": direct}, "required": ["args"]}
     return {
-        "required": required,  # deliberately False by default
+        "required": required,  # keep False so agents aren’t blocked on body
         "content": {
             "application/json": {
                 "schema": {"oneOf": [direct, wrapped]},
@@ -302,24 +304,17 @@ def make_request_body(schema: Dict[str, Any], required: bool = False) -> Dict[st
         },
     }
 
-def schema_has_required(schema: Dict[str, Any]) -> bool:
-    return bool(isinstance(schema, dict) and schema.get("required"))
-
-# Common query params to inject into every tool POST in OpenAPI
+# Common query params we add to every tool op
 _COMMON_QUERY_PARAMS = [
-    {
-        "name": "args",
-        "in": "query",
-        "required": False,
-        "description": "JSON-encoded arguments fallback when you cannot send a body. Example: ?args={\"namespace\":\"ollama\",\"kind\":\"pods\",\"action\":\"get\"}",
-        "schema": {"type": "string"}
-    },
-    {"name": "namespace", "in": "query", "required": False, "description": "Kubernetes namespace (e.g., 'ollama').", "schema": {"type": "string"}},
-    {"name": "name",      "in": "query", "required": False, "description": "Resource name (pod/deployment/etc.).", "schema": {"type": "string"}},
+    {"name": "args", "in": "query", "required": False,
+     "description": "JSON-encoded arguments fallback (e.g. ?args={\"namespace\":\"ollama\",\"kind\":\"pods\",\"action\":\"get\"})",
+     "schema": {"type": "string"}},
+    {"name": "namespace", "in": "query", "required": False, "description": "Kubernetes namespace.", "schema": {"type": "string"}},
+    {"name": "name",      "in": "query", "required": False, "description": "Resource name.", "schema": {"type": "string"}},
     {"name": "kind",      "in": "query", "required": False, "description": "Resource kind (pods, deployments, services, events, namespaces).", "schema": {"type": "string"}},
     {"name": "action",    "in": "query", "required": False, "description": "Action/verb (get, describe, logs, delete, apply).", "schema": {"type": "string"}},
-    {"name": "labels",    "in": "query", "required": False, "description": "Comma-separated label selector (e.g., app=ollama,tier=backend).", "schema": {"type": "string"}},
-    {"name": "fieldSelector", "in": "query", "required": False, "description": "Kubernetes field selector string.", "schema": {"type": "string"}},
+    {"name": "labels",    "in": "query", "required": False, "description": "Comma-separated label selector, e.g. app=ollama,tier=backend.", "schema": {"type": "string"}},
+    {"name": "fieldSelector", "in": "query", "required": False, "description": "Field selector string.", "schema": {"type": "string"}},
     {"name": "limit",     "in": "query", "required": False, "description": "Max items to return.", "schema": {"type": "integer"}},
     {"name": "container", "in": "query", "required": False, "description": "Container name (for logs).", "schema": {"type": "string"}},
     {"name": "sinceSeconds","in": "query","required": False, "description": "Only return logs newer than X seconds.", "schema": {"type": "integer"}},
@@ -334,9 +329,19 @@ _registered: set[str] = set()  # Track mounted routes
 def add_generic_routes(router: APIRouter, server: str):
     st = SERVERS[server]
 
+    @router.get("/", tags=["usage"])
+    async def root():
+        return {
+            "message": "MCP OpenAPI Bridge",
+            "next": [f"/{server}/usage", f"/{server}/tools/list (GET or POST {{}})"],
+            "examples": [
+                f"GET /{server}/tool/mcp_kubectl_resources/get/pods?namespace=ollama",
+                f"GET /{server}/tool/mcp_kubectl_resources/logs/pods?namespace=ollama&name=ollama",
+            ],
+        }
+
     @router.get(f"/{server}/healthz", summary=f"{server} health")
     async def healthz_server():
-        # Always 200; report readiness state inside
         return {
             "ok": st.ready,
             "server": server,
@@ -350,22 +355,28 @@ def add_generic_routes(router: APIRouter, server: str):
         return {
             "howToUse": [
                 "Preferred: POST with a JSON body (use `{}` if no args).",
-                "Fallbacks (for clients that cannot send a body):",
-                "  • Use GET on '/try' endpoints for zero-argument calls.",
-                "  • Put JSON in query: '?args={...}', or individual '?key=value' params.",
-                "You may POST either a direct JSON body `{...}` or wrapped `{ \"args\": { ... } }`.",
+                "If you can't send a body: **use GET** with query args or `?args={...}`.",
                 "Prefer granular endpoints like `/{SERVER}/tool/{TOOL}/get/pods` when available.",
-                "Discover tools with `POST /{SERVER}/tools/list` (send `{}` even if empty).",
+                "Discover tools via `GET or POST /{SERVER}/tools/list`.",
                 "Inspect fields with `GET /{SERVER}/tool/{TOOL}/schema` and examples with `/example`.",
             ],
-            "curlExamples": [
-                f"curl -X POST http://localhost:8080/{server}/tool/TOOL_NAME -H 'Content-Type: application/json' -d '{{}}'",
-                f"curl -X POST http://localhost:8080/{server}/tool/TOOL_NAME/get/pods -H 'Content-Type: application/json' -d '{{}}'",
-                f"curl 'http://localhost:8080/{server}/tool/TOOL_NAME/try'",
-                f"curl 'http://localhost:8080/{server}/tool/TOOL_NAME?args=%7B%22namespace%22%3A%22vault%22%7D'",
+            "worksGreat": [
+                f"GET /{server}/tool/TOOL/get/pods?namespace=ollama",
+                f"GET /{server}/tool/TOOL/logs/pods?namespace=ollama&name=ollama",
+                f"POST /{server}/tool/TOOL  {{\"action\":\"get\",\"kind\":\"pods\",\"namespace\":\"ollama\"}}",
             ],
-            "tip": "If you see 'expected a request body', resend with `{}` OR use GET '/try' OR `?args={...}`.",
+            "tip": "If you see 'expected a request body', resend with `{}` OR just call the GET form.",
         }
+
+    # tools/list: GET + POST
+    @router.get(
+        f"/{server}/tools/list",
+        summary=f"{server} raw MCP tool listing",
+        dependencies=[Depends(require_api_key)],
+    )
+    async def tools_list_get():
+        await st.refresh_tools()
+        return {"tools": list(st.tools.values())}
 
     @router.post(
         f"/{server}/tools/list",
@@ -376,30 +387,48 @@ def add_generic_routes(router: APIRouter, server: str):
             "requestBody": make_request_body({"type": "object"}),
         },
     )
-    async def tools_list(_body: Optional[Dict[str, Any]] = Body(default=None, embed=False)):
+    async def tools_list_post(_body: Optional[Dict[str, Any]] = Body(default=None, embed=False)):
         await st.refresh_tools()
         return {"tools": list(st.tools.values())}
 
+    # tools/call: GET + POST
+    @router.get(
+        f"/{server}/tools/call",
+        summary=f"{server} raw MCP tool call (GET)",
+        dependencies=[Depends(require_api_key)],
+    )
+    async def tools_call_get(
+        request: Request,
+        name: Optional[str] = Query(default=None),
+        args: Optional[str] = Query(default=None),
+    ):
+        if not name:
+            raise HTTPException(status_code=422, detail={"message": "Missing ?name=<tool>", "resolution": [
+                "Provide ?name and either ?args={} or individual ?key=value matching the tool schema."
+            ]})
+        call_args = normalize_body({}, {"type": "object"}, args, request)
+        await st.ensure_initialized()
+        return await st.rpc("tools/call", {"name": name, "arguments": call_args})
+
     @router.post(
         f"/{server}/tools/call",
-        summary=f"{server} raw MCP tool call",
+        summary=f"{server} raw MCP tool call (POST)",
         dependencies=[Depends(require_api_key)],
         openapi_extra={
             "x-instructions": (
                 "Call a tool by name. Provide arguments directly or under an `args` object. "
-                "If you cannot send a body, pass `name` and arguments via query: "
-                "`?name=TOOL&args={...}` or `?name=TOOL&namespace=vault`."
+                "If you cannot send a body, use the GET form with `?name=TOOL&args={...}`."
             ),
             "requestBody": make_request_body({"type": "object"}),
         },
     )
-    async def tools_call(
+    async def tools_call_post(
         request: Request,
         body: Optional[Dict[str, Any]] = Body(default=None, embed=False),
-        name: Optional[str] = Header(default=None, description="Optional tool name header alternative"),
-        tool: Optional[str] = Header(default=None, description="Alternative header for tool name"),
-        q_name: Optional[str] = Query(default=None, description="Tool name (query fallback)"),
-        args: Optional[str] = Query(default=None, description="JSON-encoded args (query fallback)"),
+        name: Optional[str] = Header(default=None),
+        tool: Optional[str] = Header(default=None),
+        q_name: Optional[str] = Query(default=None),
+        args: Optional[str] = Query(default=None),
     ):
         base_args = normalize_body(body, {"type":"object"}, args, request)
         tool_name = base_args.pop("name", None) or name or tool or q_name
@@ -409,10 +438,8 @@ def add_generic_routes(router: APIRouter, server: str):
                 detail={
                     "message": "Tool name not provided.",
                     "resolution": [
-                        "Pass the tool name in the JSON body as `{ \"name\": \"<tool>\", ... }`, or",
-                        "Use the `name:` or `tool:` header, or",
-                        "Set `?name=<tool>` in the query string, or",
-                        "Call a specific tool endpoint like `/{SERVER}/tool/{TOOL}`.",
+                        "Pass `{\"name\":\"<tool>\", ...}` in the body, or header `name:`/`tool:`, or `?name=<tool>`.",
+                        "Or call a specific endpoint like `/{SERVER}/tool/{TOOL}`.",
                     ],
                 },
             )
@@ -439,12 +466,10 @@ def add_schema_helpers(router: APIRouter, server: str, tool: Dict[str, Any]):
             "description": tool.get("description", "No description provided by MCP server."),
             "schema": describe_schema(schema),
             "howToUse": [
-                f"POST to `/{server}/tool/{pname}`. Always send a JSON body; if no args, send `{{}}`.",
-                "Fallbacks: GET '/try' for zero-arg, or pass `?args={...}` / `?key=value`.",
-                "You may send a direct body or `{ \"args\": { ... } }`.",
-                f"Fetch an example body from `/{server}/tool/{pname}/example`.",
-                f"View schema at `/{server}/tool/{pname}/schema`.",
-                "If granular endpoints exist (action/kind), prefer those—they pre-fill some fields.",
+                f"POST to `/{server}/tool/{pname}`. If no args, send `{{}}`.",
+                "Or use GET with `?args={...}` or `?key=value`.",
+                f"Examples at `/{server}/tool/{pname}/example`; schema at `/{server}/tool/{pname}/schema`.",
+                "Prefer granular endpoints (they pre-fill `action`/`kind`).",
             ],
         }
 
@@ -473,7 +498,17 @@ def add_tool_route(router: APIRouter, server: str, tool: Dict[str, Any]):
     desc = tool.get("description") or f"Call MCP tool {tname} on server {server}. Prefer granular endpoints when possible."
     state = st; toolname = tname
 
-    async def handler(
+    # GET mirror (query-only)
+    async def handler_get(
+        request: Request,
+        args: Optional[str] = Query(default=None, description="JSON-encoded args (query fallback)"),
+    ) -> Any:
+        call_args = normalize_body({}, schema, args, request)
+        await state.ensure_initialized()
+        return await state.rpc("tools/call", {"name": toolname, "arguments": call_args})
+
+    # POST (body or query)
+    async def handler_post(
         request: Request,
         body: Optional[Dict[str, Any]] = Body(default=None, embed=False),
         args: Optional[str] = Query(default=None, description="JSON-encoded args (query fallback)"),
@@ -482,9 +517,22 @@ def add_tool_route(router: APIRouter, server: str, tool: Dict[str, Any]):
         await state.ensure_initialized()
         return await state.rpc("tools/call", {"name": toolname, "arguments": call_args})
 
+    # GET
+    router.add_api_route(
+        path=f"/{server}/tool/{pname}",
+        endpoint=handler_get,
+        methods=["GET"],
+        name=f"{server}:{tname}:get",
+        summary=f"{desc} (GET).",
+        operation_id=f"{server}_{tname}_get",
+        tags=[f"{server}:{tname}"],
+        dependencies=[Depends(require_api_key)],
+    )
+
+    # POST
     route = APIRoute(
         path=f"/{server}/tool/{pname}",
-        endpoint=handler,
+        endpoint=handler_post,
         methods=["POST"],
         name=f"{server}:{tname}",
         summary=desc,
@@ -494,8 +542,7 @@ def add_tool_route(router: APIRouter, server: str, tool: Dict[str, Any]):
         openapi_extra={
             "x-instructions": (
                 "Preferred: POST a JSON body. If no args, send `{}`. "
-                "Fallbacks: pass args in `?args={...}` or as individual `?key=value`. "
-                "Granular endpoints like `/{SERVER}/tool/{TOOL}/{action}/{kind}` are preferred when available."
+                "Or use the GET form with query params."
             ),
             "requestBody": make_request_body(schema),
         },
@@ -533,18 +580,35 @@ def add_granular_routes(router: APIRouter, server: str, tool: Dict[str, Any]):
         state = st; toolname = tname; fixed_local = dict(fixed)
         path = f"/{server}/tool/{pname}/{_safe(action)}"
 
-        async def handler_action(
+        async def handler_action_get(
+            request: Request,
+            args: Optional[str] = Query(default=None),
+        ) -> Any:
+            call_args = normalize_body({}, reduced_schema, args, request)
+            call_args.update(fixed_local)
+            await state.ensure_initialized()
+            return await state.rpc("tools/call", {"name": toolname, "arguments": call_args})
+
+        async def handler_action_post(
             request: Request,
             body: Optional[Dict[str, Any]] = Body(default=None, embed=False),
-            args: Optional[str] = Query(default=None, description="JSON-encoded args (query fallback)"),
+            args: Optional[str] = Query(default=None),
         ) -> Any:
             call_args = normalize_body(body, reduced_schema, args, request)
             call_args.update(fixed_local)
             await state.ensure_initialized()
             return await state.rpc("tools/call", {"name": toolname, "arguments": call_args})
 
+        # GET + POST
+        router.add_api_route(
+            path=path, endpoint=handler_action_get, methods=["GET"],
+            name=f"{server}:{tname}:{action}:get",
+            summary=f"{server} → {tname} → {action} (GET)",
+            operation_id=f"{op_id}_get", tags=[f"{server}:{tname}", action],
+            dependencies=[Depends(require_api_key)],
+        )
         route = APIRoute(
-            path=path, endpoint=handler_action, methods=["POST"],
+            path=path, endpoint=handler_action_post, methods=["POST"],
             name=f"{server}:{tname}:{action}",
             summary=f"{server} → {tname} → {action}",
             description=f"Fixes `action: \"{action}\"`. Provide only remaining fields.",
@@ -552,8 +616,7 @@ def add_granular_routes(router: APIRouter, server: str, tool: Dict[str, Any]):
             dependencies=[Depends(require_api_key)],
             openapi_extra={
                 "x-instructions": (
-                    "Preferred: POST with a JSON body. If no remaining fields, send `{}`. "
-                    "Fallbacks: `?args={...}` or individual `?key=value`."
+                    "POST with JSON body (send `{}` if none) or use GET with query params."
                 ),
                 "requestBody": make_request_body(reduced_schema),
             },
@@ -597,26 +660,41 @@ def add_granular_routes(router: APIRouter, server: str, tool: Dict[str, Any]):
             state = st; toolname = tname; fixed_local = dict(fixed)
             path = f"/{server}/tool/{pname}/{suffix}"
 
-            async def handler_action_kind(
+            async def handler_action_kind_get(
+                request: Request,
+                args: Optional[str] = Query(default=None),
+            ) -> Any:
+                call_args = normalize_body({}, reduced_schema, args, request)
+                call_args.update(fixed_local)
+                await state.ensure_initialized()
+                return await state.rpc("tools/call", {"name": toolname, "arguments": call_args})
+
+            async def handler_action_kind_post(
                 request: Request,
                 body: Optional[Dict[str, Any]] = Body(default=None, embed=False),
-                args: Optional[str] = Query(default=None, description="JSON-encoded args (query fallback)"),
+                args: Optional[str] = Query(default=None),
             ) -> Any:
                 call_args = normalize_body(body, reduced_schema, args, request)
                 call_args.update(fixed_local)
                 await state.ensure_initialized()
                 return await state.rpc("tools/call", {"name": toolname, "arguments": call_args})
 
+            # GET + POST
+            router.add_api_route(
+                path=path, endpoint=handler_action_kind_get, methods=["GET"],
+                name=f"{server}:{tname}:{summary}:get",
+                summary=f"{summary} (GET)", operation_id=f"{op_id}_get", tags=tags,
+                dependencies=[Depends(require_api_key)],
+            )
             route = APIRoute(
-                path=path, endpoint=handler_action_kind, methods=["POST"],
+                path=path, endpoint=handler_action_kind_post, methods=["POST"],
                 name=f"{server}:{tname}:{summary}", summary=summary,
                 description=f"Convenience endpoint. {desc} Provide only remaining fields.",
                 operation_id=op_id, tags=tags,
                 dependencies=[Depends(require_api_key)],
                 openapi_extra={
                     "x-instructions": (
-                        "Preferred: POST with a JSON body. If no remaining fields, send `{}`. "
-                        "Fallbacks: `?args={...}` or individual `?key=value`."
+                        "POST with JSON body (send `{}` if none) or use GET with query params."
                     ),
                     "requestBody": make_request_body(reduced_schema),
                 },
@@ -653,20 +731,17 @@ def install_routes_for_server(server: str):
     app.include_router(router)
 
 async def background_poller():
-    # Keep trying forever; install routes as soon as servers are reachable
     while True:
         for name, st in SERVERS.items():
             try:
                 await st.refresh_tools()
                 install_routes_for_server(name)
             except Exception:
-                # error is recorded in st.last_error/st.ready
                 pass
         await asyncio.sleep(REFRESH_INTERVAL)
 
 @app.on_event("startup")
 async def startup():
-    # Do NOT raise on startup; just kick off the poller
     asyncio.create_task(background_poller())
 
 # Liveness: always 200 once app is running
@@ -687,7 +762,6 @@ async def readyz():
         },
     )
 
-# Health (informational; never used for pod death)
 @app.get("/healthz", tags=["health"])
 async def healthz():
     return {
@@ -719,14 +793,14 @@ async def http_exc_handler(request: Request, exc: HTTPException):
     if "resolution" not in payload:
         tips = [
             "Preferred: POST a JSON object body (use `{}` if no arguments).",
-            "Fallbacks: GET '/try' for zero-arg, or pass `?args={...}` / individual `?key=value`.",
-            "Discover tools via `/{SERVER}/tools/list` and inspect fields with `/tool/{TOOL}/schema`.",
+            "Or use the GET variant with query params or `?args={...}`.",
+            "Discover tools via `/SERVER/tools/list` and inspect fields with `/tool/{TOOL}/schema`.",
             "Use `/tool/{TOOL}/example` or granular endpoints.",
         ]
         if exc.status_code == 401:
             tips.insert(0, "Include the `X-Api-Key` header if the bridge was configured with API_KEY.")
         if exc.status_code == 422:
-            tips.insert(0, "Ensure the body is a JSON object (or use GET '/try' / `?args={...}` as a fallback).")
+            tips.insert(0, "Provide the missing parameter via body `{}` or query `?key=value` / `?args={...}`.")
         payload["resolution"] = tips
     return JSONResponse(status_code=exc.status_code, content=payload)
 
@@ -739,7 +813,7 @@ async def unhandled_exc_handler(request: Request, exc: Exception):
             "error": str(exc),
             "resolution": [
                 "Preferred: POST a JSON object body; if you have no arguments, send `{}`.",
-                "Fallbacks: GET '/try' or pass `?args={...}` / individual `?key=value`.",
+                "Or use the GET variant with query params or `?args={...}`.",
                 "Retry with a simpler body; check bridge pod logs for stack traces.",
                 "Verify MCP server availability and NetworkPolicy.",
             ],
@@ -761,50 +835,37 @@ def _build_k8s_cookbook() -> List[Dict[str, Any]]:
                 cookbook.extend([
                     {
                         "intent": "List all pods in the <namespace> namespace",
-                        "preferred": f"POST {tool_path}/get/pods",
-                        "body": {"namespace": "<namespace>"},
+                        "preferred": f"GET {tool_path}/get/pods?namespace=<namespace>",
                         "alternatives": [
+                            {"call": f"POST {tool_path}/get/pods", "body": {"namespace": "<namespace>"}},
                             {"call": f"POST {tool_path}", "body": {"action":"get","kind":"pods","namespace":"<namespace>"}},
-                            {"call": f"GET  {tool_path}/get/pods?namespace=<namespace>"},
-                            {"call": f"POST {tool_path}/get/pods?args=%7B%22namespace%22%3A%22<namespace>%22%7D"}
                         ],
-                        "notes": [
-                            "If you cannot send a body, use the query-string variants.",
-                            "Replace <namespace> with 'ollama' to match the example prompt."
-                        ]
                     },
                     {
                         "intent": "Describe the <pod> pod in the <namespace> namespace",
-                        "preferred": f"POST {tool_path}/get/pods",
-                        "body": {"namespace": "<namespace>", "name": "<pod>"},
+                        "preferred": f"GET {tool_path}/get/pods?namespace=<namespace>&name=<pod>",
                     },
                     {
                         "intent": "Get logs for the <pod> pod in the <namespace> namespace",
-                        "preferred": f"POST {tool_path}/logs/pods",
-                        "body": {"namespace": "<namespace>", "name": "<pod>", "container": "<optional>"},
+                        "preferred": f"GET {tool_path}/logs/pods?namespace=<namespace>&name=<pod>&container=<optional>",
                     },
                 ])
     return cookbook
 
 def _augment_operation_docs(openapi_schema: Dict[str, Any]):
-    """
-    Make each tool POST extremely explicit:
-    - requestBody not required (but supported).
-    - Common K8s params in query.
-    - Natural-language examples ("list pods in ollama").
-    """
     paths = openapi_schema.get("paths", {})
     for path, methods in list(paths.items()):
         if "/tool/" not in path:
             continue
         for verb, op in list(methods.items()):
-            if verb.lower() != "post":
+            if verb.lower() not in ("post", "get"):
                 continue
 
-            # Ensure requestBody exists and is NOT required
-            rb = op.get("requestBody") or {}
-            rb["required"] = False
-            op["requestBody"] = rb
+            # Ensure requestBody exists and is NOT required for POST
+            if verb.lower() == "post":
+                rb = op.get("requestBody") or {}
+                rb["required"] = False
+                op["requestBody"] = rb
 
             # Add common query params if not present
             existing = {(p.get("name"), p.get("in")) for p in op.get("parameters", [])}
@@ -817,22 +878,20 @@ def _augment_operation_docs(openapi_schema: Dict[str, Any]):
             # Strengthen description and usage
             guidance = (
                 "CALLING RULES:\n"
-                "• Preferred: POST a JSON object body. If you have no arguments, send `{}`.\n"
-                "• If you cannot send a body: use `?args={...}` or individual `?key=value` such as `?namespace=ollama`.\n"
-                "• Prefer granular paths like '/{server}/tool/{tool}/get/pods' when action/kind are implied.\n"
-                "• If you see 'Request body expected', retry the same call with an empty body `{}`.\n"
+                "• Prefer GET with query or POST with JSON. If you have no arguments, send `{}` (POST) or call GET without args when allowed.\n"
+                "• Granular paths like '/{server}/tool/{tool}/get/pods' imply `action`/`kind`.\n"
+                "• If you see 'Request body expected', retry the same call with an empty body `{}` or use the GET form.\n"
             )
             op["description"] = ((op.get("description") or "") + "\n\n" + guidance).strip()
 
-            # Add a canonical NL example
+            # Canonical NL example to nudge planners
             examples = op.setdefault("x-naturalExamples", [])
             examples.append({
                 "intent": "List all pods in the ollama namespace",
                 "how": [
-                    "Extract `namespace=ollama` from the phrase.",
-                    "Use a granular endpoint if available: '/…/get/pods'.",
-                    "Otherwise call the generic tool with `{ \"action\":\"get\", \"kind\":\"pods\", \"namespace\":\"ollama\" }`.",
-                    "If you cannot send a body, pass `?namespace=ollama` or `?args={\"namespace\":\"ollama\",\"kind\":\"pods\",\"action\":\"get\"}`."
+                    "Extract `namespace=ollama`.",
+                    "Prefer GET '/…/get/pods?namespace=ollama'.",
+                    "Alternate POST body: {\"action\":\"get\",\"kind\":\"pods\",\"namespace\":\"ollama\"}.",
                 ]
             })
 
@@ -845,30 +904,29 @@ def custom_openapi():
         description=app.description,
         routes=app.routes,
     )
+    # Global servers hint (helps some planners)
+    openapi_schema["servers"] = [{"url": "http://localhost:8080"}]
+
     openapi_schema["x-model-instructions"] = {
         "callDiscipline": [
-            "Preferred transport is POST with a JSON object body. If you have no arguments, send `{}`.",
-            "If you cannot send a body, use GET '/try' (zero-arg) or pass arguments in the query string:",
-            "  • `?args={...}` (JSON-encoded), or",
-            "  • individual `?key=value` matching schema field names.",
+            "Use **GET with query** or **POST with JSON**. If no args, POST `{}`.",
+            "If you cannot send a body, always try the GET variant.",
         ],
         "bodyShapes": ["Direct body: `{ ... }`", "Wrapped body: `{ \"args\": { ... } }`"],
         "discovery": [
-            "List tools: `/{SERVER}/tools/list` (send `{}` even if empty).",
-            "Per-tool schema: `/{SERVER}/tool/{TOOL}/schema`.",
-            "Per-tool example: `/{SERVER}/tool/{TOOL}/example`.",
-            "Per-tool help: `/{SERVER}/tool/{TOOL}/help`.",
-            "Zero-argument test: `/{SERVER}/tool/{TOOL}/try` and granular `.../try` when available.",
+            "List tools: `GET or POST /{SERVER}/tools/list`.",
+            "Per-tool schema: `GET /{SERVER}/tool/{TOOL}/schema`.",
+            "Per-tool example: `GET /{SERVER}/tool/{TOOL}/example`.",
+            "Zero-argument test: `GET /{SERVER}/tool/{TOOL}/try` and granular `.../try`.",
         ],
-        "preference": "Prefer granular endpoints like `/{SERVER}/tool/{TOOL}/{action}/{kind}` when available.",
+        "preference": "Prefer **granular GET** endpoints like `/{SERVER}/tool/{TOOL}/{action}/{kind}?namespace=...`.",
         "typicalFlow": [
-            "1) `GET /{SERVER}/usage`.",
-            "2) `POST /{SERVER}/tools/list` with `{}`.",
-            "3) `GET /{SERVER}/tool/{TOOL}/schema` and `/example`.",
-            "4) `POST /{SERVER}/tool/{TOOL}` (or granular path) with `{}` or the minimal example.",
+            "1) `GET /{SERVER}/tools/list`.",
+            "2) `GET /{SERVER}/tool/{TOOL}/schema` and `/example`.",
+            "3) Call granular GET path (or POST `{}` / minimal example).",
         ],
         "errorFix": [
-            "If you see 'expected a request body', resend with `{}` OR use GET '/try' OR `?args={...}`.",
+            "If you see 'expected a request body', resend with `{}` **or** use the GET form with query params.",
             "If you see a schema error, consult `/schema`, `/example`, or use a granular endpoint.",
         ],
     }
@@ -881,9 +939,7 @@ def custom_openapi():
         "description": "Optional API key; set if the bridge was started with API_KEY.",
     }
 
-    # Per-operation augmentation
     _augment_operation_docs(openapi_schema)
-
     app.openapi_schema = openapi_schema
     return app.openapi_schema
 
