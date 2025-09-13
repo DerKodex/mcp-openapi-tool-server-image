@@ -1,4 +1,3 @@
-# [unchanged header + imports up to httpx import]
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -20,6 +19,7 @@ Env:
 """
 
 import asyncio
+import inspect
 import json
 import os
 import re
@@ -255,12 +255,34 @@ def compose_argstring(
 # MCP integration (stdio)
 # =============================================================================
 
+async def _maybe_enter_or_await(res):
+    """Normalize stdio_client result across SDKs: async CM vs awaitable vs instance."""
+    try:
+        # Async context manager?
+        if hasattr(res, "__aenter__") and inspect.iscoroutinefunction(res.__aenter__):
+            client = await res.__aenter__()  # type: ignore[attr-defined]
+            try:
+                setattr(client, "__mcp_ctx__", res)
+            except Exception:
+                pass
+            return client
+        # Awaitable/coroutine?
+        if inspect.isawaitable(res):
+            return await res
+        # Plain instance already
+        return res
+    except Exception:
+        raise
+
 async def mcp_connect_stdio(cfg: ServerConfig):
     """
-    Create an MCP stdio client across SDK variants:
-    - Some expect stdio_client(command=<str>, args=[...], env={...}) and return an async CM.
-    - Others accept stdio_client(<list or str>) and return an awaitable.
-    - Some don't accept env=; we shim by temporarily injecting into os.environ.
+    Create an MCP stdio client across SDK variants.
+    We try several call signatures in this order:
+      1) stdio_client(<list or str>, env=...)               # positional argv
+      2) stdio_client(*argv, env=...)                       # varargs
+      3) stdio_client(command=<str>, args=[...], env=...)   # kw form
+      4) stdio_client(command=<list>, env=...)              # kw list form
+    If 'env' kw isn't supported, we re-try after temporarily injecting env.
     """
     if not MCP_AVAILABLE:
         raise RuntimeError("MCP python SDK not installed. pip install mcp[stdio]")
@@ -277,67 +299,57 @@ async def mcp_connect_stdio(cfg: ServerConfig):
     else:
         raise RuntimeError(f"Server {cfg.alias}: cmd must be list[str] or str, got {type(cfg.cmd)}")
 
-    def _call_variants(allow_env_kw: bool):
-        """
-        Yield possible constructor callables for stdio_client in descending preference.
-        If allow_env_kw is False, don't pass env= (for older SDKs).
-        """
+    def _constructors(allow_env_kw: bool):
         env_kw = {} if not allow_env_kw else {"env": (cfg.env or {})}
 
-        # 1) Newer SDK shape: explicit command + args
-        def v1():
+        def v_positional_list():
+            argv = [_command] + _args if _args else _command
+            return stdio_client(argv, **env_kw)
+
+        def v_positional_varargs():
+            return stdio_client(_command, *_args, **env_kw)
+
+        def v_kw_cmd_args():
             return stdio_client(command=_command, args=_args, **env_kw)
 
-        # 2) Some SDKs accept a single list or str positional
-        def v2():
-            cmd_pos = [_command] + _args if _args else _command
-            return stdio_client(cmd_pos, **env_kw)
+        def v_kw_cmd_list():
+            argv = [_command] + _args
+            return stdio_client(command=argv, **env_kw)
 
-        # 3) Some SDKs accept command= with list (they split internally)
-        def v3():
-            cmd_as_list = [_command] + _args
-            return stdio_client(command=cmd_as_list, **env_kw)
+        # Prefer positional forms first to avoid 'unexpected keyword' issues
+        return (v_positional_list, v_positional_varargs, v_kw_cmd_args, v_kw_cmd_list)
 
-        return (v1, v2, v3)
-
-    # Try with env kwarg first; on TypeError fall back to env injection path
-    last_exc = None
+    last_exc: Optional[BaseException] = None
     for allow_env_kw in (True, False):
-        # If not allowed, we temporarily inject env into process for spawn
         orig_env = None
         if not allow_env_kw and cfg.env:
+            # Inject env just for the spawn if 'env' kw isn't accepted
             orig_env = os.environ.copy()
             os.environ.update(cfg.env)
-
         try:
-            for ctor in _call_variants(allow_env_kw):
+            for ctor in _constructors(allow_env_kw):
                 try:
                     res = ctor()
-                    # Handle async context manager vs awaitable
-                    if hasattr(res, "__aenter__"):
-                        client = await res.__aenter__()  # type: ignore[attr-defined]
-                        try:
-                            setattr(client, "__mcp_ctx__", res)
-                        except Exception:
-                            pass
-                    else:
-                        client = await res
-                    await client.initialize()
+                    client = await _maybe_enter_or_await(res)
+                    # Some SDKs require explicit initialize()
+                    if hasattr(client, "initialize"):
+                        maybe = client.initialize()
+                        if inspect.isawaitable(maybe):
+                            await maybe
                     return client
-                except TypeError as te:
-                    # Wrong signature; try next variant
+                except (TypeError, AttributeError) as te:
+                    # Signature mismatch or internal attr expectations; try next
                     last_exc = te
                     continue
-                except AttributeError as ae:
-                    # e.g., "'list' object has no attribute 'command'" inside SDK
-                    last_exc = ae
+                except Exception as e:
+                    # Real failure from the attempt; record and try next variant
+                    last_exc = e
                     continue
         finally:
             if orig_env is not None:
                 os.environ.clear()
                 os.environ.update(orig_env)
 
-    # If we get here, all variants failed
     raise RuntimeError(f"Failed to create stdio MCP client for '{cfg.alias}': {last_exc}")
 
 async def mcp_list_tools(session) -> List[Dict[str, Any]]:
@@ -378,7 +390,6 @@ async def rpc_try_methods(client: httpx.AsyncClient, url: str, candidates: List[
     for payload in candidates:
         try:
             r = await client.post(url, json=payload, timeout=60)
-            # Accept both 200 and 207 (multi-status) if some servers use it
             if r.status_code in (200, 207):
                 data = r.json()
                 return data
@@ -403,11 +414,7 @@ async def mcp_http_list_tools() -> List[Dict[str, Any]]:
             {"method": "tool/list", "params": {}},
             {"method": "tools.list", "params": {}},
         ])
-    # Normalize plausible shapes
     tools = []
-    # common shapes:
-    # {"tools":[{"name":"...","description":"...","inputSchema":{...}}, ...]}
-    # or {"result":{"tools":[...]}}
     container = data.get("result", data)
     for t in container.get("tools", []):
         name = t.get("name")
@@ -438,9 +445,6 @@ async def mcp_http_call_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, 
             {"method": "tool/call", "params": {"name": tool_name, "arguments": args}},
             {"method": "tools.call", "params": {"name": tool_name, "arguments": args}},
         ])
-
-    # Normalize to the same shape stdio path returns
-    # Expect either {"content":[...]} or {"result":{"content":[...]}} etc.
     container = data.get("result", data)
     content = container.get("content") or container.get("contents") or []
     normalized = {"type": "mcp_result", "content": []}
@@ -449,10 +453,8 @@ async def mcp_http_call_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, 
             if item.get("type") == "text" and "text" in item:
                 normalized["content"].append({"type": "text", "text": item["text"]})
             else:
-                # pass through other content types
                 normalized["content"].append(item)
         else:
-            # fallback string payload
             normalized["content"].append({"type": "text", "text": str(item)})
     return normalized
 
@@ -463,7 +465,7 @@ async def mcp_http_call_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, 
 
 app = FastAPI(
     title="MCP OpenAPI Bridge (Generic, Self-Discovering)",
-    version="3.1.8",
+    version="3.1.9",
     description=textwrap.dedent(
         """\
         A generic, self-discovering OpenAPI façade for MCP servers.
@@ -484,7 +486,7 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"],
 )
 
-# --- Path normalizer (unchanged)
+# --- Path normalizer
 @app.middleware("http")
 async def normalize_odd_paths(request: Request, call_next):
     raw_path = request.scope.get("path") or ""
@@ -521,7 +523,7 @@ async def on_startup():
     if "mcp" not in DISCOVERY.servers:
         DISCOVERY.servers["mcp"] = ServerState(ServerConfig(alias="mcp"))  # placeholder
     await do_discover(wait_seconds=int(os.getenv("MCP_DISCOVERY_WAIT", "0")))
-    
+
 @app.on_event("shutdown")
 async def on_shutdown():
     # Gracefully close any stdio sessions opened via async context manager
@@ -534,6 +536,7 @@ async def on_shutdown():
         except Exception:
             # Don’t let shutdown be noisy
             pass
+
 
 def refresh_servers_from_env() -> bool:
     updated = False
@@ -553,65 +556,66 @@ def refresh_servers_from_env() -> bool:
 
 async def do_discover(wait_seconds: int = 0) -> Dict[str, Any]:
     for alias, st in list(DISCOVERY.servers.items()):
-        try:
-            tools_raw: List[Dict[str, Any]] = []
-            if st.cfg.mode == "stdio":
-                if not st.connected and st.cfg.cmd:
+        tools_raw: List[Dict[str, Any]] = []
+        # ---- Try stdio path, but never bail if it fails
+        if st.cfg.mode == "stdio" and st.cfg.cmd:
+            try:
+                if not st.connected:
                     st.client = await mcp_connect_stdio(st.cfg)
                     st.connected = True
-                tools_raw = await mcp_list_tools(st.client) if st.connected else []
-            else:
-                tools_raw = []
-
-            # NEW: If stdio didn't yield tools and MCP_RPC_URL is set, try HTTP RPC discovery
-            if not tools_raw and MCP_RPC_URL:
                 try:
-                    tools_raw = await mcp_http_list_tools()
-                    if tools_raw:
-                        # Mark as "virtually connected" so routes don’t 503 during help/schema
-                        st.connected = st.connected or True
+                    tools_raw = await mcp_list_tools(st.client)
                 except Exception as e:
-                    print(f"[discover:http-rpc] list_tools failed via {MCP_RPC_URL}: {e}", file=sys.stderr)
+                    print(f"[discover] list_tools via stdio failed for '{alias}': {e}", file=sys.stderr)
+                    tools_raw = []
+            except Exception as e:
+                print(f"[discover] stdio connect failed for '{alias}': {e}", file=sys.stderr)
+                st.connected = False
+                st.client = None
 
-            st.tools.clear()
-            for tr in tools_raw:
-                name = tr["name"]
-                desc = tr.get("description") or ""
-                schema = tr.get("input_schema") or {}
-                td = ToolDescriptor(
-                    name=name,
-                    description=desc,
-                    input_schema=schema,
-                    convenience_params=[p for p in CONVENIENCE_PARAMS if p in (schema.get("properties") or {})]
-                )
-                td.inferred_actions = schema_enums(schema, "operation") or parse_actions_from_description(desc)
-                kinds_from_schema = schema_enums(schema, "resource")
-                if kinds_from_schema:
-                    td.inferred_kinds = kinds_from_schema
-                elif is_k8s_tool(name, desc):
-                    td.inferred_kinds = infer_kinds_from_description(desc)
-                if is_k8s_tool(name, desc):
-                    td.output_guidance = build_k8s_output_guidance(name)
-                    td.natural_examples = k8s_natural_examples(name)
-                td.usage = {
-                    "schema": {
-                        "type": "object",
-                        "fields": {
-                            "args": {"required": True, "type": "string", "description": "Operation-specific arguments / flags"},
-                            "operation": {"required": True, "type": "string"},
-                            "resource": {"required": True, "type": "string"},
-                        },
-                        "requiredFields": ["args", "operation", "resource"]
+        # ---- HTTP RPC fallback discovery (streamable-http) if no tools yet
+        if not tools_raw and MCP_RPC_URL:
+            try:
+                tools_raw = await mcp_http_list_tools()
+                if tools_raw:
+                    st.connected = st.connected or True  # virtually connected
+            except Exception as e:
+                print(f"[discover:http-rpc] list_tools failed via {MCP_RPC_URL}: {e}", file=sys.stderr)
+
+        # ---- Update local tool cache
+        st.tools.clear()
+        for tr in tools_raw:
+            name = tr["name"]
+            desc = tr.get("description") or ""
+            schema = tr.get("input_schema") or {}
+            td = ToolDescriptor(
+                name=name,
+                description=desc,
+                input_schema=schema,
+                convenience_params=[p for p in CONVENIENCE_PARAMS if p in (schema.get("properties") or {})]
+            )
+            td.inferred_actions = schema_enums(schema, "operation") or parse_actions_from_description(desc)
+            kinds_from_schema = schema_enums(schema, "resource")
+            if kinds_from_schema:
+                td.inferred_kinds = kinds_from_schema
+            elif is_k8s_tool(name, desc):
+                td.inferred_kinds = infer_kinds_from_description(desc)
+            if is_k8s_tool(name, desc):
+                td.output_guidance = build_k8s_output_guidance(name)
+                td.natural_examples = k8s_natural_examples(name)
+            td.usage = {
+                "schema": {
+                    "type": "object",
+                    "fields": {
+                        "args": {"required": True, "type": "string", "description": "Operation-specific arguments / flags"},
+                        "operation": {"required": True, "type": "string"},
+                        "resource": {"required": True, "type": "string"},
                     },
-                    "argstringRequired": True,
-                }
-                st.tools[name] = td
-
-        except Exception as e:
-            st.connected = False
-            st.client = None
-            st.tools.clear()
-            print(f"[discover] Server '{alias}' discovery failed: {e}", file=sys.stderr)
+                    "requiredFields": ["args", "operation", "resource"]
+                },
+                "argstringRequired": True,
+            }
+            st.tools[name] = td
 
     if wait_seconds > 0:
         await asyncio.sleep(min(wait_seconds, 10))
@@ -626,7 +630,7 @@ async def do_discover(wait_seconds: int = 0) -> Dict[str, Any]:
 
 
 # =============================================================================
-# Health / Info (unchanged)
+# Health / Info
 # =============================================================================
 
 @app.get("/livez", tags=["health"], summary="Livez")
@@ -647,7 +651,7 @@ async def servers_info():
 
 
 # =============================================================================
-# Discovery control (unchanged)
+# Discovery control
 # =============================================================================
 
 @app.post("/discover", tags=["discovery"], summary="Discover Endpoint")
@@ -661,7 +665,7 @@ async def discovery_status():
 
 
 # =============================================================================
-# OpenAPI enrichment (unchanged helper)
+# OpenAPI enrichment
 # =============================================================================
 
 def openapi_extra_blocks() -> Dict[str, Any]:
@@ -733,7 +737,7 @@ async def tools_list(server: str = Path(..., description="Server alias")):
 
 
 # =============================================================================
-# HTTP Fallback helper (unchanged)
+# HTTP Fallback helper
 # =============================================================================
 
 async def forward_via_http(server: str, tool_path: str, method: str, params: Dict[str, Any], body: Optional[Dict[str, Any]]):
@@ -819,7 +823,6 @@ async def do_tool_call(
     except HTTPException as e:
         if e.status_code != 503 or not MCP_RPC_URL:
             raise
-        # stdio not connected; we'll execute via HTTP RPC below
         print(f"[rpc-fallback] Using MCP_RPC_URL={MCP_RPC_URL} for '{tool_path}'", file=sys.stderr)
 
     components = tool_path.split("/")
@@ -864,7 +867,6 @@ async def do_tool_call(
             return {"dryrun": True, "tool": tool, "args": {}}
         if st:
             return await mcp_call_tool(st.client, tool, {})
-        # HTTP RPC fallback
         return await mcp_http_call_tool(tool, {})
 
     args = {}
@@ -897,7 +899,6 @@ async def do_tool_call(
         print(f"[dryrun] server={server} tool={tool} suffix='{suffix}' final_args={final_args}", file=sys.stderr)
         return {"dryrun": True, "server": server, "tool": tool, "final_args": final_args}
 
-    # Execute via stdio if available, else via HTTP RPC
     try:
         if st:
             print(f"[invoke-stdio] server={st.cfg.alias} tool={tool} suffix='{suffix}' final_args={final_args}", file=sys.stderr)
@@ -1013,13 +1014,11 @@ async def tool_dispatch_get(
         raise
 
 
-# -------------------- explicit granular routes (unchanged except fallback already handled) --------------------
-# (Your granular_post_kind / granular_get_kind / granular_post_action / granular_get_action remain unchanged)
-# ... keep your existing granular route implementations here unchanged ...
+# -------------------- explicit granular routes (you can keep your custom ones here if any) --------------------
 
 
 # =============================================================================
-# Per-tool helper endpoints (unchanged)
+# Per-tool helper endpoints
 # =============================================================================
 
 @app.get("/mcp/tool/{tool}/invoke", tags=["tools", "invoke"], summary="Invoke (GET /invoke)")
@@ -1071,7 +1070,7 @@ async def tool_try(tool: str, dryrun: Optional[bool] = Query(False)):
 
 
 # =============================================================================
-# OpenAPI Post-processor (unchanged)
+# OpenAPI Post-processor
 # =============================================================================
 
 _original_openapi = app.openapi
