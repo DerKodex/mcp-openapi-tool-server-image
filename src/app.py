@@ -256,26 +256,46 @@ def compose_argstring(
 # =============================================================================
 
 async def mcp_connect_stdio(cfg: ServerConfig):
+    """
+    Create an MCP stdio client supporting both SDK shapes:
+    - Newer SDKs: stdio_client(...) -> async context manager (enter it)
+    - Older SDKs: stdio_client(...) -> awaitable (await it)
+    Also supports older SDKs that don't accept env= on stdio_client.
+    """
     if not MCP_AVAILABLE:
         raise RuntimeError("MCP python SDK not installed. pip install mcp[stdio]")
     if not cfg.cmd:
         raise RuntimeError(f"Server {cfg.alias}: stdio mode requires 'cmd'.")
 
-    # Try newer SDK signature first (supports env=); fall back if not supported
-    try:
-        client = await stdio_client(cfg.cmd, env=cfg.env or {})
-    except TypeError as e:
-        if "unexpected keyword argument 'env'" not in str(e):
-            raise
-        # Older SDK: temporarily inject env into process env for the spawn
-        orig_env = os.environ.copy()
+    def _make_client_factory():
         try:
-            if cfg.env:
-                os.environ.update(cfg.env)
-            client = await stdio_client(cfg.cmd)
-        finally:
-            os.environ.clear()
-            os.environ.update(orig_env)
+            # Newer SDKs often support env= on stdio_client
+            return stdio_client(cfg.cmd, env=cfg.env or {})
+        except TypeError as e:
+            # Older SDKs: no env= kwarg; temporarily inject env for the spawn
+            if "unexpected keyword argument 'env'" not in str(e):
+                raise
+            orig_env = os.environ.copy()
+            try:
+                if cfg.env:
+                    os.environ.update(cfg.env)
+                return stdio_client(cfg.cmd)
+            finally:
+                os.environ.clear()
+                os.environ.update(orig_env)
+
+    res = _make_client_factory()
+
+    # If the SDK returns an async context manager, enter it; else await it.
+    if hasattr(res, "__aenter__"):
+        client = await res.__aenter__()  # type: ignore[attr-defined]
+        # Tag the client with its context so we can close it on shutdown
+        try:
+            setattr(client, "__mcp_ctx__", res)
+        except Exception:
+            pass
+    else:
+        client = await res  # older awaitable form
 
     await client.initialize()
     return client
@@ -461,6 +481,19 @@ async def on_startup():
     if "mcp" not in DISCOVERY.servers:
         DISCOVERY.servers["mcp"] = ServerState(ServerConfig(alias="mcp"))  # placeholder
     await do_discover(wait_seconds=int(os.getenv("MCP_DISCOVERY_WAIT", "0")))
+    
+@app.on_event("shutdown")
+async def on_shutdown():
+    # Gracefully close any stdio sessions opened via async context manager
+    for alias, st in list(DISCOVERY.servers.items()):
+        try:
+            if st.client is not None:
+                ctx = getattr(st.client, "__mcp_ctx__", None)
+                if ctx and hasattr(ctx, "__aexit__"):
+                    await ctx.__aexit__(None, None, None)
+        except Exception:
+            # Don’t let shutdown be noisy
+            pass
 
 def refresh_servers_from_env() -> bool:
     updated = False
