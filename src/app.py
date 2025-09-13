@@ -255,34 +255,44 @@ def compose_argstring(
 # MCP integration (stdio)
 # =============================================================================
 
-async def _maybe_enter_or_await(res):
-    """Normalize stdio_client result across SDKs: async CM vs awaitable vs instance."""
-    try:
-        # Async context manager?
-        if hasattr(res, "__aenter__") and inspect.iscoroutinefunction(res.__aenter__):
-            client = await res.__aenter__()  # type: ignore[attr-defined]
-            try:
-                setattr(client, "__mcp_ctx__", res)
-            except Exception:
-                pass
-            return client
-        # Awaitable/coroutine?
-        if inspect.isawaitable(res):
-            return await res
-        # Plain instance already
-        return res
-    except Exception:
-        raise
+async def _normalize_stdio_result(res):
+    """
+    Normalize stdio_client result:
+    - If it is an async context manager: await __aenter__().
+    - Else if it's awaitable: await it.
+    - Else return the instance.
+    """
+    # Async context manager?
+    if hasattr(res, "__aenter__"):
+        entered = res.__aenter__()  # may be awaitable
+        if inspect.isawaitable(entered):
+            client = await entered
+        else:
+            client = entered
+        try:
+            setattr(client, "__mcp_ctx__", res)  # keep ctx for graceful shutdown
+        except Exception:
+            pass
+        return client
+
+    # Awaitable/coroutine?
+    if inspect.isawaitable(res):
+        return await res
+
+    # Already-instantiated client
+    return res
+
 
 async def mcp_connect_stdio(cfg: ServerConfig):
     """
-    Create an MCP stdio client across SDK variants.
-    We try several call signatures in this order:
-      1) stdio_client(<list or str>, env=...)               # positional argv
-      2) stdio_client(*argv, env=...)                       # varargs
-      3) stdio_client(command=<str>, args=[...], env=...)   # kw form
-      4) stdio_client(command=<list>, env=...)              # kw list form
-    If 'env' kw isn't supported, we re-try after temporarily injecting env.
+    Create an MCP stdio client across SDK variants without using any keyword-only
+    signatures (many older SDKs reject `command=` or `env=`).
+
+    We try, in order:
+      1) stdio_client(argv: List[str], **maybe_env)
+      2) stdio_client(command: str, *args, **maybe_env)  [positional/varargs]
+    If the SDK rejects 'env=', we retry after temporarily injecting cfg.env into
+    os.environ for process spawn.
     """
     if not MCP_AVAILABLE:
         raise RuntimeError("MCP python SDK not installed. pip install mcp[stdio]")
@@ -302,47 +312,41 @@ async def mcp_connect_stdio(cfg: ServerConfig):
     def _constructors(allow_env_kw: bool):
         env_kw = {} if not allow_env_kw else {"env": (cfg.env or {})}
 
+        # 1) positional: argv list OR a single str if no args
         def v_positional_list():
             argv = [_command] + _args if _args else _command
             return stdio_client(argv, **env_kw)
 
+        # 2) positional varargs: command, *args
         def v_positional_varargs():
             return stdio_client(_command, *_args, **env_kw)
 
-        def v_kw_cmd_args():
-            return stdio_client(command=_command, args=_args, **env_kw)
-
-        def v_kw_cmd_list():
-            argv = [_command] + _args
-            return stdio_client(command=argv, **env_kw)
-
-        # Prefer positional forms first to avoid 'unexpected keyword' issues
-        return (v_positional_list, v_positional_varargs, v_kw_cmd_args, v_kw_cmd_list)
+        return (v_positional_list, v_positional_varargs)
 
     last_exc: Optional[BaseException] = None
     for allow_env_kw in (True, False):
+        # If env kw not allowed, inject env into process for the spawn
         orig_env = None
         if not allow_env_kw and cfg.env:
-            # Inject env just for the spawn if 'env' kw isn't accepted
             orig_env = os.environ.copy()
             os.environ.update(cfg.env)
         try:
             for ctor in _constructors(allow_env_kw):
                 try:
                     res = ctor()
-                    client = await _maybe_enter_or_await(res)
-                    # Some SDKs require explicit initialize()
-                    if hasattr(client, "initialize"):
-                        maybe = client.initialize()
+                    client = await _normalize_stdio_result(res)
+                    # Ensure initialize() if provided
+                    init = getattr(client, "initialize", None)
+                    if callable(init):
+                        maybe = init()
                         if inspect.isawaitable(maybe):
                             await maybe
                     return client
-                except (TypeError, AttributeError) as te:
-                    # Signature mismatch or internal attr expectations; try next
+                except TypeError as te:
+                    # signature mismatch (e.g., env not supported or wrong positional type)
                     last_exc = te
                     continue
                 except Exception as e:
-                    # Real failure from the attempt; record and try next variant
                     last_exc = e
                     continue
         finally:
@@ -351,6 +355,7 @@ async def mcp_connect_stdio(cfg: ServerConfig):
                 os.environ.update(orig_env)
 
     raise RuntimeError(f"Failed to create stdio MCP client for '{cfg.alias}': {last_exc}")
+
 
 async def mcp_list_tools(session) -> List[Dict[str, Any]]:
     result = await session.list_tools()
@@ -390,6 +395,7 @@ async def rpc_try_methods(client: httpx.AsyncClient, url: str, candidates: List[
     for payload in candidates:
         try:
             r = await client.post(url, json=payload, timeout=60)
+            # Accept both 200 and 207 (multi-status) if some servers use it
             if r.status_code in (200, 207):
                 data = r.json()
                 return data
@@ -414,6 +420,7 @@ async def mcp_http_list_tools() -> List[Dict[str, Any]]:
             {"method": "tool/list", "params": {}},
             {"method": "tools.list", "params": {}},
         ])
+    # Normalize plausible shapes
     tools = []
     container = data.get("result", data)
     for t in container.get("tools", []):
@@ -445,6 +452,8 @@ async def mcp_http_call_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, 
             {"method": "tool/call", "params": {"name": tool_name, "arguments": args}},
             {"method": "tools.call", "params": {"name": tool_name, "arguments": args}},
         ])
+
+    # Normalize to the same shape stdio path returns
     container = data.get("result", data)
     content = container.get("content") or container.get("contents") or []
     normalized = {"type": "mcp_result", "content": []}
@@ -453,8 +462,10 @@ async def mcp_http_call_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, 
             if item.get("type") == "text" and "text" in item:
                 normalized["content"].append({"type": "text", "text": item["text"]})
             else:
+                # pass through other content types
                 normalized["content"].append(item)
         else:
+            # fallback string payload
             normalized["content"].append({"type": "text", "text": str(item)})
     return normalized
 
@@ -465,7 +476,7 @@ async def mcp_http_call_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, 
 
 app = FastAPI(
     title="MCP OpenAPI Bridge (Generic, Self-Discovering)",
-    version="3.1.9",
+    version="3.1.10",
     description=textwrap.dedent(
         """\
         A generic, self-discovering OpenAPI façade for MCP servers.
@@ -557,6 +568,7 @@ def refresh_servers_from_env() -> bool:
 async def do_discover(wait_seconds: int = 0) -> Dict[str, Any]:
     for alias, st in list(DISCOVERY.servers.items()):
         tools_raw: List[Dict[str, Any]] = []
+
         # ---- Try stdio path, but never bail if it fails
         if st.cfg.mode == "stdio" and st.cfg.cmd:
             try:
@@ -823,6 +835,7 @@ async def do_tool_call(
     except HTTPException as e:
         if e.status_code != 503 or not MCP_RPC_URL:
             raise
+        # stdio not connected; execute via HTTP RPC below
         print(f"[rpc-fallback] Using MCP_RPC_URL={MCP_RPC_URL} for '{tool_path}'", file=sys.stderr)
 
     components = tool_path.split("/")
@@ -867,6 +880,7 @@ async def do_tool_call(
             return {"dryrun": True, "tool": tool, "args": {}}
         if st:
             return await mcp_call_tool(st.client, tool, {})
+        # HTTP RPC fallback
         return await mcp_http_call_tool(tool, {})
 
     args = {}
@@ -899,6 +913,7 @@ async def do_tool_call(
         print(f"[dryrun] server={server} tool={tool} suffix='{suffix}' final_args={final_args}", file=sys.stderr)
         return {"dryrun": True, "server": server, "tool": tool, "final_args": final_args}
 
+    # Execute via stdio if available, else via HTTP RPC
     try:
         if st:
             print(f"[invoke-stdio] server={st.cfg.alias} tool={tool} suffix='{suffix}' final_args={final_args}", file=sys.stderr)
@@ -1014,7 +1029,7 @@ async def tool_dispatch_get(
         raise
 
 
-# -------------------- explicit granular routes (you can keep your custom ones here if any) --------------------
+# -------------------- explicit granular routes (add any custom ones here) --------------------
 
 
 # =============================================================================
