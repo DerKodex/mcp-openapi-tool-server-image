@@ -319,14 +319,11 @@ async def on_startup():
         cfg_obj = ServerConfig(**cfg)
         DISCOVERY.servers[cfg_obj.alias] = ServerState(cfg_obj)
 
-    # ---- minimal, surgical fix ----
-    # If callers hard-code /mcp/... but config uses a different alias,
-    # create a shallow alias 'mcp' to the first configured server.
+    # small compat alias for callers that hard-code /mcp/...
     if "mcp" not in DISCOVERY.servers and DISCOVERY.servers:
         first_alias, first_state = next(iter(DISCOVERY.servers.items()))
-        DISCOVERY.servers["mcp"] = first_state  # alias to the same ServerState
+        DISCOVERY.servers["mcp"] = first_state
         print(f"[compat] Created alias 'mcp' -> '{first_alias}'", file=sys.stderr)
-    # --------------------------------
 
     await do_discover(wait_seconds=int(os.getenv("MCP_DISCOVERY_WAIT", "0")))
 
@@ -546,20 +543,32 @@ async def resolve_arg_payload(
 
 async def ensure_connected(server: str) -> ServerState:
     """
-    Compatibility shim:
-    - If the requested alias isn't found but exactly one server is configured,
-      transparently use that server. This avoids 404s when URLs hardcode '/mcp/...'
-      but the actual alias differs.
+    Small compat shim to avoid 404/503 on hard-coded '/mcp/...':
+    - If the requested alias isn't found but any server is configured,
+      transparently fall back to the *first configured* server.
+    - If the chosen server isn't connected yet, attempt to connect now.
     """
     st = DISCOVERY.servers.get(server)
+
+    if not st and DISCOVERY.servers:
+        # fall back to first configured server (keeps /mcp/... working)
+        first_alias, st = next(iter(DISCOVERY.servers.items()))
+        print(f"[compat] Alias '{server}' not found; falling back to '{first_alias}'", file=sys.stderr)
+
     if not st:
-        if len(DISCOVERY.servers) == 1:
-            st = next(iter(DISCOVERY.servers.values()))
-            print(f"[compat] Alias '{server}' not found; falling back to sole server '{st.cfg.alias}'", file=sys.stderr)
-        else:
-            raise HTTPException(404, f"Unknown server '{server}'")
+        raise HTTPException(404, f"Unknown server '{server}'")
+
     if not st.connected or not st.client:
-        raise HTTPException(503, f"Server '{server}' is not connected")
+        # try to connect on demand
+        try:
+            if st.cfg.mode == "stdio":
+                st.client = await mcp_connect_stdio(st.cfg)
+                st.connected = True
+            else:
+                raise RuntimeError(f"Server '{st.cfg.alias}' not in stdio mode")
+        except Exception as e:
+            raise HTTPException(503, f"Server '{st.cfg.alias}' is not connected: {e}")
+
     return st
 
 
@@ -659,7 +668,6 @@ async def do_tool_call(
         print(f"[invoke] server={server} tool={tool} suffix='{suffix}' final_args={final_args}", file=sys.stderr)
         return await mcp_call_tool(st.client, tool, final_args)
     except Exception as e:
-        # Give a helpful error with context
         raise HTTPException(502, f"Tool invocation failed for '{tool_path}': {e}")
 
 
