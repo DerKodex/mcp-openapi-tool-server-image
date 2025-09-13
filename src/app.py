@@ -158,21 +158,21 @@ def build_k8s_output_guidance(tool_name: str) -> Dict[str, Any]:
             "For 'api-resources'/'api-versions', `format=json` works when supported; otherwise text table."
         ],
         "parsingHints": {
-            "describe/pods (text)": {
-                "extract": [
-                    {"field": "name", "regex": r"^Name:\s+([^\s]+)"},
-                    {"field": "namespace", "regex": r"^Namespace:\s+([^\s]+)"},
-                    {"field": "node", "regex": r"^Node:\s+([^\s]+)"},
-                    {"field": "podIP", "regex": r"^IP:\s+([^\s]+)"},
-                    {"field": "phase", "regex": r"^Status:\s+([A-Za-z]+)"},
-                ],
-                "lineMode": True
-            },
-            "logs (text)": {
-                "extract": [
-                    {"field": "lines", "note": "Split by newline; may contain timestamps."}
-                ]
-            }
+                "describe/pods (text)": {
+                    "extract": [
+                        {"field": "name", "regex": r"^Name:\s+([^\s]+)"},
+                        {"field": "namespace", "regex": r"^Namespace:\s+([^\s]+)"},
+                        {"field": "node", "regex": r"^Node:\s+([^\s]+)"},
+                        {"field": "podIP", "regex": r"^IP:\s+([^\s]+)"},
+                        {"field": "phase", "regex": r"^Status:\s+([A-Za-z]+)"},
+                    ],
+                    "lineMode": True
+                },
+                "logs (text)": {
+                    "extract": [
+                        {"field": "lines", "note": "Split by newline; may contain timestamps."}
+                    ]
+                }
         }
     }
 
@@ -535,9 +535,20 @@ async def resolve_arg_payload(
 
 
 async def ensure_connected(server: str) -> ServerState:
+    """
+    Small compatibility shim:
+    - If the requested alias isn't found but exactly one server is configured,
+      transparently use that server. This avoids 404s when URLs hardcode '/mcp/...'
+      but the actual alias differs.
+    """
     st = DISCOVERY.servers.get(server)
     if not st:
-        raise HTTPException(404, f"Unknown server '{server}'")
+        if len(DISCOVERY.servers) == 1:
+            # Fallback to the single configured server
+            st = next(iter(DISCOVERY.servers.values()))
+            print(f"[compat] Alias '{server}' not found; falling back to sole server '{st.cfg.alias}'", file=sys.stderr)
+        else:
+            raise HTTPException(404, f"Unknown server '{server}'")
     if not st.connected or not st.client:
         raise HTTPException(503, f"Server '{server}' is not connected")
     return st
@@ -562,7 +573,7 @@ async def do_tool_call(
     if not td:
         print(f"[dispatch] Tool '{tool}' not in cache for server '{server}'. Refreshing discovery...", file=sys.stderr)
         await do_discover(wait_seconds=0)
-        td = DISCOVERY.servers.get(server, ServerState(ServerConfig(alias=server))).tools.get(tool)
+        td = DISCOVERY.servers.get(st.cfg.alias, st).tools.get(tool)
 
     # Helper endpoints even without td: schema/example/help/try
     if suffix in ("schema", "example", "help"):
@@ -721,7 +732,7 @@ async def tool_dispatch_get(
     return JSONResponse(result)
 
 
-# -------------------- NEW: explicit granular routes to avoid 404s --------------------
+# -------------------- explicit granular routes --------------------
 
 @app.post(
     "/{server}/tool/{tool}/{action}/{kind}",
@@ -745,7 +756,6 @@ async def granular_post_kind(
     container: Optional[str] = Query(None),
     sinceSeconds: Optional[int] = Query(None),
 ):
-    # Merge convenience query params into body just like GET handler
     body = (body or {}).copy()
     for k, v in {
         "namespace": namespace, "name": name, "labels": labels,
@@ -755,7 +765,6 @@ async def granular_post_kind(
         if v is not None:
             body[k] = v
 
-    # Prefer body; if args is JSON dict, merge it too (parity with catch-all)
     if args:
         try:
             parsed = json.loads(args)
@@ -796,8 +805,6 @@ async def granular_get_kind(
     container: Optional[str] = Query(None),
     sinceSeconds: Optional[int] = Query(None),
 ):
-    # Reuse the GET catch-all behavior by composing tool_path
-    # and passing through query convenience params (via body).
     body: Dict[str, Any] = {}
     for k, v in {
         "namespace": namespace, "name": name, "labels": labels,
@@ -928,7 +935,7 @@ async def granular_get_action(
     )
     return JSONResponse(result)
 
-# ------------------ end of NEW granular routes ------------------
+# ------------------ end of explicit granular routes ------------------
 
 
 # =============================================================================
