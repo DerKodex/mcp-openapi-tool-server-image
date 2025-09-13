@@ -158,21 +158,21 @@ def build_k8s_output_guidance(tool_name: str) -> Dict[str, Any]:
             "For 'api-resources'/'api-versions', `format=json` works when supported; otherwise text table."
         ],
         "parsingHints": {
-                "describe/pods (text)": {
-                    "extract": [
-                        {"field": "name", "regex": r"^Name:\s+([^\s]+)"},
-                        {"field": "namespace", "regex": r"^Namespace:\s+([^\s]+)"},
-                        {"field": "node", "regex": r"^Node:\s+([^\s]+)"},
-                        {"field": "podIP", "regex": r"^IP:\s+([^\s]+)"},
-                        {"field": "phase", "regex": r"^Status:\s+([A-Za-z]+)"},
-                    ],
-                    "lineMode": True
-                },
-                "logs (text)": {
-                    "extract": [
-                        {"field": "lines", "note": "Split by newline; may contain timestamps."}
-                    ]
-                }
+            "describe/pods (text)": {
+                "extract": [
+                    {"field": "name", "regex": r"^Name:\s+([^\s]+)"},
+                    {"field": "namespace", "regex": r"^Namespace:\s+([^\s]+)"},
+                    {"field": "node", "regex": r"^Node:\s+([^\s]+)"},
+                    {"field": "podIP", "regex": r"^IP:\s+([^\s]+)"},
+                    {"field": "phase", "regex": r"^Status:\s+([A-Za-z]+)"},
+                ],
+                "lineMode": True
+            },
+            "logs (text)": {
+                "extract": [
+                    {"field": "lines", "note": "Split by newline; may contain timestamps."}
+                ]
+            }
         }
     }
 
@@ -318,11 +318,21 @@ async def on_startup():
     for cfg in servers_cfg:
         cfg_obj = ServerConfig(**cfg)
         DISCOVERY.servers[cfg_obj.alias] = ServerState(cfg_obj)
+
+    # ---- minimal, surgical fix ----
+    # If callers hard-code /mcp/... but config uses a different alias,
+    # create a shallow alias 'mcp' to the first configured server.
+    if "mcp" not in DISCOVERY.servers and DISCOVERY.servers:
+        first_alias, first_state = next(iter(DISCOVERY.servers.items()))
+        DISCOVERY.servers["mcp"] = first_state  # alias to the same ServerState
+        print(f"[compat] Created alias 'mcp' -> '{first_alias}'", file=sys.stderr)
+    # --------------------------------
+
     await do_discover(wait_seconds=int(os.getenv("MCP_DISCOVERY_WAIT", "0")))
 
 
 async def do_discover(wait_seconds: int = 0) -> Dict[str, Any]:
-    for alias, st in DISCOVERY.servers.items():
+    for alias, st in list(DISCOVERY.servers.items()):
         try:
             if st.cfg.mode == "stdio":
                 if not st.connected:
@@ -536,7 +546,7 @@ async def resolve_arg_payload(
 
 async def ensure_connected(server: str) -> ServerState:
     """
-    Small compatibility shim:
+    Compatibility shim:
     - If the requested alias isn't found but exactly one server is configured,
       transparently use that server. This avoids 404s when URLs hardcode '/mcp/...'
       but the actual alias differs.
@@ -544,7 +554,6 @@ async def ensure_connected(server: str) -> ServerState:
     st = DISCOVERY.servers.get(server)
     if not st:
         if len(DISCOVERY.servers) == 1:
-            # Fallback to the single configured server
             st = next(iter(DISCOVERY.servers.values()))
             print(f"[compat] Alias '{server}' not found; falling back to sole server '{st.cfg.alias}'", file=sys.stderr)
         else:
