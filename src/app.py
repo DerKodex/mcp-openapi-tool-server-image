@@ -38,9 +38,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 # ---- Optional MCP client (stdio) -------------------------------------------
-# If "mcp" is not available, we degrade gracefully (discovery returns empty).
 try:
-    # Official SDK: https://github.com/modelcontextprotocol/python-sdk
     from mcp.client.stdio import stdio_client
     from mcp.types import TextContent
     MCP_AVAILABLE = True
@@ -55,7 +53,6 @@ except Exception:
 class ServerConfig(BaseModel):
     alias: str
     mode: str = Field("stdio", description="stdio | custom(implement in code)")
-    # stdio-specific:
     cmd: Optional[List[str]] = None
     env: Optional[Dict[str, str]] = None
 
@@ -63,8 +60,7 @@ class ServerConfig(BaseModel):
 class ToolDescriptor(BaseModel):
     name: str
     description: Optional[str] = None
-    input_schema: Optional[Dict[str, Any]] = None  # JSON Schema (dict)
-    # Derived/enriched hints
+    input_schema: Optional[Dict[str, Any]] = None
     inferred_actions: List[str] = Field(default_factory=list)
     inferred_kinds: List[str] = Field(default_factory=list)
     convenience_params: List[str] = Field(default_factory=list)
@@ -74,29 +70,24 @@ class ToolDescriptor(BaseModel):
 
 
 class ServerState:
-    """Holds a live MCP client session and discovered tools."""
     def __init__(self, cfg: ServerConfig):
         self.cfg = cfg
         self.connected = False
-        self.client = None  # mcp stdio client (if available)
+        self.client = None
         self.tools: Dict[str, ToolDescriptor] = {}
 
 
 class DiscoveryState:
-    """In-memory registry of servers -> tools."""
     def __init__(self):
         self.servers: Dict[str, ServerState] = {}
 
     def list_servers(self) -> List[Dict[str, Any]]:
-        out = []
-        for alias, st in self.servers.items():
-            out.append({
-                "alias": alias,
-                "mode": st.cfg.mode,
-                "connected": st.connected,
-                "tools": list(st.tools.keys())
-            })
-        return out
+        return [{
+            "alias": alias,
+            "mode": st.cfg.mode,
+            "connected": st.connected,
+            "tools": list(st.tools.keys()),
+        } for alias, st in self.servers.items()]
 
 
 DISCOVERY = DiscoveryState()
@@ -128,7 +119,6 @@ def getenv_json(name: str, default: Any) -> Any:
 
 
 def parse_actions_from_description(desc: str) -> List[str]:
-    """Heuristically extract action verbs from bullet lines like '- get: ...'"""
     if not desc:
         return []
     actions = set()
@@ -136,7 +126,6 @@ def parse_actions_from_description(desc: str) -> List[str]:
         m = re.search(r"^\s*-\s*([a-zA-Z0-9_-]+)\s*[:\-]", line)
         if m:
             actions.add(m.group(1).strip())
-    # Keep a nice order for familiar kubectl-ish tools
     preferred = ["get", "describe", "logs", "events", "top", "exec", "cp",
                  "cluster-info", "api-resources", "api-versions", "explain",
                  "diff", "auth", "config"]
@@ -154,24 +143,20 @@ def infer_kinds_from_description(desc: str) -> List[str]:
     for k in COMMON_K8S_KINDS:
         if re.search(rf"\b{k}\b", desc):
             kinds.add(k)
-    ordered = [k for k in COMMON_K8S_KINDS if k in kinds]
-    return ordered
+    return [k for k in COMMON_K8S_KINDS if k in kinds]
 
 
 def schema_enums(schema: Dict[str, Any], field: str) -> List[str]:
-    """Read enum from a JSON schema property if present."""
     try:
         props = schema.get("properties", {})
         if field in props and "enum" in props[field]:
-            vals = [str(v) for v in props[field]["enum"]]
-            return vals
+            return [str(v) for v in props[field]["enum"]]
     except Exception:
         pass
     return []
 
 
 def build_k8s_output_guidance(tool_name: str) -> Dict[str, Any]:
-    """Provide structured output guidance for typical kubectl-ish tools."""
     return {
         "preferredFormats": ["json", "yaml", "text"],
         "notes": [
@@ -201,31 +186,30 @@ def build_k8s_output_guidance(tool_name: str) -> Dict[str, Any]:
 
 
 def k8s_natural_examples(tool_name: str) -> List[Dict[str, Any]]:
-    """Natural language intents -> example calls."""
-    examples = []
-    examples.append({
-        "intent": "List all pods in the vault namespace (machine-readable JSON)",
-        "calls": [
-            {"GET": f"/mcp/tool/{tool_name}/get/pods?namespace=vault&format=json"},
-            {"POST": f"/mcp/tool/{tool_name}/get/pods", "body": {"namespace": "vault"}, "query": {"format": "json"}},
-        ],
-        "notes": ["Use format=json to inject '-o json' when supported (e.g., kubectl get)."]
-    })
-    examples.append({
-        "intent": "Describe a pod (human text)",
-        "calls": [
-            {"GET": f"/mcp/tool/{tool_name}/describe/pods?namespace=vault&name=vault-0"},
-        ],
-        "notes": ["'describe' outputs unstructured text; see x-outputGuidance.parsingHints."]
-    })
-    examples.append({
-        "intent": "List namespaces",
-        "calls": [
-            {"GET": f"/mcp/tool/{tool_name}/get/namespaces?format=json"},
-        ],
-        "notes": ["Prefer JSON for machine parsing."]
-    })
-    return examples
+    return [
+        {
+            "intent": "List all pods in the vault namespace (machine-readable JSON)",
+            "calls": [
+                {"GET": f"/mcp/tool/{tool_name}/get/pods?namespace=vault&format=json"},
+                {"POST": f"/mcp/tool/{tool_name}/get/pods", "body": {"namespace": "vault"}, "query": {"format": "json"}},
+            ],
+            "notes": ["Use format=json to inject '-o json' when supported (e.g., kubectl get)."]
+        },
+        {
+            "intent": "Describe a pod (human text)",
+            "calls": [
+                {"GET": f"/mcp/tool/{tool_name}/describe/pods?namespace=vault&name=vault-0"},
+            ],
+            "notes": ["'describe' outputs unstructured text; see x-outputGuidance.parsingHints."]
+        },
+        {
+            "intent": "List namespaces",
+            "calls": [
+                {"GET": f"/mcp/tool/{tool_name}/get/namespaces?format=json"},
+            ],
+            "notes": ["Prefer JSON for machine parsing."]
+        }
+    ]
 
 
 def is_k8s_tool(name: str, desc: str) -> bool:
@@ -242,7 +226,6 @@ def compose_argstring(
     container: Optional[str] = None,
     sinceSeconds: Optional[int] = None,
 ) -> str:
-    """Converts convenience params into a CLI-like argstring. Keeps user's 'args' tail."""
     parts: List[str] = []
     if name:
         parts.append(str(name))
@@ -275,7 +258,6 @@ def compose_argstring(
 # =============================================================================
 
 async def mcp_connect_stdio(cfg: ServerConfig):
-    """Connect to an MCP server via stdio and return a session."""
     if not MCP_AVAILABLE:
         raise RuntimeError("MCP python SDK not installed. pip install mcp[stdio]")
     if not cfg.cmd:
@@ -286,7 +268,6 @@ async def mcp_connect_stdio(cfg: ServerConfig):
 
 
 async def mcp_list_tools(session) -> List[Dict[str, Any]]:
-    """Ask the MCP server for tools."""
     result = await session.list_tools()
     tools = []
     for t in result.tools:
@@ -299,10 +280,6 @@ async def mcp_list_tools(session) -> List[Dict[str, Any]]:
 
 
 async def mcp_call_tool(session, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Invoke an MCP tool. Returns a normalized structure:
-    { "type": "mcp_result", "content": [{"type":"text","text":"..."}, {"type":"json","json":{...}}, ...] }
-    """
     call = await session.call_tool(tool_name, args)
     normalized = {"type": "mcp_result", "content": []}
     for item in call.content:
@@ -321,7 +298,7 @@ async def mcp_call_tool(session, tool_name: str, args: Dict[str, Any]) -> Dict[s
 
 app = FastAPI(
     title="MCP OpenAPI Bridge (Generic, Self-Discovering)",
-    version="3.1.0",
+    version="3.1.1",
     description=textwrap.dedent(
         """\
         A generic, self-discovering OpenAPI façade for MCP servers.
@@ -353,7 +330,6 @@ async def on_startup():
 
 
 async def do_discover(wait_seconds: int = 0) -> Dict[str, Any]:
-    """Connect (if needed) and refresh the tool catalog for all servers."""
     for alias, st in DISCOVERY.servers.items():
         try:
             if st.cfg.mode == "stdio":
@@ -377,7 +353,6 @@ async def do_discover(wait_seconds: int = 0) -> Dict[str, Any]:
                     convenience_params=[p for p in CONVENIENCE_PARAMS if p in (schema.get("properties") or {})]
                 )
 
-                # Infer actions and kinds
                 td.inferred_actions = schema_enums(schema, "operation") or parse_actions_from_description(desc)
                 kinds_from_schema = schema_enums(schema, "resource")
                 if kinds_from_schema:
@@ -393,11 +368,7 @@ async def do_discover(wait_seconds: int = 0) -> Dict[str, Any]:
                     "schema": {
                         "type": "object",
                         "fields": {
-                            "args": {
-                                "required": True,
-                                "type": "string",
-                                "description": "Operation-specific arguments / flags"
-                            },
+                            "args": {"required": True, "type": "string", "description": "Operation-specific arguments / flags"},
                             "operation": {"required": True, "type": "string"},
                             "resource": {"required": True, "type": "string"},
                         },
@@ -417,14 +388,13 @@ async def do_discover(wait_seconds: int = 0) -> Dict[str, Any]:
     if wait_seconds > 0:
         await asyncio.sleep(min(wait_seconds, 10))
 
-    out = {"servers": []}
-    for alias, st in DISCOVERY.servers.items():
-        out["servers"].append({
+    return {
+        "servers": [{
             "alias": alias,
             "connected": st.connected,
             "tools": [t for t in st.tools.keys()]
-        })
-    return out
+        } for alias, st in DISCOVERY.servers.items()]
+    }
 
 
 # =============================================================================
@@ -458,8 +428,7 @@ async def servers_info():
 @app.post("/discover", tags=["discovery"], summary="Discover Endpoint")
 async def discover_endpoint(wait: Optional[int] = Query(0, description="Seconds to wait (max 10) for discovery")):
     wait = max(0, min(int(wait or 0), 10))
-    res = await do_discover(wait_seconds=wait)
-    return res
+    return await do_discover(wait_seconds=wait)
 
 
 @app.get("/discovery/status", tags=["discovery"], summary="Discovery Status")
@@ -549,12 +518,6 @@ async def resolve_arg_payload(
     convenience: Dict[str, Any],
     format_hint: Optional[str]
 ) -> Dict[str, Any]:
-    """
-    Produces the final MCP tool args object:
-    - Preserves user-provided fields
-    - Adds 'args' (argstring) if we can compose it
-    - Applies '-o <format>' injection for 'get' style ops where applicable
-    """
     args_obj = (payload or {}).copy()
     argstring = compose_argstring(
         args_str=query_args_str or args_obj.get("args", ""),
@@ -587,12 +550,6 @@ async def do_tool_call(
     dryrun: bool,
     format_hint: Optional[str],
 ) -> Any:
-    """
-    tool_path can be either:
-      - 'TOOL'  (generic invoke with whatever 'operation'/'resource' provided)
-      - 'TOOL/ACTION' or 'TOOL/ACTION/KIND' (granular)
-      - 'TOOL/invoke', 'TOOL/schema', 'TOOL/example', 'TOOL/help', 'TOOL/try'
-    """
     st = DISCOVERY.servers.get(server)
     if not st:
         raise HTTPException(404, f"Unknown server '{server}'")
@@ -661,7 +618,7 @@ async def do_tool_call(
 
 
 @app.post(
-    "/{server}/tool/{tool_path}",
+    "/{server}/tool/{tool_path:path}",
     tags=["tools"],
     summary="Tool Dispatch",
     responses={200: {"description": "Successful Response", "content": {"application/json": {}}}},
@@ -679,13 +636,20 @@ async def tool_dispatch_post(
         try:
             qargs = json.loads(args)
         except Exception:
-            qargs = args  # raw string fallback becomes tail
-    result = await do_tool_call(server, tool_path, body or (qargs if isinstance(qargs, dict) else None), None, bool(dryrun), format)
+            qargs = args
+    result = await do_tool_call(
+        server,
+        tool_path,
+        body or (qargs if isinstance(qargs, dict) else None),
+        None,
+        bool(dryrun),
+        format
+    )
     return JSONResponse(result)
 
 
 @app.get(
-    "/{server}/tool/{tool_path}",
+    "/{server}/tool/{tool_path:path}",
     tags=["tools"],
     summary="Tool Dispatch",
     responses={200: {"description": "Successful Response", "content": {"application/json": {}}}},
@@ -736,10 +700,7 @@ async def tool_dispatch_get(
 # =============================================================================
 
 @app.get("/mcp/tool/{tool}/invoke", tags=["tools", "invoke"], summary="Invoke (GET /invoke)")
-async def tool_invoke_get(
-    tool: str,
-    **kwargs
-):
+async def tool_invoke_get(tool: str, **kwargs):
     return await tool_dispatch_get(server="mcp", tool_path=f"{tool}/invoke", **kwargs)
 
 
@@ -788,13 +749,12 @@ async def tool_try(tool: str, dryrun: Optional[bool] = Query(False)):
 
 _original_openapi = app.openapi
 
-
 def custom_openapi():
-    # Generate (or refresh) the schema, then add x-* blocks every time
     openapi_schema = _original_openapi()
-    openapi_schema.update(openapi_extra_blocks())
+    openapi_schema.update({
+        **openapi_extra_blocks()
+    })
     app.openapi_schema = openapi_schema
     return app.openapi_schema
-
 
 app.openapi = custom_openapi
