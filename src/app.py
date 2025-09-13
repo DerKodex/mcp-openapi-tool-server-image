@@ -1,971 +1,860 @@
-# app.py
-import os, time, asyncio, re, json, hashlib
-from typing import Any, Dict, Optional, List, Tuple, Union
-from fastapi import (
-    FastAPI, Body, Response, HTTPException, Depends, Header,
-    Request, Query, Path
-)
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+MCP OpenAPI Bridge — Generic, Self-Discovering
+----------------------------------------------
+- Discovers MCP servers + tools at runtime
+- Exposes generic and granular HTTP endpoints per tool
+- Builds a richly annotated OpenAPI with model guidance,
+  natural-language intents, parsing hints, format/dryrun helpers
+
+Transport:
+- Prefers the official "mcp" python client (stdio).
+- Also supports a "router" mode via another process (optional).
+- You can run multiple servers; configure with MCP_SERVERS env var.
+
+Install (if needed):
+  pip install fastapi uvicorn pydantic mcp[stdio]
+
+Run:
+  UVICORN_WORKERS=1 uvicorn app:app --host 0.0.0.0 --port 8080
+
+Env:
+  MCP_SERVERS='[{"alias":"mcp","mode":"stdio","cmd":["/path/to/mcp-server","--flag"]}]'
+  MCP_DISCOVERY_WAIT=2  (seconds to wait for discovery on POST /discover)
+"""
+
+import asyncio
+import json
+import os
+import re
+import sys
+import textwrap
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+from fastapi import FastAPI, Body, Query, Path, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from fastapi.openapi.utils import get_openapi
-import httpx
+from fastapi.responses import JSONResponse, PlainTextResponse
+from pydantic import BaseModel, Field
 
-# =========================
-# Config
-# =========================
-API_KEY            = os.environ.get("API_KEY", "").strip()
-ALLOW_ORIGINS      = os.environ.get("CORS_ALLOW_ORIGINS", "*")
-REQUEST_TIMEOUT    = int(os.environ.get("REQUEST_TIMEOUT", "30"))
-REFRESH_INTERVAL   = int(os.environ.get("REFRESH_INTERVAL", "10"))  # seconds
-DISCOVERY_PUBLIC   = os.environ.get("DISCOVERY_PUBLIC", "true").lower() in ("1","true","t","yes","y","on")
-PUBLIC_BASE_URL    = os.environ.get("PUBLIC_BASE_URL", "http://localhost:8080")
+# ---- Optional MCP client (stdio) -------------------------------------------
+# If "mcp" is not available, we degrade gracefully (discovery returns empty).
+try:
+    # Official SDK: https://github.com/modelcontextprotocol/python-sdk
+    from mcp.client.stdio import stdio_client
+    from mcp.types import TextContent
+    MCP_AVAILABLE = True
+except Exception:
+    MCP_AVAILABLE = False
 
-# Optional: capture small output samples per tool to embed in the spec (LLM training wheels)
-CAPTURE_SAMPLES             = os.environ.get("CAPTURE_SAMPLES", "false").lower() in ("1","true","t","yes","y","on")
-CAPTURE_SAMPLE_BYTES        = int(os.environ.get("CAPTURE_SAMPLE_BYTES", "4000"))  # truncate
-CAPTURE_SAMPLE_TIMEOUT_SECS = int(os.environ.get("CAPTURE_SAMPLE_TIMEOUT_SECS", "6"))
 
-# Multiple servers: "ro=http://host:8080/mcp,admin=http://host:8080/mcp"
-MCP_SERVERS  = os.environ.get("MCP_SERVERS", "").strip()
-MCP_RPC_URL  = os.environ.get("MCP_RPC_URL", "").strip()  # single-server fallback
+# =============================================================================
+# Data structures
+# =============================================================================
 
-def parse_servers(spec: str) -> Dict[str, str]:
-    out: Dict[str, str] = {}
-    for part in [p.strip() for p in spec.split(",") if p.strip()]:
-        if "=" in part:
-            k, v = part.split("=", 1)
-            out[k.strip()] = v.strip()
-    return out
+class ServerConfig(BaseModel):
+    alias: str
+    mode: str = Field("stdio", description="stdio | custom(implement in code)")
+    # stdio-specific:
+    cmd: Optional[List[str]] = None
+    env: Optional[Dict[str, str]] = None
 
-SERVERS_CFG = parse_servers(MCP_SERVERS) or ({"mcp": MCP_RPC_URL} if MCP_RPC_URL else {"mcp": "http://localhost:8080/mcp"})
 
-# =========================
-# App
-# =========================
-app = FastAPI(
-    title="MCP OpenAPI Bridge (Generic, Self-Discovering)",
-    version="3.0.0",
-    description=(
-        "A generic, self-discovering OpenAPI façade for MCP servers.\n"
-        "It discovers tools, prompts, and resources from MCP and exposes:\n"
-        "• One generic GET/POST endpoint per tool\n"
-        "• Auto-generated granular endpoints for each `action`/`kind` enum combination\n"
-        "All endpoints accept GET (query) and POST (JSON); request bodies are optional.\n"
-        "Use `{}` for empty POST bodies. If you cannot send a body, use GET with `?args={...}` or `?key=value`."
-    ),
-)
+class ToolDescriptor(BaseModel):
+    name: str
+    description: Optional[str] = None
+    input_schema: Optional[Dict[str, Any]] = None  # JSON Schema (dict)
+    # Derived/enriched hints
+    inferred_actions: List[str] = Field(default_factory=list)
+    inferred_kinds: List[str] = Field(default_factory=list)
+    convenience_params: List[str] = Field(default_factory=list)
+    output_guidance: Dict[str, Any] = Field(default_factory=dict)
+    usage: Dict[str, Any] = Field(default_factory=dict)
+    natural_examples: List[Dict[str, Any]] = Field(default_factory=list)
 
-if ALLOW_ORIGINS:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"] if ALLOW_ORIGINS == "*" else [o.strip() for o in ALLOW_ORIGINS.split(",")],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
 
-def require_api_key(x_api_key: Optional[str] = Header(default=None)):
-    if not API_KEY:
-        return
-    if x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="invalid api key")
-
-PUBLIC_OR_AUTH = [] if DISCOVERY_PUBLIC else [Depends(require_api_key)]
-
-# =========================
-# HTTP client
-# =========================
-_client: Optional[httpx.AsyncClient] = None
-async def get_client() -> httpx.AsyncClient:
-    global _client
-    if _client is None:
-        _client = httpx.AsyncClient(timeout=REQUEST_TIMEOUT)
-    return _client
-
-# =========================
-# MCP state / RPC
-# =========================
 class ServerState:
-    def __init__(self, name: str, rpc_url: str):
-        self.name = name
-        self.rpc_url = rpc_url
-        self.session_id: Optional[str] = None
-        self.tools: Dict[str, Dict[str, Any]] = {}
-        self.prompts: List[Dict[str, Any]] = []
-        self.resources: List[Dict[str, Any]] = []
-        self.ready: bool = False
-        self.last_error: Optional[str] = None
-        # cached samples {toolName: {"args":{...}, "output":"...", "ts":...}}
-        self.samples: Dict[str, Dict[str, Any]] = {}
+    """Holds a live MCP client session and discovered tools."""
+    def __init__(self, cfg: ServerConfig):
+        self.cfg = cfg
+        self.connected = False
+        self.client = None  # mcp stdio client (if available)
+        self.tools: Dict[str, ToolDescriptor] = {}
 
-    async def rpc(self, method: str, params: Optional[Dict[str, Any]] = None, timeout: Optional[int] = None) -> Dict[str, Any]:
-        client = await get_client()
-        headers = {}
-        if self.session_id:
-            headers["mcp-session-id"] = self.session_id
-        payload = {"jsonrpc": "2.0", "id": str(int(time.time() * 1000)), "method": method}
-        if params is not None:
-            payload["params"] = params
-        try:
-            resp = await client.post(self.rpc_url, json=payload, headers=headers, timeout=timeout or REQUEST_TIMEOUT)
-            resp.raise_for_status()
-        except Exception as e:
-            self.ready = False
-            self.last_error = f"{type(e).__name__}: {e}"
-            raise HTTPException(
-                status_code=503,
-                detail={
-                    "message": f"Failed to connect to MCP server at {self.rpc_url}",
-                    "error": str(e),
-                    "resolution": [
-                        "Verify the MCP service DNS/port, Endpoint, and NetworkPolicy.",
-                        f"Check that {self.rpc_url} is correct and reachable from this pod.",
-                    ],
-                },
-            )
-        sid = resp.headers.get("mcp-session-id")
-        if sid:
-            self.session_id = sid
-        data = resp.json()
-        if "error" in data:
-            self.ready = False
-            self.last_error = str(data["error"])
-            raise HTTPException(
-                status_code=502,
-                detail={
-                    "message": "MCP server returned an error",
-                    "mcp_error": data["error"],
-                    "resolution": [
-                        "Confirm tool name and argument keys match the tool schema.",
-                        "Call `/{SERVER}/tools/list` and `/{SERVER}/tool/{TOOL}/schema` to verify fields.",
-                        "If RBAC/namespace related, try the admin server or pass `namespace`.",
-                    ],
-                },
-            )
-        return data["result"]
 
-    async def ensure_initialized(self):
-        if self.session_id:
-            return
-        await self.rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {}})
+class DiscoveryState:
+    """In-memory registry of servers -> tools."""
+    def __init__(self):
+        self.servers: Dict[str, ServerState] = {}
 
-    async def refresh_all(self):
-        await self.ensure_initialized()
-        # tools
-        tools_result = await self.rpc("tools/list")
-        tool_list = tools_result.get("tools", tools_result if isinstance(tools_result, list) else [])
-        self.tools = {t["name"]: t for t in tool_list if isinstance(t, dict) and "name" in t}
+    def list_servers(self) -> List[Dict[str, Any]]:
+        out = []
+        for alias, st in self.servers.items():
+            out.append({
+                "alias": alias,
+                "mode": st.cfg.mode,
+                "connected": st.connected,
+                "tools": list(st.tools.keys())
+            })
+        return out
 
-        # prompts (best-effort)
-        try:
-            prompts_result = await self.rpc("prompts/list")
-            self.prompts = prompts_result.get("prompts", prompts_result if isinstance(prompts_result, list) else [])
-        except Exception:
-            self.prompts = []
 
-        # resources (best-effort)
-        try:
-            res_result = await self.rpc("resources/list")
-            self.resources = res_result.get("resources", res_result if isinstance(res_result, list) else [])
-        except Exception:
-            self.resources = []
+DISCOVERY = DiscoveryState()
 
-        # capture small samples (non-blocking best-effort)
-        if CAPTURE_SAMPLES:
-            await self.capture_samples_best_effort()
 
-        self.ready = True
-        self.last_error = None
+# =============================================================================
+# Utilities
+# =============================================================================
 
-    async def capture_samples_best_effort(self):
-        # For each tool, try zero-arg {} if possible
-        for tname, tool in list(self.tools.items())[:10]:  # cap total
-            if tname in self.samples:
-                continue
-            schema = tool.get("inputSchema") or {"type": "object"}
-            # Construct a tiny example args (our generator is safe)
-            example_args = example_from_schema(schema) or {}
-            # Don't try obviously heavy kubectl combos (we keep it empty unless it has enums)
-            try:
-                result = await self.rpc(
-                    "tools/call",
-                    {"name": tname, "arguments": example_args},
-                    timeout=CAPTURE_SAMPLE_TIMEOUT_SECS,
-                )
-                out = result
-            except Exception:
-                # Ignore failures; store nothing
-                continue
-            # Store truncated JSON string as sample
-            try:
-                txt = json.dumps(out, ensure_ascii=False)
-            except Exception:
-                txt = str(out)
-            self.samples[tname] = {
-                "args": example_args,
-                "output": (txt[:CAPTURE_SAMPLE_BYTES] + ("…" if len(txt) > CAPTURE_SAMPLE_BYTES else "")),
-                "ts": int(time.time()),
-            }
+COMMON_K8S_KINDS = [
+    "pods", "pod", "deployments", "deployment",
+    "services", "nodes", "configmaps", "secrets",
+    "namespaces", "ingresses", "statefulsets", "daemonsets", "jobs"
+]
 
-SERVERS: Dict[str, ServerState] = {name: ServerState(name, url) for name, url in SERVERS_CFG.items()}
+CONVENIENCE_PARAMS = [
+    "namespace", "name", "labels", "labelSelector", "fieldSelector",
+    "container", "sinceSeconds"
+]
 
-# =========================
-# Helpers
-# =========================
-def _safe(name: str) -> str:
-    return re.sub(r"[^a-zA-Z0-9_]", "_", name)
-
-def example_from_schema(schema: Any) -> Any:
-    if not isinstance(schema, dict):
-        return {}
-    if "example" in schema:
-        return schema["example"]
-    t = schema.get("type")
-    if isinstance(t, list) and t:
-        t = t[0]
-    if "enum" in schema and schema["enum"]:
-        return schema["enum"][0]
-    if t == "object" or ("properties" in schema):
-        props = schema.get("properties", {})
-        required = set(schema.get("required", []))
-        obj = {}
-        for k, v in props.items():
-            if "default" in v: obj[k] = v["default"]; continue
-            ex = example_from_schema(v)
-            if ex == {}:
-                vt = v.get("type")
-                if vt == "string":
-                    ex = (v.get("enum") or ["value"])[0]
-                elif vt in ("integer", "number"):
-                    ex = 1
-                elif vt == "boolean":
-                    ex = True
-                elif vt == "array":
-                    ex = []
-                elif vt == "object":
-                    ex = {}
-                else:
-                    ex = "value"
-            obj[k] = ex
-        if required:
-            obj = {k: v for k, v in obj.items() if k in required}
-        return obj
-    if t == "array":
-        return [example_from_schema(schema.get("items", {}))]
-    if t == "string":  return schema.get("default") or "value"
-    if t in ("integer", "number"): return schema.get("default") or 1
-    if t == "boolean": return schema.get("default") or True
-    return schema.get("default") or {}
-
-def describe_schema(schema: Any) -> Dict[str, Any]:
-    if not isinstance(schema, dict):
-        return {"type": "object", "fields": {}, "requiredFields": []}
-    props = schema.get("properties", {})
-    required = set(schema.get("required", []))
-    fields = {}
-    for k, v in props.items():
-        fields[k] = {
-            "required": k in required,
-            "type": v.get("type", "any"),
-            "enum": v.get("enum", None),
-            "default": v.get("default", None),
-            "description": v.get("description", None),
-            "examples": v.get("examples", None),
-        }
-    return {"type": schema.get("type", "object"), "fields": fields, "requiredFields": sorted(list(required))}
-
-def parse_args_query(args_q: Optional[str]) -> Dict[str, Any]:
-    if not args_q: return {}
+def getenv_json(name: str, default: Any) -> Any:
+    val = os.getenv(name)
+    if not val:
+        return default
     try:
-        val = json.loads(args_q)
-        return val if isinstance(val, dict) else {}
+        return json.loads(val)
     except Exception:
-        return {}
+        return default
 
-def coerce_query_params(schema: Dict[str, Any], qp: Dict[str, str]) -> Dict[str, Any]:
-    props = (schema or {}).get("properties", {}) if isinstance(schema, dict) else {}
-    out: Dict[str, Any] = {}
-    for k, v in qp.items():
-        if k in props:
-            typ = props[k].get("type")
-            if typ in (None, "string"): out[k] = v
-            elif typ in ("integer", "number"):
-                try: out[k] = int(v) if typ == "integer" else float(v)
-                except: out[k] = v
-            elif typ == "boolean":
-                out[k] = v.lower() in ("1","true","t","yes","y","on")
-            elif typ == "array":
-                out[k] = [s for s in v.split(",") if s != ""]
-            else:
-                out[k] = v
-    return out
 
-def normalize_body(
-    body: Optional[Union[Dict[str, Any], list, str, int, float, bool, None]],
-    schema: Optional[Dict[str, Any]],
-    args_q: Optional[str],
-    request: Optional[Request]
-) -> Dict[str, Any]:
-    base: Dict[str, Any] = {}
-    if isinstance(body, dict):
-        base = body.get("args", body) if isinstance(body.get("args"), dict) else body or {}
-    from_args = parse_args_query(args_q)
-    base.update(from_args)
-    if request is not None:
-        qp = {k: v for k, v in request.query_params.items() if k not in ("args","dryrun","format")}
-        base.update(coerce_query_params(schema or {"type":"object"}, qp))
-    return base or {}
+def parse_actions_from_description(desc: str) -> List[str]:
+    """Heuristically extract action verbs from bullet lines like '- get: ...'"""
+    if not desc:
+        return []
+    actions = set()
+    for line in desc.splitlines():
+        m = re.search(r"^\s*-\s*([a-zA-Z0-9_-]+)\s*[:\-]", line)
+        if m:
+            actions.add(m.group(1).strip())
+    # Keep a nice order for familiar kubectl-ish tools
+    preferred = ["get", "describe", "logs", "events", "top", "exec", "cp",
+                 "cluster-info", "api-resources", "api-versions", "explain",
+                 "diff", "auth", "config"]
+    ordered = [a for a in preferred if a in actions]
+    for a in actions:
+        if a not in ordered:
+            ordered.append(a)
+    return ordered
 
-def iter_action_kind(schema: Dict[str, Any]) -> Tuple[List[str], List[str]]:
-    if not isinstance(schema, Dict):
-        return ([], [])
-    props = schema.get("properties", {})
-    action_key = next((k for k in ["action","verb","operation","op"] if k in props), None)
-    actions = props.get(action_key, {}).get("enum", []) if action_key else []
-    kind_key = next((k for k in ["kind","resource","resources","type"] if k in props), None)
-    kinds = props.get(kind_key, {}).get("enum", []) if kind_key else []
-    return (actions, kinds)
 
-# ---- Argstring composer (for kubectl-like tools) ----
-def _looks_kubectl_like(tool_name: str, description: str, schema: Dict[str, Any]) -> bool:
-    text = (tool_name + " " + (description or "")).lower()
-    has_ops = any(k in (schema.get("properties") or {}) for k in ("operation","action"))
-    has_resource = any(k in (schema.get("properties") or {}) for k in ("resource","kind"))
-    has_args = (schema.get("properties") or {}).get("args",{}).get("type") == "string"
-    return has_ops and has_resource and has_args and ("kubectl" in text or "kubernetes" in text)
+def infer_kinds_from_description(desc: str) -> List[str]:
+    if not desc:
+        return []
+    # Grab common k8s nouns that appear in examples/lines
+    kinds = set()
+    for k in COMMON_K8S_KINDS:
+        if re.search(rf"\b{k}\b", desc):
+            kinds.add(k)
+    # Keep order consistent / predictable
+    ordered = [k for k in COMMON_K8S_KINDS if k in kinds]
+    return ordered
 
-def _append_flag(parts: List[str], flag: str, value: Optional[str]):
-    if value is None or value == "": return
-    if " " in value:
-        parts.append(f"{flag} '{value}'")
-    else:
-        parts.append(f"{flag} {value}")
 
-def enrich_argstring(call_args: Dict[str, Any], schema: Dict[str, Any], tool_name: str, description: str, fmt: Optional[str]):
-    """If the tool requires args:string and caller passed convenience params,
-       auto-compose args (e.g., name + -n namespace + selectors). Also add -o json/yaml if format= specified."""
-    props = (schema or {}).get("properties", {})
-    if props.get("args", {}).get("type") != "string":
-        return
-    looks_kube = _looks_kubectl_like(tool_name, description, schema)
-    if not looks_kube:
-        return
+def schema_enums(schema: Dict[str, Any], field: str) -> List[str]:
+    """Read enum from a JSON schema property if present."""
+    try:
+        props = schema.get("properties", {})
+        if field in props and "enum" in props[field]:
+            vals = [str(v) for v in props[field]["enum"]]
+            return vals
+    except Exception:
+        pass
+    return []
 
-    parts: List[str] = []
-    raw = str(call_args.get("args") or "").strip()
-    if raw:
-        parts.append(raw)
 
-    name = call_args.pop("name", None)
-    namespace = call_args.pop("namespace", None)
-    labels = call_args.pop("labels", None) or call_args.pop("labelSelector", None)
-    field_selector = call_args.pop("fieldSelector", None)
-    container = call_args.pop("container", None)
-    since_seconds = call_args.pop("sinceSeconds", None)
-
-    # positional first
-    if name: parts.insert(0, name)
-    _append_flag(parts, "-n", namespace)
-    if labels: _append_flag(parts, "-l", labels)
-    if field_selector: _append_flag(parts, "--field-selector", field_selector)
-    if container: _append_flag(parts, "-c", container)
-    if since_seconds is not None:
-        try:
-            ss = int(since_seconds)
-            _append_flag(parts, "--since", f"{ss}s")
-        except Exception:
-            pass
-
-    # -o <format> for certain operations (only when not already present)
-    argline = " ".join(parts)
-    if fmt in ("json","yaml") and "-o " not in argline and "--output" not in argline:
-        op = (call_args.get("operation") or call_args.get("action") or "").lower()
-        # Only inject for read-ish operations where kubectl supports -o
-        if op in ("get","api-resources","api-versions"):
-            parts.append(f"-o {fmt}")
-        elif op == "logs" and fmt == "json":
-            # logs do not support -o json; skip
-            pass
-
-    call_args["args"] = " ".join(parts).strip()
-
-def parse_bool(v: Optional[str]) -> Optional[bool]:
-    if v is None:
-        return None
-    s = v.lower().strip()
-    if s in ("1","true","t","yes","y","on"): return True
-    if s in ("0","false","f","no","n","off"): return False
-    return None
-
-# =========================
-# Discovery loop
-# =========================
-_discovery_lock = asyncio.Lock()
-_last_discovery: float = 0.0
-
-async def discover_once():
-    global _last_discovery
-    async with _discovery_lock:
-        for name, st in SERVERS.items():
-            try:
-                await st.refresh_all()
-            except Exception:
-                pass
-        _last_discovery = time.time()
-
-async def background_poller():
-    while True:
-        try:
-            await discover_once()
-        except Exception:
-            pass
-        await asyncio.sleep(REFRESH_INTERVAL)
-
-@app.on_event("startup")
-async def startup():
-    asyncio.create_task(background_poller())
-
-# =========================
-# Health / discovery / tool list
-# =========================
-@app.get("/livez", tags=["health"])
-async def livez(): return {"ok": True}
-
-@app.get("/readyz", tags=["health"])
-async def readyz():
-    any_ready = any(st.ready for st in SERVERS.values())
-    return JSONResponse(
-        status_code=200 if any_ready else 503,
-        content={"ok": any_ready,
-                 "servers": {k: {"ready": v.ready, "tools": list(v.tools.keys()), "last_error": v.last_error} for k,v in SERVERS.items()}},
-    )
-
-@app.get("/healthz", tags=["health"])
-async def healthz():
-    return {"ok": any(st.ready for st in SERVERS.values()),
-            "servers": {k: {"ready": v.ready, "rpc_url": v.rpc_url, "tools": list(v.tools.keys()), "last_error": v.last_error}
-                        for k,v in SERVERS.items()}}
-
-@app.get("/servers", tags=["info"], summary="Servers Info")
-async def servers_info(): return {"servers": {k: v.rpc_url for k, v in SERVERS.items()}}
-
-@app.get("/{server}/tools/list", tags=["discovery"], dependencies=PUBLIC_OR_AUTH, summary="Tools List")
-async def tools_list(server: str):
-    st = SERVERS.get(server)
-    if not st:
-        raise HTTPException(status_code=404, detail={"message": f"Unknown server '{server}'"})
+def build_k8s_output_guidance(tool_name: str) -> Dict[str, Any]:
+    """
+    Provide structured output guidance for typical kubectl-ish tools.
+    This is additive (only used if the tool appears to be k8s-related).
+    """
     return {
-        "tools": list(st.tools.values()),
-        "prompts": st.prompts,
-        "resources": st.resources,
-        "samples": st.samples,
+        "preferredFormats": ["json", "yaml", "text"],
+        "notes": [
+            "For 'get' style operations, prefer `format=json` to inject `-o json` so output is machine-readable.",
+            "For 'describe', kubectl emits human text (no -o json). Treat it as unstructured text.",
+            "For 'logs', output is line-oriented text; do not expect JSON.",
+            "For 'api-resources'/'api-versions', `format=json` works when supported; otherwise text table."
+        ],
+        "parsingHints": {
+            "describe/pods (text)": {
+                "extract": [
+                    {"field": "name", "regex": r"^Name:\s+([^\s]+)"},
+                    {"field": "namespace", "regex": r"^Namespace:\s+([^\s]+)"},
+                    {"field": "node", "regex": r"^Node:\s+([^\s]+)"},
+                    {"field": "podIP", "regex": r"^IP:\s+([^\s]+)"},
+                    {"field": "phase", "regex": r"^Status:\s+([A-Za-z]+)"},
+                ],
+                "lineMode": True
+            },
+            "logs (text)": {
+                "extract": [
+                    {"field": "lines", "note": "Split by newline; may contain timestamps."}
+                ]
+            }
+        }
     }
 
-@app.post("/discover", tags=["discovery"], dependencies=PUBLIC_OR_AUTH, summary="Discover Endpoint")
-async def discover_endpoint(wait: Optional[int] = Query(default=0, description="Seconds to wait (max 10) for discovery")):
-    wait = max(0, min(int(wait or 0), 10))
-    task = asyncio.create_task(discover_once())
-    if wait:
+
+def k8s_natural_examples(tool_name: str) -> List[Dict[str, Any]]:
+    """
+    Natural language intents -> example calls.
+    These are hints for the model to map ordinary requests to correct routes.
+    """
+    examples = []
+    # JSON listing for pods in a namespace
+    examples.append({
+        "intent": "List all pods in the vault namespace (machine-readable JSON)",
+        "calls": [
+            {"GET": f"/mcp/tool/{tool_name}/get/pods?namespace=vault&format=json"},
+            {"POST": f"/mcp/tool/{tool_name}/get/pods", "body": {"namespace": "vault"}, "query": {"format": "json"}},
+        ],
+        "notes": ["Use format=json to inject '-o json' when supported (e.g., kubectl get)."]
+    })
+    # human describe pod
+    examples.append({
+        "intent": "Describe a pod (human text)",
+        "calls": [
+            {"GET": f"/mcp/tool/{tool_name}/describe/pods?namespace=vault&name=vault-0"},
+        ],
+        "notes": ["'describe' outputs unstructured text; see x-outputGuidance.parsingHints."]
+    })
+    # list namespaces
+    examples.append({
+        "intent": "List namespaces",
+        "calls": [
+            {"GET": f"/mcp/tool/{tool_name}/get/namespaces?format=json"},
+        ],
+        "notes": ["Prefer JSON for machine parsing."]
+    })
+    return examples
+
+
+def is_k8s_tool(name: str, desc: str) -> bool:
+    return bool(re.search(r"\bkubectl\b", desc or "") or name.startswith("kubectl_"))
+
+
+def compose_argstring(
+    args_str: Optional[str],
+    namespace: Optional[str] = None,
+    name: Optional[str] = None,
+    labels: Optional[str] = None,
+    labelSelector: Optional[str] = None,
+    fieldSelector: Optional[str] = None,
+    container: Optional[str] = None,
+    sinceSeconds: Optional[int] = None,
+) -> str:
+    """
+    Converts convenience params into a CLI-like argstring. Keeps user's 'args' tail.
+    """
+    parts: List[str] = []
+    if name:
+        parts.append(str(name))
+    if namespace:
+        parts.extend(["-n", namespace])
+
+    sel = labels or labelSelector
+    if sel:
+        parts.extend(["-l", sel])
+
+    if fieldSelector:
+        parts.extend(["--field-selector", fieldSelector])
+
+    if container:
+        parts.extend(["-c", container])
+
+    if sinceSeconds and sinceSeconds > 0:
+        parts.extend(["--since", f"{sinceSeconds}s"])
+
+    if args_str:
+        tail = str(args_str).strip()
+        if tail:
+            parts.append(tail)
+
+    return " ".join(parts).strip()
+
+
+# =============================================================================
+# MCP integration
+# =============================================================================
+
+async def mcp_connect_stdio(cfg: ServerConfig):
+    """
+    Connect to an MCP server via stdio and return a session.
+    Requires: cfg.cmd is a list program invocation.
+    """
+    if not MCP_AVAILABLE:
+        raise RuntimeError("MCP python SDK not installed. pip install mcp[stdio]")
+
+    if not cfg.cmd:
+        raise RuntimeError(f"Server {cfg.alias}: stdio mode requires 'cmd'.")
+
+    client = await stdio_client(cfg.cmd, env=cfg.env or {})
+    await client.initialize()
+    return client
+
+
+async def mcp_list_tools(session) -> List[Dict[str, Any]]:
+    """
+    Ask the MCP server for tools. Returns a list of tool dicts:
+    [{"name": "...", "description": "...", "inputSchema": {...}}, ...]
+    """
+    result = await session.list_tools()
+    tools = []
+    for t in result.tools:
+        tools.append({
+            "name": t.name,
+            "description": t.description or "",
+            "input_schema": t.inputSchema.model_dump() if getattr(t, "inputSchema", None) else {}
+        })
+    return tools
+
+
+async def mcp_call_tool(session, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Invoke an MCP tool. Returns a normalized structure:
+    { "type": "mcp_result", "content": [{"type":"text","text":"..."}, {"type":"json","json":{...}}, ...] }
+    """
+    call = await session.call_tool(tool_name, args)
+    normalized = {"type": "mcp_result", "content": []}
+    for item in call.content:
+        if isinstance(item, TextContent):
+            normalized["content"].append({"type": "text", "text": item.text})
+        else:
+            # Try best-effort attribute names
+            payload = item.model_dump() if hasattr(item, "model_dump") else {}
+            ctype = payload.get("type") or "unknown"
+            normalized["content"].append(payload if ctype != "unknown" else {"type": "unknown", "data": payload})
+    return normalized
+
+
+# =============================================================================
+# FastAPI App + Discovery
+# =============================================================================
+
+app = FastAPI(
+    title="MCP OpenAPI Bridge (Generic, Self-Discovering)",
+    version="3.1.0",
+    description=textwrap.dedent(
+        """\
+        A generic, self-discovering OpenAPI façade for MCP servers.
+        It discovers tools, prompts, and resources from MCP and exposes:
+        • One generic GET/POST endpoint per tool
+        • Auto-generated granular endpoints for each `action`/`kind` combo
+        All endpoints accept GET (query) and POST (JSON); request bodies are optional.
+        Use `{}` for empty POST bodies. If you cannot send a body, use GET with `?args={...}` or `?key=value`.
+        """
+    ),
+    servers=[{"url": "http://localhost:8080"}],
+    openapi_url="/openapi.json"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
+)
+
+
+@app.on_event("startup")
+async def on_startup():
+    # Load server configs
+    servers_cfg = getenv_json("MCP_SERVERS", None)
+    if not servers_cfg:
+        # Reasonable default: one stdio server named "mcp" is expected to be provided
+        # by the environment. If not set, we keep discovery empty (service still runs).
+        servers_cfg = []
+
+    for cfg in servers_cfg:
+        cfg_obj = ServerConfig(**cfg)
+        DISCOVERY.servers[cfg_obj.alias] = ServerState(cfg_obj)
+
+    # Connect + discover tools (non-fatal if it fails; the /discover endpoint can retry)
+    await do_discover(wait_seconds=int(os.getenv("MCP_DISCOVERY_WAIT", "0")))
+
+
+async def do_discover(wait_seconds: int = 0) -> Dict[str, Any]:
+    """
+    Connect (if needed) and refresh the tool catalog for all servers.
+    wait_seconds>0: give slow servers time to spawn/initialize.
+    """
+    for alias, st in DISCOVERY.servers.items():
         try:
-            await asyncio.wait_for(task, timeout=wait)
-        except asyncio.TimeoutError:
-            return {"ok": False, "message": "Discovery still running", "waited": wait}
-    return {"ok": True, "lastDiscovery": _last_discovery}
+            if st.cfg.mode == "stdio":
+                if not st.connected:
+                    st.client = await mcp_connect_stdio(st.cfg)
+                    st.connected = True
+                tools_raw = await mcp_list_tools(st.client)
+            else:
+                # Placeholder for custom connectors (HTTP/SSE, etc.)
+                tools_raw = []
+
+            # Build ToolDescriptor w/ enrichment
+            st.tools.clear()
+            for tr in tools_raw:
+                name = tr["name"]
+                desc = tr.get("description") or ""
+                schema = tr.get("input_schema") or {}
+
+                td = ToolDescriptor(
+                    name=name,
+                    description=desc,
+                    input_schema=schema,
+                    convenience_params=[p for p in CONVENIENCE_PARAMS if p in (schema.get("properties") or {})]
+                )
+
+                # Infer actions and kinds (from schema or description)
+                td.inferred_actions = schema_enums(schema, "operation") or parse_actions_from_description(desc)
+                # Only infer kinds if it seems k8s; otherwise rely on schema enum
+                kinds_from_schema = schema_enums(schema, "resource")
+                if kinds_from_schema:
+                    td.inferred_kinds = kinds_from_schema
+                elif is_k8s_tool(name, desc):
+                    td.inferred_kinds = infer_kinds_from_description(desc)
+
+                # Output guidance and examples for known kubectl-ish tools
+                if is_k8s_tool(name, desc):
+                    td.output_guidance = build_k8s_output_guidance(name)
+                    td.natural_examples = k8s_natural_examples(name)
+
+                # Minimal usage block
+                td.usage = {
+                    "schema": {
+                        "type": "object",
+                        "fields": {
+                            "args": {
+                                "required": True,
+                                "type": "string",
+                                "description": "Operation-specific arguments / flags"
+                            },
+                            "operation": {"required": True, "type": "string"},
+                            "resource": {"required": True, "type": "string"},
+                        },
+                        "requiredFields": ["args", "operation", "resource"]
+                    },
+                    "argstringRequired": True,
+                }
+
+                st.tools[name] = td
+
+        except Exception as e:
+            # non-fatal: keep server listed but disconnected
+            st.connected = False
+            st.client = None
+            st.tools.clear()
+            print(f"[discover] Server '{alias}' discovery failed: {e}", file=sys.stderr)
+
+    # (Optional) wait for stabilization
+    if wait_seconds > 0:
+        await asyncio.sleep(min(wait_seconds, 10))
+
+    # Return discovery snapshot
+    out = {"servers": []}
+    for alias, st in DISCOVERY.servers.items():
+        out["servers"].append({
+            "alias": alias,
+            "connected": st.connected,
+            "tools": [t for t in st.tools.keys()]
+        })
+    return out
+
+
+# =============================================================================
+# Health / Info
+# =============================================================================
+
+@app.get("/livez", tags=["health"], summary="Livez")
+async def livez():
+    return {"status": "ok"}
+
+
+@app.get("/readyz", tags=["health"], summary="Readyz")
+async def readyz():
+    return {"status": "ok", "servers": DISCOVERY.list_servers()}
+
+
+@app.get("/healthz", tags=["health"], summary="Healthz")
+async def healthz():
+    return {"status": "ok"}
+
+
+@app.get("/servers", tags=["info"], summary="Servers Info")
+async def servers_info():
+    return {"servers": DISCOVERY.list_servers()}
+
+
+# =============================================================================
+# Discovery control
+# =============================================================================
+
+class DiscoverQuery(BaseModel):
+    wait: Optional[int] = Field(0, description="Seconds to wait (max 10) for discovery")
+
+@app.post("/discover", tags=["discovery"], summary="Discover Endpoint")
+async def discover_endpoint(wait: Optional[int] = Query(0, description="Seconds to wait (max 10) for discovery")):
+    wait = max(0, min(int(wait or 0), 10))
+    res = await do_discover(wait_seconds=wait)
+    return res
+
 
 @app.get("/discovery/status", tags=["discovery"], summary="Discovery Status")
 async def discovery_status():
-    return {"lastDiscovery": _last_discovery,
-            "servers": {k: {"ready": v.ready, "tools": list(v.tools.keys()),
-                            "prompts": [p.get('name') for p in v.prompts],
-                            "resources": [r.get('uri','') for r in v.resources],
-                            "samples": {tn: {"args": sm["args"], "preview": sm["output"][:200]} for tn, sm in v.samples.items()},
-                            "last_error": v.last_error}
-                        for k, v in SERVERS.items()}}
+    return {"servers": DISCOVERY.list_servers()}
 
-# =========================
-# Generic dispatcher for ALL tools & granular forms
-# =========================
-@app.api_route("/{server}/tool/{tool_path:path}", methods=["GET","POST"], tags=["tools"], dependencies=PUBLIC_OR_AUTH, summary="Tool Dispatch")
-async def tool_dispatch(
-    request: Request,
-    server: str = Path(..., description="Server alias (e.g., 'mcp', 'ro', 'admin')"),
-    tool_path: str = Path(..., description="Tool name or tool plus suffix, e.g., 'kubectl_resources', 'kubectl_resources/get/pods', 'kubectl_resources/invoke'"),
-    args: Optional[str] = Query(default=None, description="JSON-encoded args fallback"),
-    dryrun: Optional[bool] = Query(default=False, description="If true, returns the would-be MCP call without executing it"),
-    format_hint: Optional[str] = Query(alias="format", default=None, description="Output preference: json|yaml|text (adds '-o json|yaml' when supported)"),
-    body: Optional[Dict[str, Any]] = Body(default=None, embed=False),
-):
-    st = SERVERS.get(server)
-    if not st or tool_path.strip() == "":
-        raise HTTPException(status_code=404, detail={"message": "Unknown server or tool."})
 
-    # Split tool path: tool[/action][/kind or special]
-    parts = [p for p in tool_path.split("/") if p != ""]
-    tool_name = parts[0]
-    suffix = parts[1:]  # e.g. ['get','pods'] or ['invoke'] or ['try']
+# =============================================================================
+# OpenAPI enrichment (x-* blocks)
+# =============================================================================
 
-    tool = st.tools.get(tool_name)
-    if not tool:
-        # try match by safe-name
-        rev = { _safe(k): k for k in st.tools.keys() }
-        real = rev.get(tool_name)
-        if real: tool = st.tools.get(real); tool_name = real
-
-    if not tool:
-        raise HTTPException(status_code=404, detail={"message": f"Tool '{tool_name}' not found on server '{server}'."})
-
-    schema = tool.get("inputSchema") or {"type":"object"}
-    description = tool.get("description", "")
-    call_args = normalize_body(body, schema, args, request)
-
-    # helper suffixes
-    if suffix == ["schema"]:
-        return schema
-    if suffix == ["example"]:
-        return {"name": tool_name, "arguments": example_from_schema(schema)}
-    if suffix == ["help"]:
-        return {
-            "tool": tool_name,
-            "server": server,
-            "description": description or "No description provided by MCP server.",
-            "schema": describe_schema(schema),
-            "howToUse": [
-                f"POST {PUBLIC_BASE_URL}/{server}/tool/{_safe(tool_name)} with JSON; if no args, send {{}}.",
-                f"GET  {PUBLIC_BASE_URL}/{server}/tool/{_safe(tool_name)}?args={{...}} (if body unsupported).",
-                f"Try zero-arg: GET {PUBLIC_BASE_URL}/{server}/tool/{_safe(tool_name)}/try",
-                "Prefer granular forms like '/{server}/tool/{tool}/{action}[/{kind}]' when available.",
-                "Use 'format=json|yaml' to request machine-readable output when supported (-o flag injection).",
-                "Use 'dryrun=true' to preview the composed call.",
-            ],
-            "outputGuidance": output_guidance_for(tool_name, description, schema),
-        }
-    if suffix == ["try"]:
-        await st.ensure_initialized()
-        return await st.rpc("tools/call", {"name": tool_name, "arguments": {}})
-    if suffix == ["invoke"]:
-        await st.ensure_initialized()
-        enrich_argstring(call_args, schema, tool_name, description, format_hint)
-        if dryrun:
-            return {"dryrun": {"name": tool_name, "arguments": call_args}}
-        return await st.rpc("tools/call", {"name": tool_name, "arguments": call_args})
-
-    # granular: /{action}[/{kind}]
-    actions, kinds = iter_action_kind(schema)
-    fixed: Dict[str, Any] = {}
-    if len(suffix) >= 1 and suffix[0] not in ("schema","example","help","try","invoke"):
-        fixed["action"] = suffix[0]
-        fixed["operation"] = suffix[0]
-    if len(suffix) >= 2:
-        fixed["kind"] = suffix[1]
-        fixed["resource"] = suffix[1]
-    call_args.update(fixed)
-
-    # Compose argstring (kubectl-like tools) and add -o when requested
-    enrich_argstring(call_args, schema, tool_name, description, format_hint)
-
-    await st.ensure_initialized()
-    if dryrun:
-        return {"dryrun": {"name": tool_name, "arguments": call_args}}
-    return await st.rpc("tools/call", {"name": tool_name, "arguments": call_args})
-
-# =========================
-# Output guidance (for LLMs)
-# =========================
-def output_guidance_for(tool_name: str, description: str, schema: Dict[str, Any]) -> Dict[str, Any]:
-    looks_kube = _looks_kubectl_like(tool_name, description, schema)
-    if not looks_kube:
-        return {"preferredFormats": ["json","yaml","text"], "notes": ["Format depends on tool implementation."]}
-    notes = [
-        "For 'get' style operations, prefer `format=json` to inject `-o json` so output is machine-readable.",
-        "For 'describe', kubectl emits human text (no -o json). Treat it as unstructured text.",
-        "For 'logs', output is line-oriented text; do not expect JSON.",
-        "For 'api-resources'/'api-versions', `format=json` works when supported; otherwise text table.",
-    ]
-    # Simple parse hints for common describe/logs
-    parsing = {
-        "describe/pods (text)": {
-            "extract": [
-                {"field": "name", "regex": r"^Name:\s+([^\s]+)"},
-                {"field": "namespace", "regex": r"^Namespace:\s+([^\s]+)"},
-                {"field": "node", "regex": r"^Node:\s+([^\s]+)"},
-                {"field": "podIP", "regex": r"^IP:\s+([^\s]+)"},
-                {"field": "phase", "regex": r"^Status:\s+([A-Za-z]+)"},
-            ],
-            "lineMode": True
-        },
-        "logs (text)": {
-            "extract": [{"field": "lines", "note": "Split by newline; may contain timestamps."}]
-        }
-    }
-    return {
-        "preferredFormats": ["json","yaml","text"],
-        "notes": notes,
-        "parsingHints": parsing
-    }
-
-# =========================
-# Error handlers with guidance
-# =========================
-@app.exception_handler(HTTPException)
-async def http_exc_handler(request: Request, exc: HTTPException):
-    payload = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}
-    if "resolution" not in payload:
-        tips = [
-            "Preferred: POST a JSON object body (use `{}` if no arguments).",
-            "Fallbacks: GET '/try' or '/invoke' for zero-arg, or pass `?args={...}` / `?key=value`.",
-            "Discover tools via `/{SERVER}/tools/list` and inspect fields with `/tool/{TOOL}/schema`.",
-            "Use `format=json|yaml` to inject an output flag when supported (e.g., kubectl get).",
-            "If the tool requires `args` (string), pass it OR provide convenience params like `namespace`, `name` etc.; the bridge will construct the argstring.",
-            "Use `dryrun=true` to preview the exact MCP call.",
+def openapi_extra_blocks() -> Dict[str, Any]:
+    # High-level model-call instructions
+    x_model_instructions = {
+        "callDiscipline": [
+            "Use **GET with query** or **POST with JSON**. If no args, POST `{}`.",
+            "Prefer granular endpoints `/{SERVER}/tool/{TOOL}/{action}[/{kind}]` when actions/kinds are available.",
+            "If the tool requires `args` (string), you can either provide it directly OR pass convenience params; the bridge will compose the argstring.",
+            "Use `format=json|yaml|text` to influence output; json/yaml injects '-o' when supported.",
+            "Use `dryrun=true` to preview the composed MCP call."
+        ],
+        "bodyShapes": [
+            "Direct body: `{ ... }`",
+            "Wrapped body: `{ \"args\": { ... } }`"
+        ],
+        "discovery": [
+            "List tools: `GET /{SERVER}/tools/list`.",
+            "Per-tool schema: `GET /{SERVER}/tool/{TOOL}/schema`.",
+            "Per-tool example: `GET /{SERVER}/tool/{TOOL}/example`.",
+            "Per-tool help: `GET /{SERVER}/tool/{TOOL}/help`.",
+            "Zero-argument test: `GET /{SERVER}/tool/{TOOL}/try`."
+        ],
+        "typicalFlow": [
+            "1) Read `/openapi.json` and `/discovery/status`.",
+            "2) Choose a tool whose schema/description matches the user request.",
+            "3) Use a granular path when available (e.g., `/get/pods`).",
+            "4) Prefer `format=json` for machine-readable results when available."
+        ],
+        "errorFix": [
+            "If you see 'expected a request body', use GET or POST `{}`.",
+            "If a tool needs `args` (string): either send it, or pass convenience params like `namespace`, `name`, etc.",
+            "If you see a schema error, inspect `/schema`, `/example`, or try a granular endpoint.",
+            "If parsing text, leverage `x-outputGuidance.parsingHints`."
         ]
-        if exc.status_code == 401:
-            tips.insert(0, "Include the `X-Api-Key` header if the bridge was configured with API_KEY.")
-        if exc.status_code == 422:
-            tips.insert(0, "Ensure the request is JSON or use GET with `?args={...}` as a fallback.")
-        payload["resolution"] = tips
-    return JSONResponse(status_code=exc.status_code, content=payload)
+    }
 
-@app.exception_handler(Exception)
-async def unhandled_exc_handler(request: Request, exc: Exception):
-    return JSONResponse(
-        status_code=500,
-        content={
-            "message": f"Unhandled error: {type(exc).__name__}",
-            "error": str(exc),
-            "resolution": [
-                "Preferred: POST a JSON object body; if you have no arguments, send `{}`.",
-                "Fallbacks: GET '/try' or '/invoke', or pass `?args={...}` / individual `?key=value`.",
-                "Retry with a simpler body; check bridge pod logs for stack traces.",
-                "Verify MCP server availability and NetworkPolicy.",
-            ],
-        },
+    # Snapshot of the catalog (helpful hint for the model)
+    x_mcp_tool_catalog: List[Dict[str, Any]] = []
+    for alias, st in DISCOVERY.servers.items():
+        for tname, td in st.tools.items():
+            x_mcp_tool_catalog.append({
+                "server": alias,
+                "tool": tname,
+                "description": td.description,
+                "schema": td.input_schema or {"type": "object"},
+                "requiredFields": td.usage.get("schema", {}).get("requiredFields", []),
+            })
+
+    return {
+        "x-model-instructions": x_model_instructions,
+        "x-mcp-tool-catalog": x_mcp_tool_catalog,
+        "x-mcp-prompts": {},
+        "x-mcp-resources": {}
+    }
+
+
+@app.get("/{server}/tools/list", tags=["discovery"], summary="Tools List")
+async def tools_list(server: str = Path(..., description="Server alias")):
+    st = DISCOVERY.servers.get(server)
+    if not st:
+        raise HTTPException(404, f"Unknown server '{server}'")
+    tools = []
+    for tname, td in st.tools.items():
+        tools.append({
+            "name": tname,
+            "description": td.description,
+            "input_schema": td.input_schema
+        })
+    return {"server": server, "tools": tools}
+
+
+# =============================================================================
+# Generic Tool Dispatch (both GET and POST)
+# =============================================================================
+
+class GenericDispatchRequest(BaseModel):
+    # Accept anything; we will forward to MCP
+    __root__: Optional[Dict[str, Any]] = None
+
+
+async def resolve_arg_payload(
+    payload: Optional[Dict[str, Any]],
+    query_args_str: Optional[str],
+    convenience: Dict[str, Any],
+    format_hint: Optional[str]
+) -> Dict[str, Any]:
+    """
+    Produces the final MCP tool args object:
+    - Preserves user-provided fields
+    - Adds 'args' (argstring) if we can compose it
+    - Applies '-o <format>' injection for 'get' style ops where applicable
+    """
+    args_obj = (payload or {}).copy()
+    # Pull convenience params out for composing argstring
+    argstring = compose_argstring(
+        args_str=query_args_str or args_obj.get("args", ""),
+        namespace=convenience.get("namespace", args_obj.get("namespace")),
+        name=convenience.get("name", args_obj.get("name")),
+        labels=convenience.get("labels", args_obj.get("labels")),
+        labelSelector=convenience.get("labelSelector", args_obj.get("labelSelector")),
+        fieldSelector=convenience.get("fieldSelector", args_obj.get("fieldSelector")),
+        container=convenience.get("container", args_obj.get("container")),
+        sinceSeconds=convenience.get("sinceSeconds", args_obj.get("sinceSeconds")),
     )
 
-# =========================
-# OpenAPI builder – synthesize spec from MCP data
-# =========================
-_COMMON_CONVENIENCE = [
-    {"name": "namespace", "in": "query", "required": False, "schema": {"type":"string"},
-     "description": "Convenience param; auto-translated into argstring (e.g., '-n <namespace>')."},
-    {"name": "name", "in": "query", "required": False, "schema": {"type":"string"},
-     "description": "Convenience param; resource name; placed positionally before flags in argstring."},
-    {"name": "labels", "in": "query", "required": False, "schema": {"type":"string"},
-     "description": "Convenience param; label selector; becomes '-l <labels>'."},
-    {"name": "labelSelector", "in": "query", "required": False, "schema": {"type":"string"},
-     "description": "Convenience alias for 'labels'."},
-    {"name": "fieldSelector", "in": "query", "required": False, "schema": {"type":"string"},
-     "description": "Convenience param; becomes '--field-selector <expr>'."},
-    {"name": "container", "in": "query", "required": False, "schema": {"type":"string"},
-     "description": "Convenience param for logs; becomes '-c <container>'."},
-    {"name": "sinceSeconds", "in": "query", "required": False, "schema": {"type":"integer"},
-     "description": "Convenience param for logs; becomes '--since <N>s'."},
-    {"name": "format", "in": "query", "required": False, "schema": {"type":"string","enum":["json","yaml","text"]},
-     "description": "Output hint (adds '-o json|yaml' when supported)."},
-    {"name": "dryrun", "in": "query", "required": False, "schema": {"type":"boolean"},
-     "description": "If true, returns the would-be MCP call without executing it."},
-    {"name": "args", "in": "query", "required": False, "schema": {"type":"string"},
-     "description": "Raw argstring fallback (JSON body still preferred)."},
-]
+    # Inject -o json/yaml if user asks for format and not describe/logs/etc.
+    operation = args_obj.get("operation") or convenience.get("operation")
+    if format_hint in ("json", "yaml"):
+        # Only inject for likely 'get/print' operations
+        if operation in (None, "get", "api-resources", "api-versions"):
+            if not re.search(r"\s\-o\s+(json|yaml)\b", argstring):
+                argstring = (argstring + f" -o {format_hint}").strip()
 
-def _op_params_with_schema(schema: Dict[str, Any], argstring_required: bool, include_convenience=True) -> List[Dict[str, Any]]:
-    params: List[Dict[str, Any]] = []
-    # Query fallbacks for actual schema fields
-    props = (schema or {}).get("properties", {}) if isinstance(schema, dict) else {}
-    for k, v in props.items():
-        params.append({"name": k, "in": "query", "required": False,
-                       "description": v.get("description", f"Query param for '{k}'"),
-                       "schema": {"type": v.get("type","string")}})
-    if include_convenience:
-        params.extend(_COMMON_CONVENIENCE)
-    return params
+    if argstring:
+        args_obj["args"] = argstring
 
-def _make_request_body(schema: Dict[str, Any], required: bool=False) -> Dict[str, Any]:
-    direct = schema or {"type": "object"}
-    wrapped = {"type": "object", "properties": {"args": direct}, "required": ["args"]}
+    return args_obj
+
+
+async def do_tool_call(
+    server: str,
+    tool_path: str,
+    body: Optional[Dict[str, Any]],
+    query_args_fallback: Optional[str],
+    dryrun: bool,
+    format_hint: Optional[str],
+) -> Any:
+    """
+    tool_path can be either:
+      - 'TOOL'  (generic invoke with whatever 'operation'/'resource' provided)
+      - 'TOOL/ACTION' or 'TOOL/ACTION/KIND' (granular)
+      - 'TOOL/invoke', 'TOOL/schema', 'TOOL/example', 'TOOL/help', 'TOOL/try'
+    """
+    st = DISCOVERY.servers.get(server)
+    if not st:
+        raise HTTPException(404, f"Unknown server '{server}'")
+    if not st.connected or not st.client:
+        raise HTTPException(503, f"Server '{server}' is not connected")
+
+    components = tool_path.split("/")
+    tool = components[0]
+    suffix = "/".join(components[1:]) if len(components) > 1 else ""
+
+    td = st.tools.get(tool)
+    if not td:
+        raise HTTPException(404, f"Server '{server}' has no tool '{tool}'")
+
+    # handle meta suffixes
+    if suffix in ("schema", "example", "help"):
+        return td.input_schema or {}
+    if suffix == "try":
+        # Zero-arg test
+        if dryrun:
+            return {"dryrun": True, "tool": tool, "args": {}}
+        return await mcp_call_tool(st.client, tool, {})
+
+    # granular form ACTION[/KIND]
+    args = {}
+    convenience = {}
+    if suffix and suffix not in ("invoke",):
+        parts = suffix.split("/")
+        action = parts[0]
+        kind = parts[1] if len(parts) > 1 else ""
+
+        # Pre-fill operation/resource in payload args
+        args["operation"] = action
+        args["resource"] = kind
+
+    # Merge body
+    body = body or {}
+    if "args" in body and isinstance(body["args"], dict) and any(k in body["args"] for k in ["operation", "resource", "args"]):
+        # Wrapped body: { "args": { ... } }
+        args.update(body.get("args", {}))
+    else:
+        args.update(body)
+
+    # Collect convenience from query-like fields
+    for p in CONVENIENCE_PARAMS + ["operation", "resource"]:
+        if p in body:
+            convenience[p] = body[p]
+
+    # Compose final args incl. argstring + format injection
+    final_args = await resolve_arg_payload(args, query_args_fallback, convenience, format_hint)
+
+    if dryrun:
+        return {
+            "dryrun": True,
+            "server": server,
+            "tool": tool,
+            "final_args": final_args
+        }
+
+    # Call MCP
+    return await mcp_call_tool(st.client, tool, final_args)
+
+
+@app.post(
+    "/{server}/tool/{tool_path}",
+    tags=["tools"],
+    summary="Tool Dispatch",
+    responses={200: {"description": "Successful Response", "content": {"application/json": {}}}},
+)
+async def tool_dispatch_post(
+    server: str = Path(..., description="Server alias (e.g., 'mcp')"),
+    tool_path: str = Path(..., description="Tool or tool path like 'kubectl_resources/get/pods'"),
+    args: Optional[str] = Query(None, description="JSON-encoded args fallback"),
+    dryrun: Optional[bool] = Query(False, description="If true, returns the would-be MCP call without executing it"),
+    format: Optional[str] = Query(None, description="Output preference: json|yaml|text (adds '-o json|yaml' when supported)"),
+    body: Optional[Dict[str, Any]] = Body(None),
+):
+    qargs = None
+    if args:
+        try:
+            qargs = json.loads(args)
+        except Exception:
+            qargs = args  # raw string fallback becomes tail
+    result = await do_tool_call(server, tool_path, body or qargs, None, bool(dryrun), format)
+    return JSONResponse(result)
+
+
+@app.get(
+    "/{server}/tool/{tool_path}",
+    tags=["tools"],
+    summary="Tool Dispatch",
+    responses={200: {"description": "Successful Response", "content": {"application/json": {}}}},
+)
+async def tool_dispatch_get(
+    server: str = Path(..., description="Server alias (e.g., 'mcp')"),
+    tool_path: str = Path(..., description="Tool or tool path like 'kubectl_resources/get/pods'"),
+    args: Optional[str] = Query(None, description="JSON-encoded args fallback"),
+    dryrun: Optional[bool] = Query(False, description="If true, returns the would-be MCP call without executing it"),
+    format: Optional[str] = Query(None, description="Output preference: json|yaml|text (adds '-o json|yaml' when supported)"),
+    namespace: Optional[str] = Query(None),
+    name: Optional[str] = Query(None),
+    labels: Optional[str] = Query(None),
+    labelSelector: Optional[str] = Query(None),
+    fieldSelector: Optional[str] = Query(None),
+    container: Optional[str] = Query(None),
+    sinceSeconds: Optional[int] = Query(None),
+):
+    # Convenience params come in via GET
+    qargs_fallback = None
+    if args:
+        try:
+            data = json.loads(args)
+            if isinstance(data, dict):
+                body = data
+            else:
+                body = {}
+                qargs_fallback = args
+        except Exception:
+            body = {}
+            qargs_fallback = args
+    else:
+        body = {}
+
+    # Merge convenience into body for resolve_arg_payload
+    for k, v in {
+        "namespace": namespace, "name": name, "labels": labels,
+        "labelSelector": labelSelector, "fieldSelector": fieldSelector,
+        "container": container, "sinceSeconds": sinceSeconds,
+    }.items():
+        if v is not None:
+            body[k] = v
+
+    result = await do_tool_call(server, tool_path, body, qargs_fallback, bool(dryrun), format)
+    return JSONResponse(result)
+
+
+# =============================================================================
+# Per-tool helper endpoints (schema/example/help/try)
+# =============================================================================
+
+@app.get("/mcp/tool/{tool}/invoke", tags=["tools", "invoke"], summary="Invoke (GET /invoke)")
+async def tool_invoke_get(
+    tool: str,
+    **kwargs
+):
+    return await tool_dispatch_get(server="mcp", tool_path=f"{tool}/invoke", **kwargs)
+
+
+@app.get("/mcp/tool/{tool}/schema", tags=["tools", "schema"], summary="Tool schema")
+async def tool_schema(tool: str):
+    st = DISCOVERY.servers.get("mcp")
+    if not st or tool not in st.tools:
+        raise HTTPException(404, f"No such tool '{tool}' on server 'mcp'")
+    return st.tools[tool].input_schema or {}
+
+
+@app.get("/mcp/tool/{tool}/example", tags=["tools", "example"], summary="Tool example")
+async def tool_example(tool: str):
+    st = DISCOVERY.servers.get("mcp")
+    if not st or tool not in st.tools:
+        raise HTTPException(404, f"No such tool '{tool}' on server 'mcp'")
+    return {"naturalExamples": st.tools[tool].natural_examples}
+
+
+@app.get("/mcp/tool/{tool}/help", tags=["tools", "help"], summary="Tool help")
+async def tool_help(tool: str):
+    st = DISCOVERY.servers.get("mcp")
+    if not st or tool not in st.tools:
+        raise HTTPException(404, f"No such tool '{tool}' on server 'mcp'")
+    td = st.tools[tool]
     return {
-        "required": required,
-        "content": {
-            "application/json": {
-                "schema": {"oneOf": [direct, wrapped]},
-                "examples": {
-                    "empty":  {"summary": "No arguments", "value": {}},
-                    "direct": {"summary": "Direct body", "value": example_from_schema(direct) or {}},
-                    "wrapped": {"summary": "Wrapped in args", "value": {"args": example_from_schema(direct) or {}}},
-                },
-            }
-        },
+        "name": tool,
+        "description": td.description,
+        "inferred_actions": td.inferred_actions,
+        "inferred_kinds": td.inferred_kinds,
+        "convenience_params": td.convenience_params,
+        "outputGuidance": td.output_guidance,
+        "usage": td.usage
     }
 
-def _parse_examples_from_description(desc: str) -> List[str]:
-    out: List[str] = []
-    for line in (desc or "").splitlines():
-        s = line.strip()
-        if not s:
-            continue
-        if s.startswith("- "):
-            out.append(s[2:])
-        elif "operation=" in s or "args=" in s or "resource=" in s or "action=" in s or "kind=" in s:
-            out.append(s)
-    return out[:16]
 
-def _nl_examples_from(server: str, tool_name: str, schema: Dict[str, Any], description: str) -> List[Dict[str, Any]]:
-    props = schema.get("properties", {}) if isinstance(schema, dict) else {}
-    has_ns = "namespace" in props or _looks_kubectl_like(tool_name, description, schema)
-    exs: List[Dict[str, Any]] = []
-    if has_ns:
-        exs.append({
-            "intent": "List all pods in the apisix namespace (machine-readable)",
-            "calls": [
-                {"GET": f"/{server}/tool/{_safe(tool_name)}/get/pods?namespace=apisix&format=json"},
-                {"POST": f"/{server}/tool/{_safe(tool_name)}/get/pods", "body": {"namespace":"apisix"}, "query": {"format":"json"}},
-            ],
-            "notes": ["Use format=json to inject '-o json' when supported (e.g., kubectl get)."]
-        })
-        exs.append({
-            "intent": "Describe the apisix pod (human text)",
-            "calls": [
-                {"GET": f"/{server}/tool/{_safe(tool_name)}/describe/pods?namespace=apisix&name=apisix"},
-            ],
-            "notes": ["Describe emits text; parse with `x-outputGuidance.parsingHints`."]
-        })
-    parsed = _parse_examples_from_description(description)
-    if parsed:
-        exs.append({"intent": "Examples from MCP description", "lines": parsed})
-    return exs
+@app.get("/mcp/tool/{tool}/try", tags=["tools", "try"], summary="Tool zero-arg try",
+         description="Calls this tool with `{}` (no arguments).")
+async def tool_try(tool: str, dryrun: Optional[bool] = Query(False)):
+    return await tool_dispatch_get(server="mcp", tool_path=f"{tool}/try", dryrun=dryrun)
 
-def _response_block(schema: Dict[str, Any], tool_name: str, description: str) -> Dict[str, Any]:
-    looks_kube = _looks_kubectl_like(tool_name, description, schema)
-    if looks_kube:
-        return {
-            "200": {
-                "description": "OK",
-                "content": {
-                    "application/json": {"schema": {"oneOf": [{"type":"object"},{"type":"array"}]}},
-                    "application/yaml": {"schema": {"type":"string"}},
-                    "text/plain": {"schema": {"type":"string"}}
-                }
-            }
-        }
-    # generic
-    return {"200": {"description": "OK", "content": {"application/json": {"schema": {}}, "text/plain": {"schema": {"type":"string"}}}}}
 
-def _compose_paths_from_mcp() -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    paths: Dict[str, Any] = {}
-    components: Dict[str, Any] = {"schemas": {}}
+# =============================================================================
+# OpenAPI Post-processor: insert x-* fields
+# =============================================================================
 
-    for server, st in SERVERS.items():
-        for tname, t in st.tools.items():
-            schema = t.get("inputSchema") or {"type":"object"}
-            desc = t.get("description", "") or ""
-            safe = _safe(tname)
-            tool_base = f"/{server}/tool/{safe}"
-            actions, kinds = iter_action_kind(schema)
-            comp_name = f"Args_{_safe(server)}_{safe}"
-            components["schemas"][comp_name] = schema
-            props = schema.get("properties", {}) if isinstance(schema, dict) else {}
-            argstring_required = props.get("args", {}).get("type") == "string"
-            looks_kube = _looks_kubectl_like(tname, desc, schema)
-            x_output = output_guidance_for(tname, desc, schema)
-            output_samples = st.samples.get(tname)
+_original_openapi = app.openapi
 
-            # Base GET/POST
-            for method in ("get","post"):
-                opid = f"{server}_{safe}_base_{method}"
-                op = {
-                    "tags": [f"{server}:{tname}"],
-                    "summary": t.get("title", tname),
-                    "operationId": opid,
-                    "description": (
-                        (desc or tname) + "\n\n"
-                        "CALLING RULES:\n"
-                        "• Prefer POST with a JSON object body. If you have no arguments, send `{}`.\n"
-                        "• If you cannot send a body: pass `?args={...}` or individual `?key=value`.\n"
-                        "• Granular paths like '/{server}/tool/{tool}/{action}[/{kind}]' imply fixed fields."
-                        + ("\n• This tool expects an argstring. You may pass convenience params (`namespace`, `name`, etc.); the bridge will compose it." if argstring_required else "")
-                        + ("\n• Use `format=json|yaml|text` to request the output shape; json/yaml injects '-o <format>' when supported." if looks_kube else "")
-                    ).strip(),
-                    "parameters": _op_params_with_schema(schema, argstring_required),
-                    "responses": _response_block(schema, tname, desc),
-                    "x-usage": {
-                        "schema": describe_schema(schema),
-                        "argstringRequired": argstring_required,
-                        "naturalExamples": _nl_examples_from(server, tname, schema, desc),
-                        "outputGuidance": x_output,
-                        **({"outputSample": output_samples} if output_samples else {}),
-                    },
-                }
-                if method == "post":
-                    op["requestBody"] = _make_request_body(schema, required=False)
-                paths.setdefault(tool_base, {})[method] = op
-
-            # helpers
-            for helper, tag in (("invoke","invoke"),("schema","schema"),("example","example"),("help","help"),("try","try")):
-                opid = f"{server}_{safe}_{helper}"
-                paths.setdefault(f"{tool_base}/{helper}", {})["get"]  = {
-                    "tags": [f"{server}:{tname}", tag],
-                    "summary": f"{tname} ({helper})",
-                    "operationId": opid,
-                    "parameters": _op_params_with_schema(schema, argstring_required) if helper=="invoke" else [],
-                    "responses": _response_block(schema, tname, desc),
-                    **({"description":"Calls this tool with `{}` (no arguments)."} if helper=="try" else {}),
-                }
-
-            # Granular: /{action} and /{action}/{kind}
-            if actions or kinds:
-                for action in actions or []:
-                    p = f"{tool_base}/{_safe(action)}"
-                    for method in ("get","post"):
-                        opid = f"{server}_{safe}_{_safe(action)}_{method}"
-                        op = {
-                            "tags": [f"{server}:{tname}", action],
-                            "summary": f"{tname} → {action}",
-                            "operationId": opid,
-                            "description": f"Fixes `action: \"{action}\"`. Provide only remaining fields."
-                                           + ("\nConvenience params (`namespace`, `name`, etc.) are accepted and composed into the argstring." if argstring_required else "")
-                                           + ("\nUse `format=json|yaml|text` to control output shape." if looks_kube else ""),
-                            "parameters": _op_params_with_schema(schema, argstring_required),
-                            "responses": _response_block(schema, tname, desc),
-                            "x-usage": {
-                                "schema": describe_schema(schema),
-                                "argstringRequired": argstring_required,
-                                "naturalExamples": _nl_examples_from(server, tname, schema, desc),
-                                "outputGuidance": x_output,
-                                **({"outputSample": output_samples} if output_samples else {}),
-                            },
-                        }
-                        if method == "post":
-                            op["requestBody"] = _make_request_body(schema, required=False)
-                        paths.setdefault(p, {})[method] = op
-                    paths.setdefault(f"{p}/try", {})["get"] = {
-                        "tags": [f"{server}:{tname}", action, "try"],
-                        "summary": f"{tname} → {action} zero-arg try",
-                        "operationId": f"{server}_{safe}_{_safe(action)}_try",
-                        "responses": _response_block(schema, tname, desc),
-                    }
-
-                # action + kind, or kind only
-                aks = []
-                if actions and kinds:
-                    aks = [(a,k) for a in actions for k in kinds]
-                elif kinds:
-                    aks = [("_", k) for k in kinds]
-
-                for action, kind in aks:
-                    suffix = f"{_safe(kind)}" if action == "_" else f"{_safe(action)}/{_safe(kind)}"
-                    p = f"{tool_base}/{suffix}"
-                    for method in ("get","post"):
-                        opid = f"{server}_{safe}_{suffix.replace('/','_')}_{method}"
-                        op = {
-                            "tags": [f"{server}:{tname}", *( [] if action=="_" else [action] ), kind],
-                            "summary": f"{tname} → {(kind if action=='_' else action+'/'+kind)}",
-                            "operationId": opid,
-                            "description": (
-                                (f"Fixes `kind: \"{kind}\"`. " if action=="_" else f"Fixes `action: \"{action}\"` and `kind: \"{kind}\"`. ")
-                                + "Provide only remaining fields."
-                                + ("\nConvenience params (`namespace`, `name`, etc.) are accepted and composed into the argstring." if argstring_required else "")
-                                + ("\nUse `format=json|yaml|text` to control output shape." if looks_kube else "")
-                            ),
-                            "parameters": _op_params_with_schema(schema, argstring_required),
-                            "responses": _response_block(schema, tname, desc),
-                            "x-usage": {
-                                "schema": describe_schema(schema),
-                                "argstringRequired": argstring_required,
-                                "naturalExamples": _nl_examples_from(server, tname, schema, desc),
-                                "outputGuidance": x_output,
-                                **({"outputSample": output_samples} if output_samples else {}),
-                            },
-                        }
-                        if method == "post":
-                            op["requestBody"] = _make_request_body(schema, required=False)
-                        paths.setdefault(p, {})[method] = op
-                    paths.setdefault(f"{p}/try", {})["get"] = {
-                        "tags": [f"{server}:{tname}", *( [] if action=="_" else [action] ), kind, "try"],
-                        "summary": f"{tname} → {(kind if action=='_' else action+'/'+kind)} zero-arg try",
-                        "operationId": f"{server}_{safe}_{suffix.replace('/','_')}_try",
-                        "responses": _response_block(schema, tname, desc),
-                    }
-
-    return paths, components
 
 def custom_openapi():
-    # Base skeleton
-    openapi = {
-        "openapi": "3.1.0",
-        "info": {
-            "title": app.title,
-            "version": app.version,
-            "description": app.description,
-        },
-        "servers": [{"url": PUBLIC_BASE_URL}],
-        "paths": {},
-        "components": {"schemas": {}, "securitySchemes": {
-            "XApiKey": {"type": "apiKey","in": "header","name": "X-Api-Key","description":"Optional API key (if configured)."}
-        }},
-        "x-model-instructions": {
-            "callDiscipline": [
-                "Use **GET with query** or **POST with JSON**. If no args, POST `{}`.",
-                "Prefer granular endpoints `/{SERVER}/tool/{TOOL}/{action}[/{kind}]` when enums exist.",
-                "If the tool requires `args` (string), you can either provide it directly OR pass convenience params; the bridge will compose the argstring.",
-                "Use `format=json|yaml|text` to influence output; json/yaml injects '-o' when supported.",
-                "Use `dryrun=true` to preview the composed MCP call.",
-            ],
-            "bodyShapes": ["Direct body: `{ ... }`","Wrapped body: `{ \"args\": { ... } }`"],
-            "discovery": [
-                "List tools: `GET /{SERVER}/tools/list`.",
-                "Per-tool schema: `GET /{SERVER}/tool/{TOOL}/schema`.",
-                "Per-tool example: `GET /{SERVER}/tool/{TOOL}/example`.",
-                "Per-tool help: `GET /{SERVER}/tool/{TOOL}/help`.",
-                "Zero-argument test: `GET /{SERVER}/tool/{TOOL}/try`."
-            ],
-            "typicalFlow": [
-                "1) Read `/openapi.json` and `/discovery/status`.",
-                "2) Choose a tool whose schema/description matches the user request.",
-                "3) Use a granular path when available (e.g., `/get/pods`).",
-                "4) Prefer `format=json` for machine-readable results when available.",
-            ],
-            "errorFix": [
-                "If you see 'expected a request body', use GET or POST `{}`.",
-                "If a tool needs `args` (string): either send it, or pass convenience params like `namespace`, `name`, etc.",
-                "If you see a schema error, inspect `/schema`, `/example`, or try a granular endpoint.",
-                "If parsing text, leverage `x-outputGuidance.parsingHints`.",
-            ],
-        },
-    }
+    if app.openapi_schema:
+        # Always refresh the x-* blocks from current discovery
+        app.openapi_schema["components"] = app.openapi_schema.get("components", {})
+        app.openapi_schema.update(openapi_extra_blocks())
+        return app.openapi_schema
 
-    # Include fixed routes (health/discovery) from FastAPI
-    fixed = get_openapi(title=app.title, version=app.version, description=app.description, routes=app.routes)
-    for p, item in (fixed.get("paths") or {}).items():
-        openapi["paths"].setdefault(p, item)
+    openapi_schema = _original_openapi()
+    openapi_schema.update(openapi_extra_blocks())
 
-    # Synthesize tool paths/components directly from MCP data
-    tool_paths, comp = _compose_paths_from_mcp()
-    openapi["paths"].update(tool_paths)
-    openapi["components"]["schemas"].update(comp.get("schemas", {}))
+    # Enrich known kubectl-ish tools with usage/naturalExamples in paths via x-usage/outputGuidance
+    # (We cannot modify FastAPI's route schemas per-tool easily here; the top-level x-* carries it.)
+    app.openapi_schema = openapi_schema
+    return app.openapi_schema
 
-    # MCP catalog (tools + prompts + resources + samples)
-    openapi["x-mcp-tool-catalog"] = [
-        {
-            "server": sname,
-            "tool": tname,
-            "description": t.get("description", "No description provided by MCP server."),
-            "schema": describe_schema(t.get("inputSchema") or {"type":"object"}),
-            **({"outputSample": SERVERS[sname].samples.get(tname)} if SERVERS[sname].samples.get(tname) else {}),
-        }
-        for sname, st in SERVERS.items()
-        for tname, t in st.tools.items()
-    ]
-    openapi["x-mcp-prompts"] = { sname: st.prompts for sname, st in SERVERS.items() if st.prompts }
-    openapi["x-mcp-resources"] = { sname: st.resources for sname, st in SERVERS.items() if st.resources }
-
-    # Hint if nothing discovered yet
-    if not any("/tool/" in p for p in openapi.get("paths", {}).keys()):
-        openapi["x-note"] = {
-            "message": "No tool paths synthesized yet. Discovery runs asynchronously.",
-            "actions": [
-                "Call `POST /discover?wait=3` to prompt a discovery cycle.",
-                "Then re-fetch `/openapi.json`."
-            ]
-        }
-    return openapi
 
 app.openapi = custom_openapi
