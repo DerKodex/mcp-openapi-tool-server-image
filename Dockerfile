@@ -6,10 +6,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Slim, deterministic deps
-RUN pip install --no-cache-dir fastapi==0.114.2 uvicorn==0.30.6 httpx==0.27.2
-
 COPY src/app.py .
+COPY src/requirements.txt .
+
+# Slim, deterministic deps
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Non-root
 USER 10001:10001
