@@ -159,22 +159,22 @@ def build_k8s_output_guidance(tool_name: str) -> Dict[str, Any]:
             "For 'api-resources'/'api-versions', `format=json` works when supported; otherwise text table."
         ],
         "parsingHints": {
-                "describe/pods (text)": {
-                    "extract": [
-                        {"field": "name", "regex": r"^Name:\s+([^\s]+)"},
-                        {"field": "namespace", "regex": r"^Namespace:\s+([^\s]+)"},
-                        {"field": "node", "regex": r"^Node:\s+([^\s]+)"},
-                        {"field": "podIP", "regex": r"^IP:\s+([^\s]+)"},
-                        {"field": "phase", "regex": r"^Status:\s+([A-Za-z]+)"},
-                    ],
-                    "lineMode": True
-                },
-                "logs (text)": {
-                    "extract": [
-                        {"field": "lines", "note": "Split by newline; may contain timestamps."}
-                    ]
-                }
+            "describe/pods (text)": {
+                "extract": [
+                    {"field": "name", "regex": r"^Name:\s+([^\s]+)"},
+                    {"field": "namespace", "regex": r"^Namespace:\s+([^\s]+)"},
+                    {"field": "node", "regex": r"^Node:\s+([^\s]+)"},
+                    {"field": "podIP", "regex": r"^IP:\s+([^\s]+)"},
+                    {"field": "phase", "regex": r"^Status:\s+([A-Za-z]+)"},
+                ],
+                "lineMode": True
+            },
+            "logs (text)": {
+                "extract": [
+                    {"field": "lines", "note": "Split by newline; may contain timestamps."}
+                ]
             }
+        }
     }
 
 
@@ -291,7 +291,7 @@ async def mcp_call_tool(session, tool_name: str, args: Dict[str, Any]) -> Dict[s
 
 app = FastAPI(
     title="MCP OpenAPI Bridge (Generic, Self-Discovering)",
-    version="3.1.3",
+    version="3.1.4",
     description=textwrap.dedent(
         """\
         A generic, self-discovering OpenAPI façade for MCP servers.
@@ -312,33 +312,41 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"],
 )
 
-# --- Small, surgical: path normalizer to accept placeholders and spaces ------
+# --- Small, surgical: path normalizer (accept placeholders, spaces, unknown aliases)
 @app.middleware("http")
 async def normalize_odd_paths(request: Request, call_next):
-    # Unquote once so %3Cserver-alias%3E, %20, etc become plain text
     raw_path = request.scope.get("path") or ""
     decoded = unquote(raw_path)
 
-    # If caller used literal placeholders, map them to /mcp/...
+    # Map literal placeholder aliases to /mcp/...
     for bad in ("<server-alias>", "<server>", "server-alias", "server"):
         prefix = f"/{bad}/"
         if decoded.startswith(prefix):
             decoded = "/mcp/" + decoded[len(prefix):]
             break
 
-    # If caller put spaces after /tool/, e.g., /tool/kubectl/get pods -> get/pods
-    # Only touch the segment after '/tool/'.
+    # If caller put spaces after /tool/, fix "get pods" -> "get/pods"
     marker = "/tool/"
     if marker in decoded:
         head, tail = decoded.split(marker, 1)
-        # Replace runs of spaces with slashes (safe for 'get pods', 'describe pod', etc.)
         tail = tail.replace("  ", " ").strip()
-        if " " in tail and "/" not in tail.split("/", 1)[-1]:
-            # Convert spaces to slashes in the remainder
+        # If there are spaces and not already split, convert spaces to slashes
+        if " " in tail:
             tail = "/".join([p for p in tail.split(" ") if p])
         decoded = head + marker + tail
 
-    # If changed, patch the path in scope
+    # If no server segment given (starts with /tool/), prefix with /mcp
+    if decoded.startswith("/tool/"):
+        decoded = "/mcp" + decoded
+
+    # If server segment is unknown, rewrite to /mcp/… so routing always matches
+    # Pattern: "/{seg}/tool/..."
+    if decoded.startswith("/") and "/tool/" in decoded:
+        first = decoded.split("/", 2)[1]  # segment after first slash
+        if first and first not in DISCOVERY.servers:
+            decoded = "/mcp/" + decoded.split("/", 2)[2]
+
+    # Patch the path in scope if changed
     if decoded != raw_path:
         request.scope["path"] = decoded
 
@@ -576,12 +584,6 @@ async def resolve_arg_payload(
 
 
 async def ensure_connected(server: str) -> ServerState:
-    """
-    Small compat shim to avoid 404/503 on odd aliases:
-    - If the requested alias isn't found but any server is configured,
-      transparently fall back to the *first configured* server.
-    - If the chosen server isn't connected yet, attempt to connect now.
-    """
     st = DISCOVERY.servers.get(server)
 
     if not st and DISCOVERY.servers:
@@ -618,14 +620,12 @@ async def do_tool_call(
     tool = components[0]
     suffix = "/".join(components[1:]) if len(components) > 1 else ""
 
-    # Try to locate descriptor; if missing, refresh once, then fall back to "best-effort"
     td = st.tools.get(tool)
     if not td:
         print(f"[dispatch] Tool '{tool}' not in cache for server '{server}'. Refreshing discovery...", file=sys.stderr)
         await do_discover(wait_seconds=0)
         td = DISCOVERY.servers.get(st.cfg.alias, st).tools.get(tool)
 
-    # Helper endpoints even without td: schema/example/help/try
     if suffix in ("schema", "example", "help"):
         if td:
             if suffix == "schema":
@@ -642,7 +642,6 @@ async def do_tool_call(
                     "outputGuidance": td.output_guidance,
                     "usage": td.usage
                 }
-        # No descriptor: provide minimal help
         if suffix == "schema":
             return {}
         if suffix == "example":
@@ -658,7 +657,6 @@ async def do_tool_call(
             return {"dryrun": True, "tool": tool, "args": {}}
         return await mcp_call_tool(st.client, tool, {})
 
-    # Build args from URL suffix when present (action/kind)
     args = {}
     convenience = {}
     if suffix and suffix not in ("invoke",):
@@ -680,7 +678,6 @@ async def do_tool_call(
 
     final_args = await resolve_arg_payload(args, query_args_fallback, convenience, format_hint)
 
-    # If still missing 'operation'/'resource' and we have a descriptor, inject defaults when sensible
     if td and "operation" not in final_args and td.inferred_actions:
         final_args["operation"] = td.inferred_actions[0]
     if td and "resource" not in final_args and td.inferred_kinds:
