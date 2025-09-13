@@ -291,7 +291,7 @@ async def mcp_call_tool(session, tool_name: str, args: Dict[str, Any]) -> Dict[s
 
 app = FastAPI(
     title="MCP OpenAPI Bridge (Generic, Self-Discovering)",
-    version="3.1.5",
+    version="3.1.6",
     description=textwrap.dedent(
         """\
         A generic, self-discovering OpenAPI façade for MCP servers.
@@ -357,11 +357,28 @@ async def on_startup():
         cfg_obj = ServerConfig(**cfg)
         DISCOVERY.servers[cfg_obj.alias] = ServerState(cfg_obj)
 
-    # Ensure a default 'mcp' alias ALWAYS exists, even if no servers provided.  # <<<
+    # Ensure a default 'mcp' alias ALWAYS exists, even if no servers provided.
     if "mcp" not in DISCOVERY.servers:
-        DISCOVERY.servers["mcp"] = ServerState(ServerConfig(alias="mcp"))  # cmd=None, will 503 on use  # <<<
+        DISCOVERY.servers["mcp"] = ServerState(ServerConfig(alias="mcp"))  # placeholder
 
     await do_discover(wait_seconds=int(os.getenv("MCP_DISCOVERY_WAIT", "0")))
+
+# --- NEW: re-hydrate servers from env on demand (tiny helper)
+def refresh_servers_from_env() -> bool:
+    updated = False
+    servers_cfg = getenv_json("MCP_SERVERS", None) or []
+    for cfg in servers_cfg:
+        cfg_obj = ServerConfig(**cfg)
+        st = DISCOVERY.servers.get(cfg_obj.alias)
+        if not st:
+            DISCOVERY.servers[cfg_obj.alias] = ServerState(cfg_obj)
+            updated = True
+        else:
+            # If placeholder or changed config, replace with fresh cfg
+            if (not st.cfg.cmd and cfg_obj.cmd) or (st.cfg.cmd != cfg_obj.cmd) or (st.cfg.mode != cfg_obj.mode) or (st.cfg.env != cfg_obj.env):
+                DISCOVERY.servers[cfg_obj.alias] = ServerState(cfg_obj)
+                updated = True
+    return updated
 
 
 async def do_discover(wait_seconds: int = 0) -> Dict[str, Any]:
@@ -580,19 +597,44 @@ async def resolve_arg_payload(
 async def ensure_connected(server: str) -> ServerState:
     st = DISCOVERY.servers.get(server)
 
+    # If alias missing, fall back to the first defined server (compat behavior)
     if not st and DISCOVERY.servers:
         first_alias, st = next(iter(DISCOVERY.servers.items()))
         print(f"[compat] Alias '{server}' not found; falling back to '{first_alias}'", file=sys.stderr)
 
-    # Don't 404 here — return 503 so the endpoint is considered present.        # <<<
+    # If still missing, try to re-hydrate from env once
     if not st:
-        raise HTTPException(503, "No MCP server configured. Set MCP_SERVERS env to a valid stdio MCP server.")  # <<<
+        if refresh_servers_from_env():
+            await do_discover(0)
+            st = DISCOVERY.servers.get(server)
+            if not st and DISCOVERY.servers:
+                st = next(iter(DISCOVERY.servers.values()))
 
+    # If we have a placeholder alias (no cmd), try to re-hydrate + discover once
+    if st and (not st.connected and not st.cfg.cmd):
+        if refresh_servers_from_env():
+            await do_discover(0)
+            st = DISCOVERY.servers.get(server, st)
+
+        # If this alias still unusable, prefer any usable server
+        if (not st.connected and not st.cfg.cmd) and DISCOVERY.servers:
+            for cand in DISCOVERY.servers.values():
+                if cand.connected or cand.cfg.cmd:
+                    st = cand
+                    print(f"[fallback] Using server '{st.cfg.alias}' instead of placeholder '{server}'", file=sys.stderr)
+                    break
+
+    if not st:
+        raise HTTPException(503, "No MCP server configured. Set MCP_SERVERS env to a valid stdio MCP server.")
+
+    # Connect lazily if possible
     if not st.connected or not st.client:
         try:
             if st.cfg.mode == "stdio" and st.cfg.cmd:
                 st.client = await mcp_connect_stdio(st.cfg)
                 st.connected = True
+                # refresh tools after connecting
+                await do_discover(0)
             else:
                 raise RuntimeError("Missing stdio cmd for MCP server")
         except Exception as e:
@@ -617,7 +659,7 @@ async def do_tool_call(
 
     td = st.tools.get(tool)
     if not td:
-        print(f"[dispatch] Tool '{tool}' not in cache for server '{server}'. Refreshing discovery...", file=sys.stderr)
+        print(f"[dispatch] Tool '{tool}' not in cache for server '{st.cfg.alias}'. Refreshing discovery...", file=sys.stderr)
         await do_discover(wait_seconds=0)
         td = DISCOVERY.servers.get(st.cfg.alias, st).tools.get(tool)
 
@@ -688,7 +730,7 @@ async def do_tool_call(
         }
 
     try:
-        print(f"[invoke] server={server} tool={tool} suffix='{suffix}' final_args={final_args}", file=sys.stderr)
+        print(f"[invoke] server={st.cfg.alias} tool={tool} suffix='{suffix}' final_args={final_args}", file=sys.stderr)
         return await mcp_call_tool(st.client, tool, final_args)
     except Exception as e:
         raise HTTPException(502, f"Tool invocation failed for '{tool_path}': {e}")
