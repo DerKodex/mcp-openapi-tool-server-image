@@ -260,10 +260,25 @@ async def mcp_connect_stdio(cfg: ServerConfig):
         raise RuntimeError("MCP python SDK not installed. pip install mcp[stdio]")
     if not cfg.cmd:
         raise RuntimeError(f"Server {cfg.alias}: stdio mode requires 'cmd'.")
-    client = await stdio_client(cfg.cmd, env=cfg.env or {})
+
+    # Try newer SDK signature first (supports env=); fall back if not supported
+    try:
+        client = await stdio_client(cfg.cmd, env=cfg.env or {})
+    except TypeError as e:
+        if "unexpected keyword argument 'env'" not in str(e):
+            raise
+        # Older SDK: temporarily inject env into process env for the spawn
+        orig_env = os.environ.copy()
+        try:
+            if cfg.env:
+                os.environ.update(cfg.env)
+            client = await stdio_client(cfg.cmd)
+        finally:
+            os.environ.clear()
+            os.environ.update(orig_env)
+
     await client.initialize()
     return client
-
 
 async def mcp_list_tools(session) -> List[Dict[str, Any]]:
     result = await session.list_tools()
