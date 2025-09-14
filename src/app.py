@@ -6,7 +6,8 @@ MCP OpenAPI Bridge — Generic, Self-Discovering (HTTP-first, hardened stdio)
 - Generic only (no domain assumptions)
 - HTTP RPC (MCP_RPC_URL) preferred; stdio optional and hardened
 - Stdio uses the descriptor-only signature expected by newer MCP SDKs
-- OpenAPI now includes concrete per-tool POST endpoints with real schemas
+- OpenAPI now includes concrete per-tool POST **and GET** endpoints with real schemas
+- Alias-path rewrite fixes clients that mistakenly use operationId as a URL
 
 Run:
   uvicorn app:app --host 0.0.0.0 --port 8080
@@ -19,7 +20,7 @@ Env:
   MCP_STDIO_PREFLIGHT=1          # 0/1 run version/help preflights
   MCP_STDIO_PREFLIGHT_CONFIG=0   # 0/1 preflight with configured args (off by default)
   MCP_STDIO_EXTRA_ARGS=''        # optional extra args appended for stdio attempts
-  MCP_SERVERS='[{"alias":"mcp","mode":"stdio","cmd":["/mcpbin/mcp-kubernetes","--transport","stdio","--access-level","readonly"],"env":{"K":"V"},"cwd":"/app"}]'
+  MCP_SERVERS='[{"alias":"mcp","mode":"stdio","cmd":["/mcpbin/mcp-kubernetes","--transport","stdio","--access-level","readonly"],"env":{},"cwd":"/app"}]'
   MCP_DISCOVERY_WAIT=2
   MCP_FORWARD_URL='http://mcp-upstream:8080'
 """
@@ -28,6 +29,7 @@ import asyncio
 import inspect
 import json
 import os
+import re
 import stat
 import sys
 import textwrap
@@ -508,7 +510,7 @@ async def mcp_call_tool_stdio(session, tool_name: str, args: Dict[str, Any]) -> 
 
 app = FastAPI(
     title="MCP OpenAPI Bridge (Generic, Self-Discovering)",
-    version="6.5.0",
+    version="6.6.0",
     description=textwrap.dedent(
         """\
         Generic OpenAPI façade for MCP servers.
@@ -529,15 +531,26 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"],
 )
 
+# --- URL normalization + alias rewrite (fixes clients that use operationId as a path) ---
+_ALIAS_RE = re.compile(r"^/mcp/tool/call_([^_/]+)_(.+)$")
+
 @app.middleware("http")
 async def normalize_odd_paths(request: Request, call_next):
     raw_path = request.scope.get("path") or ""
     decoded = unquote(raw_path)
+
+    # Rewrite opId-as-path to the real tool path, e.g. /mcp/tool/call_mcp_kubectl_resources -> /mcp/tool/kubectl_resources
+    m = _ALIAS_RE.match(decoded)
+    if m:
+        alias, tool = m.group(1), m.group(2)
+        decoded = f"/mcp/tool/{tool}"
+
     for bad in ("<server-alias>", "<server>", "server-alias", "server"):
         prefix = f"/{bad}/"
         if decoded.startswith(prefix):
             decoded = "/mcp/" + decoded[len(prefix):]
             break
+
     marker = "/tool/"
     if marker in decoded:
         head, tail = decoded.split(marker, 1)
@@ -545,12 +558,15 @@ async def normalize_odd_paths(request: Request, call_next):
         if " " in tail:
             tail = "/".join([p for p in tail.split(" ") if p])
         decoded = head + marker + tail
+
     if decoded.startswith("/tool/"):
         decoded = "/mcp" + decoded
+
     if decoded.startswith("/") and "/tool/" in decoded:
         first = decoded.split("/", 2)[1]
         if first and first not in DISCOVERY.servers:
             decoded = "/mcp/" + decoded.split("/", 2)[2]
+
     if decoded != raw_path:
         request.scope["path"] = decoded
     return await call_next(request)
@@ -823,8 +839,8 @@ async def tool_help(tool: str):
         "name": tool,
         "description": td.description,
         "notes": [
-            "Arguments are forwarded to the MCP tool exactly as you send them.",
-            "Use /mcp/tool/{tool}/schema and /mcp/tool/{tool}/example for guidance."
+                "Arguments are forwarded to the MCP tool exactly as you send them.",
+                "Use /mcp/tool/{tool}/schema and /mcp/tool/{tool}/example for guidance."
         ],
     }
 
@@ -842,36 +858,95 @@ async def tool_try(tool: str, dryrun: Optional[bool] = Query(False)):
 
 
 # =============================================================================
-# OpenAPI Post-processor (adds per-tool POST operations)
+# OpenAPI Post-processor (adds per-tool POST/GET operations + guidance)
 # =============================================================================
+
+def _tool_guidance_for(name: str) -> Dict[str, Any]:
+    """
+    Per-tool guidance used in vendor extensions to steer LLMs.
+    Adjusts heuristics for common k8s tasks.
+    """
+    # Defaults
+    guidance = {
+        "x-usage-hints": [
+            "Prefer POST with a JSON body matching the schema.",
+            "If a field is not applicable, send an empty string ''.",
+            "For namespace selection, pass flags in 'args' (e.g., -n default or --all-namespaces).",
+        ],
+        "x-examples": [],
+        "x-intent": ""
+    }
+
+    if name == "kubectl_resources":
+        guidance["x-intent"] = "Read-only listing and describing Kubernetes resources."
+        guidance["x-examples"] = [
+            {
+                "ask": "List pods in namespace 'apisix'",
+                "body": {"operation": "get", "resource": "pods", "args": "-n apisix"}
+            },
+            {
+                "ask": "Describe pod apisix-c96444b8-s7ctp in 'apisix'",
+                "body": {"operation": "describe", "resource": "pods", "args": "apisix-c96444b8-s7ctp -n apisix"}
+            },
+            {
+                "ask": "Get all services across namespaces",
+                "body": {"operation": "get", "resource": "services", "args": "--all-namespaces"}
+            },
+        ]
+    elif name == "kubectl_diagnostics":
+        guidance["x-intent"] = "Logs, events, top, exec, and cp for debugging."
+        guidance["x-examples"] = [
+            {"ask": "Tail logs of pod 'gateway-0' in 'apisix'", "body": {"operation": "logs", "resource": "", "args": "gateway-0 -n apisix"}},
+            {"ask": "Cluster events in all namespaces", "body": {"operation": "events", "resource": "", "args": "--all-namespaces"}},
+            {"ask": "Top pods in 'default'", "body": {"operation": "top", "resource": "pod", "args": "-n default"}},
+        ]
+    elif name == "kubectl_config":
+        guidance["x-intent"] = "Auth checks, config view (read-only)."
+        guidance["x-examples"] = [
+            {"ask": "What is the current context?", "body": {"operation": "config", "resource": "current-context", "args": ""}},
+            {"ask": "Can I create pods cluster-wide?", "body": {"operation": "auth", "resource": "can-i", "args": "create pods --all-namespaces"}},
+        ]
+    elif name == "kubectl_cluster":
+        guidance["x-intent"] = "Cluster metadata (resources, versions, explain)."
+        guidance["x-examples"] = [
+            {"ask": "List API resources", "body": {"operation": "api-resources", "resource": "", "args": ""}},
+            {"ask": "Explain deployments (apps/v1)", "body": {"operation": "explain", "resource": "deployments", "args": "--api-version=apps/v1"}},
+        ]
+
+    return guidance
 
 def _inject_tool_operations(openapi_schema: Dict[str, Any]) -> None:
     """
-    Add one concrete POST endpoint per discovered tool at /mcp/tool/{tool_name},
-    using the tool's input_schema as the requestBody schema. These point at the
-    existing dynamic handler path; FastAPI routing already matches them.
+    Add one concrete POST and GET endpoint per discovered tool at /mcp/tool/{tool_name},
+    using the tool's input_schema. Also add rich vendor extensions to guide LLMs.
     """
     paths = openapi_schema.setdefault("paths", {})
-    # For each known tool, add a POST path
+    tags = openapi_schema.setdefault("tags", [])
+    # Ensure tag docs exist
+    if not any(t.get("name") == "kubernetes" for t in tags):
+        tags.append({"name": "kubernetes", "description": "Operations for querying a Kubernetes cluster (read-only)."})
+    if not any(t.get("name") == "mcp" for t in tags):
+        tags.append({"name": "mcp", "description": "Model Context Protocol (stdio/http) tool bridge."})
+
     for alias, st in DISCOVERY.servers.items():
         if alias != "mcp":
-            # You can drop this condition if you want per-alias paths too
             continue
         for tname, td in st.tools.items():
             p = f"/mcp/tool/{tname}"
             if p not in paths:
                 paths[p] = {}
-            # Build operation
-            op = {
-                "tags": ["tools"],
+            guidance = _tool_guidance_for(tname)
+
+            # Build POST operation (preferred)
+            post_op = {
+                "tags": ["tools", "kubernetes", "mcp"],
                 "summary": f"Call MCP tool '{tname}'",
                 "description": (td.description or "").strip(),
-                "operationId": f"call_{alias}_{tname}",
+                "operationId": f"call_{alias}_{tname}",  # kept for compatibility
                 "requestBody": {
                     "required": True,
                     "content": {
                         "application/json": {
-                            # OpenAPI 3.1 accepts JSON Schema directly
                             "schema": td.input_schema or {"type": "object"}
                         }
                     }
@@ -880,24 +955,63 @@ def _inject_tool_operations(openapi_schema: Dict[str, Any]) -> None:
                     "200": {
                         "description": "Successful Response",
                         "content": {
-                            "application/json": {
-                                "schema": {"type": "object"}  # generic MCP result envelope
-                            }
+                            "application/json": {"schema": {"type": "object"}}
                         }
                     }
-                }
+                },
+                # Vendor extensions to steer LLMs
+                "x-mcp-tool-name": tname,
+                "x-preferred": True,
+                **guidance
             }
-            # Only set if not already present
             if "post" not in paths[p]:
-                paths[p]["post"] = op
+                paths[p]["post"] = post_op
+
+            # Build GET operation (explicit, mirrors dynamic GET)
+            get_op = {
+                "tags": ["tools", "kubernetes", "mcp"],
+                "summary": f"Call MCP tool '{tname}' (GET)",
+                "description": (
+                    "Use only when you need to pass arguments via the 'args' query string as JSON. "
+                    "Prefer POST for structured calls."
+                ),
+                "operationId": f"call_{alias}_{tname}_get",
+                "parameters": [
+                    {
+                        "name": "args",
+                        "in": "query",
+                        "required": False,
+                        "schema": {"type": "string", "description": "JSON-encoded arguments."},
+                        "description": "JSON-encoded object matching the tool schema."
+                    },
+                    {
+                        "name": "dryrun",
+                        "in": "query",
+                        "required": False,
+                        "schema": {"type": "boolean", "default": False}
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {"application/json": {"schema": {"type": "object"}}}
+                    }
+                },
+                "x-mcp-tool-name": tname,
+                "x-preferred": False,
+                **guidance
+            }
+            if "get" not in paths[p]:
+                paths[p]["get"] = get_op
 
 def openapi_extra_blocks() -> Dict[str, Any]:
     x_model_instructions = {
         "usage": [
-            "Use GET with ?args={...} (JSON-encoded) or POST with a JSON body.",
-            "If the tool expects no arguments, send POST {}.",
-            "Arguments are forwarded exactly as provided to the MCP tool.",
-            "See /mcp/tool/{tool}/schema and /mcp/tool/{tool}/example for schema-derived guidance."
+            "Prefer POST to /mcp/tool/{tool} with a JSON body that matches the schema.",
+            "If a parameter isn't needed, send empty string ''.",
+            "For Kubernetes namespace selection, include -n <namespace> in 'args'.",
+            "Use kubectl_resources for get/describe, kubectl_diagnostics for logs/events/top/exec/cp, "
+            "kubectl_config for auth/config introspection, kubectl_cluster for cluster info/explain."
         ],
         "discovery": [
             "List tools: GET /{SERVER}/tools/list",
