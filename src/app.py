@@ -304,8 +304,11 @@ async def _exit_ctx(cm):
 
 def _server_descriptors(cfg: ServerConfig) -> List[SimpleNamespace]:
     """
-    Yield a few descriptor variants to satisfy different SDKs.
-    Order: most complete -> minimal.
+    Yield descriptor variants to satisfy different SDK expectations.
+    Add explicit encoding handlers to avoid AttributeError seen in stdout_reader:
+    - encoding_error_handler
+    - stderr_encoding_error_handler
+    Also include stderr_encoding in some variants.
     """
     if isinstance(cfg.cmd, list) and cfg.cmd:
         cmd0, args = str(cfg.cmd[0]), [str(x) for x in cfg.cmd[1:]]
@@ -316,9 +319,34 @@ def _server_descriptors(cfg: ServerConfig) -> List[SimpleNamespace]:
 
     env = cfg.env or {}
     variants = [
-        SimpleNamespace(command=cmd0, args=args, env=env, cwd=cfg.cwd, encoding="utf-8"),
-        SimpleNamespace(command=cmd0, args=args, env=env, encoding="utf-8"),
-        SimpleNamespace(command=cmd0, args=args, encoding="utf-8"),
+        # Most explicit
+        SimpleNamespace(
+            command=cmd0, args=args, env=env, cwd=cfg.cwd,
+            encoding="utf-8", stderr_encoding="utf-8",
+            encoding_error_handler="replace",
+            stderr_encoding_error_handler="replace",
+        ),
+        # Drop cwd
+        SimpleNamespace(
+            command=cmd0, args=args, env=env,
+            encoding="utf-8", stderr_encoding="utf-8",
+            encoding_error_handler="replace",
+            stderr_encoding_error_handler="replace",
+        ),
+        # Drop stderr_encoding
+        SimpleNamespace(
+            command=cmd0, args=args, env=env,
+            encoding="utf-8",
+            encoding_error_handler="replace",
+            stderr_encoding_error_handler="replace",
+        ),
+        # Minimal with encoding only
+        SimpleNamespace(
+            command=cmd0, args=args,
+            encoding="utf-8",
+            encoding_error_handler="replace",
+        ),
+        # Bare minimum
         SimpleNamespace(command=cmd0, args=args),
     ]
     return variants
@@ -337,23 +365,25 @@ async def mcp_connect_stdio(cfg: ServerConfig) -> Any:
     if not cfg.cmd:
         raise RuntimeError(f"Server {cfg.alias}: stdio mode requires 'cmd'.")
 
-    # 1) Descriptor-first variants
     last_exc: Optional[BaseException] = None
+
+    # 1) Descriptor-first variants
     for desc in _server_descriptors(cfg):
+        stdio_cm = None
         try:
             stdio_cm = stdio_client(desc)          # async context manager
             rw = await _enter_ctx(stdio_cm)        # expect (read, write)
             if not isinstance(rw, (tuple, list)) or len(rw) != 2:
-                await _exit_ctx(stdio_cm)
                 raise TypeError("stdio_client did not yield (read_stream, write_stream)")
             read_stream, write_stream = rw[0], rw[1]
 
             session = MCPClientSession(read_stream, write_stream)  # not a context manager in most SDKs
             init = getattr(session, "initialize", None)
             if callable(init):
+                # Avoid startup hangs; 30s is generous
                 maybe = init()
                 if inspect.isawaitable(maybe):
-                    await maybe
+                    await asyncio.wait_for(maybe, timeout=30)
 
             # success
             sess = session
@@ -362,15 +392,21 @@ async def mcp_connect_stdio(cfg: ServerConfig) -> Any:
             return sess
         except Exception as e:
             last_exc = e
+            # ensure we exit context if it was entered
+            try:
+                await _exit_ctx(stdio_cm)
+            except Exception:
+                pass
 
     # 2) Fallbacks: pass command as [list] or "str"
+    # a) list
     if isinstance(cfg.cmd, list) and cfg.cmd:
-        cmd_list = [str(x) for x in cfg.cmd]
+        stdio_cm = None
         try:
+            cmd_list = [str(x) for x in cfg.cmd]
             stdio_cm = stdio_client(cmd_list)
             rw = await _enter_ctx(stdio_cm)
             if not isinstance(rw, (tuple, list)) or len(rw) != 2:
-                await _exit_ctx(stdio_cm)
                 raise TypeError("stdio_client did not yield (read_stream, write_stream)")
             read_stream, write_stream = rw[0], rw[1]
             session = MCPClientSession(read_stream, write_stream)
@@ -378,20 +414,25 @@ async def mcp_connect_stdio(cfg: ServerConfig) -> Any:
             if callable(init):
                 maybe = init()
                 if inspect.isawaitable(maybe):
-                    await maybe
+                    await asyncio.wait_for(maybe, timeout=30)
             sess = session
             setattr(sess, "__stdio_ctx__", stdio_cm)
             setattr(sess, "__stdio_pair__", rw)
             return sess
         except Exception as e:
             last_exc = e
+            try:
+                await _exit_ctx(stdio_cm)
+            except Exception:
+                pass
 
+    # b) str
     if isinstance(cfg.cmd, str):
+        stdio_cm = None
         try:
             stdio_cm = stdio_client(cfg.cmd)
             rw = await _enter_ctx(stdio_cm)
             if not isinstance(rw, (tuple, list)) or len(rw) != 2:
-                await _exit_ctx(stdio_cm)
                 raise TypeError("stdio_client did not yield (read_stream, write_stream)")
             read_stream, write_stream = rw[0], rw[1]
             session = MCPClientSession(read_stream, write_stream)
@@ -399,13 +440,17 @@ async def mcp_connect_stdio(cfg: ServerConfig) -> Any:
             if callable(init):
                 maybe = init()
                 if inspect.isawaitable(maybe):
-                    await maybe
+                    await asyncio.wait_for(maybe, timeout=30)
             sess = session
             setattr(sess, "__stdio_ctx__", stdio_cm)
             setattr(sess, "__stdio_pair__", rw)
             return sess
         except Exception as e:
             last_exc = e
+            try:
+                await _exit_ctx(stdio_cm)
+            except Exception:
+                pass
 
     raise RuntimeError(f"Failed to open stdio_client for '{cfg.alias}': {last_exc}")
 
@@ -452,7 +497,7 @@ async def mcp_call_tool_stdio(session, tool_name: str, args: Dict[str, Any]) -> 
 
 app = FastAPI(
     title="MCP OpenAPI Bridge (Generic, Self-Discovering)",
-    version="5.2.0",
+    version="5.3.0",
     description=textwrap.dedent(
         """\
         A generic, self-discovering OpenAPI façade for MCP servers.
@@ -518,14 +563,12 @@ async def on_shutdown():
     # Close any active stdio contexts/sessions
     for _, st in list(DISCOVERY.servers.items()):
         try:
-            # Try session close() if present (non-fatal if missing)
             if st.client is not None:
                 close = getattr(st.client, "close", None)
                 if callable(close):
                     maybe = close()
                     if inspect.isawaitable(maybe):
                         await maybe
-            # Exit the stdio context manager if present
             await _exit_ctx(getattr(st.client, "__stdio_ctx__", None))
         except Exception:
             pass
