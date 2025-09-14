@@ -285,7 +285,8 @@ async def _exit_ctx(cm):
 def _server_descriptors(cfg: ServerConfig) -> List[SimpleNamespace]:
     """
     Yield descriptor variants to satisfy different SDK expectations.
-    Include encoding fields to satisfy stdout_reader on some versions.
+    Always include .env and .cwd (older SDKs require them).
+    Also include encoding fields to satisfy stdout_reader on some versions.
     """
     if isinstance(cfg.cmd, list) and cfg.cmd:
         cmd0, args = str(cfg.cmd[0]), [str(x) for x in cfg.cmd[1:]]
@@ -294,32 +295,30 @@ def _server_descriptors(cfg: ServerConfig) -> List[SimpleNamespace]:
     else:
         raise RuntimeError(f"Server {cfg.alias}: invalid cmd; expected str or non-empty list[str].")
 
-    env = cfg.env or {}
+    # Ensure env and cwd ALWAYS exist
+    env = dict(os.environ)
+    if cfg.env:
+        env.update(cfg.env)
+    cwd = cfg.cwd or os.getcwd()
+
     variants = [
         SimpleNamespace(
-            command=cmd0, args=args, env=env, cwd=cfg.cwd,
+            command=cmd0, args=args, env=env, cwd=cwd,
             encoding="utf-8", stderr_encoding="utf-8",
             encoding_error_handler="replace",
             stderr_encoding_error_handler="replace",
         ),
         SimpleNamespace(
-            command=cmd0, args=args, env=env,
+            command=cmd0, args=args, env=env, cwd=cwd,
             encoding="utf-8", stderr_encoding="utf-8",
-            encoding_error_handler="replace",
-            stderr_encoding_error_handler="replace",
         ),
         SimpleNamespace(
-            command=cmd0, args=args, env=env,
+            command=cmd0, args=args, env=env, cwd=cwd,
             encoding="utf-8",
-            encoding_error_handler="replace",
-            stderr_encoding_error_handler="replace",
         ),
         SimpleNamespace(
-            command=cmd0, args=args,
-            encoding="utf-8",
-            encoding_error_handler="replace",
+            command=cmd0, args=args, env=env, cwd=cwd,
         ),
-        SimpleNamespace(command=cmd0, args=args),
     ]
     return variants
 
@@ -331,7 +330,7 @@ async def mcp_connect_stdio(cfg: ServerConfig) -> Any:
       B) stdio_client(cmd0, args)                                       (2-positional)
       C) stdio_client([cmd0] + args)                                    (1-positional list)
       D) stdio_client(cmd0)                                             (1-positional str)
-      E) stdio_client(server_descriptor_object)                          (object with .command, .args, ...)
+      E) stdio_client(server_descriptor_object)                          (object with .command, .args, .env, .cwd, ...)
 
     On success, returns an initialized MCPClientSession(session).
     On failure, raises with an aggregated diagnostics message of all attempts.
@@ -350,7 +349,11 @@ async def mcp_connect_stdio(cfg: ServerConfig) -> Any:
     else:
         cmd0, args = str(cfg.cmd), []
 
-    env = cfg.env or {}
+    env_kw = dict(os.environ)
+    if cfg.env:
+        env_kw.update(cfg.env)
+    cwd_kw = cfg.cwd or os.getcwd()
+
     attempts: List[str] = []
 
     async def _finalize(stdio_cm, rw):
@@ -370,7 +373,7 @@ async def mcp_connect_stdio(cfg: ServerConfig) -> Any:
 
     # Attempt A: keyword style (if supported)
     try:
-        stdio_cm = stdio_client(command=cmd0, args=args, env=env, cwd=cfg.cwd)  # type: ignore
+        stdio_cm = stdio_client(command=cmd0, args=args, env=env_kw, cwd=cwd_kw)  # type: ignore
         rw = await _enter_ctx(stdio_cm)
         return await _finalize(stdio_cm, rw)
     except Exception as e:
@@ -416,7 +419,7 @@ async def mcp_connect_stdio(cfg: ServerConfig) -> Any:
         except Exception:
             pass
 
-    # Attempt E: descriptor objects
+    # Attempt E: descriptor objects (with guaranteed env/cwd defaults)
     last_exc: Optional[BaseException] = None
     for desc in _server_descriptors(cfg):
         stdio_cm = None
@@ -432,7 +435,7 @@ async def mcp_connect_stdio(cfg: ServerConfig) -> Any:
             except Exception:
                 pass
 
-    detail = " | ".join(attempts[-5:])  # keep it compact
+    detail = " | ".join(attempts)  # include all attempts for clarity
     raise RuntimeError(f"Failed to open stdio_client for '{cfg.alias}': {detail}")
 
 async def mcp_list_tools_stdio(session) -> List[Dict[str, Any]]:
@@ -478,7 +481,7 @@ async def mcp_call_tool_stdio(session, tool_name: str, args: Dict[str, Any]) -> 
 
 app = FastAPI(
     title="MCP OpenAPI Bridge (Generic, Self-Discovering)",
-    version="5.4.0",
+    version="5.5.0",
     description=textwrap.dedent(
         """\
         A generic, self-discovering OpenAPI façade for MCP servers.
