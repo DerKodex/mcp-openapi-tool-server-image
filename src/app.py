@@ -4,15 +4,15 @@
 MCP OpenAPI Bridge — Generic, Self-Discovering (resilient)
 ----------------------------------------------------------
 - Discovers MCP servers + tools at runtime
-- Exposes generic and granular HTTP endpoints per tool
+- Exposes generic HTTP endpoints per tool
 - Calls succeed even if discovery hasn't populated a tool yet
-- Rich OpenAPI with x-* guidance and examples
+- OpenAPI is populated purely from MCP discovery (no domain-specific logic)
 
 Run:
   uvicorn app:app --host 0.0.0.0 --port 8080
 
 Env:
-  MCP_SERVERS='[{"alias":"mcp","mode":"stdio","cmd":["/path/to/mcp-server"]}]'
+  MCP_SERVERS='[{"alias":"mcp","mode":"stdio","cmd":["/path/to/mcp-server","--flag"]}]'
   MCP_DISCOVERY_WAIT=2
   MCP_FORWARD_URL='http://mcp-upstream:8080'   # OPTIONAL: REST bridge fallback
   MCP_RPC_URL='http://mcp-server:8080/mcp'     # OPTIONAL: raw MCP HTTP RPC
@@ -58,12 +58,6 @@ class ToolDescriptor(BaseModel):
     name: str
     description: Optional[str] = None
     input_schema: Optional[Dict[str, Any]] = None
-    inferred_actions: List[str] = Field(default_factory=list)
-    inferred_kinds: List[str] = Field(default_factory=list)
-    convenience_params: List[str] = Field(default_factory=list)
-    output_guidance: Dict[str, Any] = Field(default_factory=dict)
-    usage: Dict[str, Any] = Field(default_factory=dict)
-    natural_examples: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class ServerState:
@@ -91,22 +85,13 @@ DISCOVERY = DiscoveryState()
 MCP_FORWARD_URL = os.getenv("MCP_FORWARD_URL")  # Optional REST-forward target
 MCP_RPC_URL = os.getenv("MCP_RPC_URL")          # Optional raw MCP HTTP RPC
 
+
 # =============================================================================
 # Utilities
 # =============================================================================
 
-COMMON_K8S_KINDS = [
-    "pods", "pod", "deployments", "deployment",
-    "services", "nodes", "configmaps", "secrets",
-    "namespaces", "ingresses", "statefulsets", "daemonsets", "jobs"
-]
-
-CONVENIENCE_PARAMS = [
-    "namespace", "name", "labels", "labelSelector", "fieldSelector",
-    "container", "sinceSeconds"
-]
-
 def getenv_json(name: str, default: Any) -> Any:
+    """Parse an env var as JSON or return default."""
     val = os.getenv(name)
     if not val:
         return default
@@ -114,141 +99,6 @@ def getenv_json(name: str, default: Any) -> Any:
         return json.loads(val)
     except Exception:
         return default
-
-
-def parse_actions_from_description(desc: str) -> List[str]:
-    if not desc:
-        return []
-    actions = set()
-    for line in desc.splitlines():
-        m = re.search(r"^\s*-\s*([a-zA-Z0-9_-]+)\s*[:\-]", line)
-        if m:
-            actions.add(m.group(1).strip())
-    preferred = ["get", "describe", "logs", "events", "top", "exec", "cp",
-                 "cluster-info", "api-resources", "api-versions", "explain",
-                 "diff", "auth", "config"]
-    ordered = [a for a in preferred if a in actions]
-    for a in actions:
-        if a not in ordered:
-            ordered.append(a)
-    return ordered
-
-
-def infer_kinds_from_description(desc: str) -> List[str]:
-    if not desc:
-        return []
-    kinds = set()
-    for k in COMMON_K8S_KINDS:
-        if re.search(rf"\b{k}\b", desc):
-            kinds.add(k)
-    return [k for k in COMMON_K8S_KINDS if k in kinds]
-
-
-def schema_enums(schema: Dict[str, Any], field: str) -> List[str]:
-    try:
-        props = schema.get("properties", {})
-        if field in props and "enum" in props[field]:
-            return [str(v) for v in props[field]["enum"]]
-    except Exception:
-        pass
-    return []
-
-
-def build_k8s_output_guidance(tool_name: str) -> Dict[str, Any]:
-    return {
-        "preferredFormats": ["json", "yaml", "text"],
-        "notes": [
-            "For 'get' style operations, prefer `format=json` to inject `-o json` so output is machine-readable.",
-            "For 'describe', kubectl emits human text (no -o json). Treat it as unstructured text.",
-            "For 'logs', output is line-oriented text; do not expect JSON.",
-            "For 'api-resources'/'api-versions', `format=json` works when supported; otherwise text table."
-        ],
-        "parsingHints": {
-            "describe/pods (text)": {
-                "extract": [
-                    {"field": "name", "regex": r"^Name:\s+([^\s]+)"},
-                    {"field": "namespace", "regex": r"^Namespace:\s+([^\s]+)"},
-                    {"field": "node", "regex": r"^Node:\s+([^\s]+)"},
-                    {"field": "podIP", "regex": r"^IP:\s+([^\s]+)"},
-                    {"field": "phase", "regex": r"^Status:\s+([A-Za-z]+)"},
-                ],
-                "lineMode": True
-            },
-            "logs (text)": {
-                "extract": [
-                    {"field": "lines", "note": "Split by newline; may contain timestamps."}
-                ]
-            }
-        }
-    }
-
-
-def k8s_natural_examples(tool_name: str) -> List[Dict[str, Any]]:
-    return [
-        {
-            "intent": "List all pods in the vault namespace (machine-readable JSON)",
-            "calls": [
-                {"GET": f"/mcp/tool/{tool_name}/get/pods?namespace=vault&format=json"},
-                {"POST": f"/mcp/tool/{tool_name}/get/pods", "body": {"namespace": "vault"}, "query": {"format": "json"}},
-            ],
-            "notes": ["Use format=json to inject '-o json' when supported (e.g., kubectl get)."]
-        },
-        {
-            "intent": "Describe a pod (human text)",
-            "calls": [
-                {"GET": f"/mcp/tool/{tool_name}/describe/pods?namespace=vault&name=vault-0"},
-            ],
-            "notes": ["'describe' outputs unstructured text; see x-outputGuidance.parsingHints."]
-        },
-        {
-            "intent": "List namespaces",
-            "calls": [
-                {"GET": f"/mcp/tool/{tool_name}/get/namespaces?format=json"},
-            ],
-            "notes": ["Prefer JSON for machine parsing."]
-        }
-    ]
-
-
-def is_k8s_tool(name: str, desc: str) -> bool:
-    return bool(re.search(r"\bkubectl\b", desc or "") or name.startswith("kubectl_"))
-
-
-def compose_argstring(
-    args_str: Optional[str],
-    namespace: Optional[str] = None,
-    name: Optional[str] = None,
-    labels: Optional[str] = None,
-    labelSelector: Optional[str] = None,
-    fieldSelector: Optional[str] = None,
-    container: Optional[str] = None,
-    sinceSeconds: Optional[int] = None,
-) -> str:
-    parts: List[str] = []
-    if name:
-        parts.append(str(name))
-    if namespace:
-        parts.extend(["-n", namespace])
-
-    sel = labels or labelSelector
-    if sel:
-        parts.extend(["-l", sel])
-
-    if fieldSelector:
-        parts.extend(["--field-selector", fieldSelector])
-
-    if container:
-        parts.extend(["-c", container])
-
-    if sinceSeconds and sinceSeconds > 0:
-        parts.extend(["--since", f"{sinceSeconds}s"])
-
-    if args_str:
-        tail = str(args_str).strip()
-        if tail:
-            parts.append(tail)
-
-    return " ".join(parts).strip()
 
 
 # =============================================================================
@@ -262,9 +112,8 @@ async def _normalize_stdio_result(res):
     - Else if it's awaitable: await it.
     - Else return the instance.
     """
-    # Async context manager?
     if hasattr(res, "__aenter__"):
-        entered = res.__aenter__()  # may be awaitable
+        entered = res.__aenter__()
         if inspect.isawaitable(entered):
             client = await entered
         else:
@@ -275,86 +124,82 @@ async def _normalize_stdio_result(res):
             pass
         return client
 
-    # Awaitable/coroutine?
     if inspect.isawaitable(res):
         return await res
 
-    # Already-instantiated client
     return res
 
 
 async def mcp_connect_stdio(cfg: ServerConfig):
     """
-    Create an MCP stdio client across SDK variants without using any keyword-only
-    signatures (many older SDKs reject `command=` or `env=`).
+    Create an MCP stdio client across SDK variants while avoiding keyword-only
+    signatures (e.g., `command=`) and varargs forms (your SDK rejects them).
 
-    We try, in order:
-      1) stdio_client(argv: List[str], **maybe_env)
-      2) stdio_client(command: str, *args, **maybe_env)  [positional/varargs]
-    If the SDK rejects 'env=', we retry after temporarily injecting cfg.env into
-    os.environ for process spawn.
+    We try:
+      1) stdio_client(argv, env=...)      # if supported
+      2) stdio_client(argv) with process env temporarily injected
     """
     if not MCP_AVAILABLE:
         raise RuntimeError("MCP python SDK not installed. pip install mcp[stdio]")
     if not cfg.cmd:
         raise RuntimeError(f"Server {cfg.alias}: stdio mode requires 'cmd'.")
 
-    # --- Normalize cmd into (<str> command, [args] list)
+    # Build argv (list or str OK; prefer list if multiple parts)
     if isinstance(cfg.cmd, list):
         if not cfg.cmd:
             raise RuntimeError(f"Server {cfg.alias}: empty cmd list.")
-        _command, _args = str(cfg.cmd[0]), [str(x) for x in cfg.cmd[1:]]
+        argv = [str(x) for x in cfg.cmd]
+        argv_for_call = argv
+        if len(argv) == 1:
+            # some SDKs allow a single string; keep it a list to be safe
+            argv_for_call = argv  # list with 1 element
     elif isinstance(cfg.cmd, str):
-        _command, _args = cfg.cmd, []
+        argv_for_call = cfg.cmd  # single string
     else:
         raise RuntimeError(f"Server {cfg.alias}: cmd must be list[str] or str, got {type(cfg.cmd)}")
 
-    def _constructors(allow_env_kw: bool):
-        env_kw = {} if not allow_env_kw else {"env": (cfg.env or {})}
-
-        # 1) positional: argv list OR a single str if no args
-        def v_positional_list():
-            argv = [_command] + _args if _args else _command
-            return stdio_client(argv, **env_kw)
-
-        # 2) positional varargs: command, *args
-        def v_positional_varargs():
-            return stdio_client(_command, *_args, **env_kw)
-
-        return (v_positional_list, v_positional_varargs)
-
     last_exc: Optional[BaseException] = None
-    for allow_env_kw in (True, False):
-        # If env kw not allowed, inject env into process for the spawn
-        orig_env = None
-        if not allow_env_kw and cfg.env:
+
+    # Attempt with env kwarg first
+    try:
+        if cfg.env:
+            res = stdio_client(argv_for_call, env=cfg.env)
+        else:
+            res = stdio_client(argv_for_call)
+        client = await _normalize_stdio_result(res)
+        init = getattr(client, "initialize", None)
+        if callable(init):
+            maybe = init()
+            if inspect.isawaitable(maybe):
+                await maybe
+        return client
+    except TypeError as te:
+        # Likely "unexpected keyword argument 'env'"
+        last_exc = te
+    except Exception as e:
+        last_exc = e
+
+    # Retry by temporarily injecting env into os.environ and calling without env kw
+    orig_env = None
+    try:
+        if cfg.env:
             orig_env = os.environ.copy()
             os.environ.update(cfg.env)
-        try:
-            for ctor in _constructors(allow_env_kw):
-                try:
-                    res = ctor()
-                    client = await _normalize_stdio_result(res)
-                    # Ensure initialize() if provided
-                    init = getattr(client, "initialize", None)
-                    if callable(init):
-                        maybe = init()
-                        if inspect.isawaitable(maybe):
-                            await maybe
-                    return client
-                except TypeError as te:
-                    # signature mismatch (e.g., env not supported or wrong positional type)
-                    last_exc = te
-                    continue
-                except Exception as e:
-                    last_exc = e
-                    continue
-        finally:
-            if orig_env is not None:
-                os.environ.clear()
-                os.environ.update(orig_env)
-
-    raise RuntimeError(f"Failed to create stdio MCP client for '{cfg.alias}': {last_exc}")
+        res = stdio_client(argv_for_call)
+        client = await _normalize_stdio_result(res)
+        init = getattr(client, "initialize", None)
+        if callable(init):
+            maybe = init()
+            if inspect.isawaitable(maybe):
+                await maybe
+        return client
+    except Exception as e:
+        last_exc = e
+        raise RuntimeError(f"Failed to create stdio MCP client for '{cfg.alias}': {last_exc}")
+    finally:
+        if orig_env is not None:
+            os.environ.clear()
+            os.environ.update(orig_env)
 
 
 async def mcp_list_tools(session) -> List[Dict[str, Any]]:
@@ -395,7 +240,6 @@ async def rpc_try_methods(client: httpx.AsyncClient, url: str, candidates: List[
     for payload in candidates:
         try:
             r = await client.post(url, json=payload, timeout=60)
-            # Accept both 200 and 207 (multi-status) if some servers use it
             if r.status_code in (200, 207):
                 data = r.json()
                 return data
@@ -404,6 +248,7 @@ async def rpc_try_methods(client: httpx.AsyncClient, url: str, candidates: List[
     if last_exc:
         raise last_exc
     raise RuntimeError("No RPC method variant succeeded")
+
 
 async def mcp_http_list_tools() -> List[Dict[str, Any]]:
     """
@@ -420,7 +265,6 @@ async def mcp_http_list_tools() -> List[Dict[str, Any]]:
             {"method": "tool/list", "params": {}},
             {"method": "tools.list", "params": {}},
         ])
-    # Normalize plausible shapes
     tools = []
     container = data.get("result", data)
     for t in container.get("tools", []):
@@ -437,6 +281,7 @@ async def mcp_http_list_tools() -> List[Dict[str, Any]]:
         })
     return tools
 
+
 async def mcp_http_call_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     """
     Minimal call_tool over HTTP RPC to MCP_RPC_URL.
@@ -452,8 +297,6 @@ async def mcp_http_call_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, 
             {"method": "tool/call", "params": {"name": tool_name, "arguments": args}},
             {"method": "tools.call", "params": {"name": tool_name, "arguments": args}},
         ])
-
-    # Normalize to the same shape stdio path returns
     container = data.get("result", data)
     content = container.get("content") or container.get("contents") or []
     normalized = {"type": "mcp_result", "content": []}
@@ -462,10 +305,8 @@ async def mcp_http_call_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, 
             if item.get("type") == "text" and "text" in item:
                 normalized["content"].append({"type": "text", "text": item["text"]})
             else:
-                # pass through other content types
                 normalized["content"].append(item)
         else:
-            # fallback string payload
             normalized["content"].append({"type": "text", "text": str(item)})
     return normalized
 
@@ -476,15 +317,13 @@ async def mcp_http_call_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, 
 
 app = FastAPI(
     title="MCP OpenAPI Bridge (Generic, Self-Discovering)",
-    version="3.1.10",
+    version="4.0.0",
     description=textwrap.dedent(
         """\
         A generic, self-discovering OpenAPI façade for MCP servers.
-        It discovers tools, prompts, and resources from MCP and exposes:
-        • One generic GET/POST endpoint per tool
-        • Auto-generated granular endpoints for each `action`/`kind` combo
-        All endpoints accept GET (query) and POST (JSON); request bodies are optional.
-        Use `{}` for empty POST bodies. If you cannot send a body, use GET with `?args={...}` or `?key=value`.
+        It discovers tools (and their JSON Schemas) from MCP and exposes a generic
+        GET/POST endpoint per tool. Requests are passed through without any
+        domain-specific transformations or assumptions.
         """
     ),
     servers=[{"url": "http://localhost:8080"}],
@@ -497,7 +336,7 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"],
 )
 
-# --- Path normalizer
+# --- Path normalizer (keeps legacy paths working, but generic)
 @app.middleware("http")
 async def normalize_odd_paths(request: Request, call_next):
     raw_path = request.scope.get("path") or ""
@@ -545,7 +384,6 @@ async def on_shutdown():
                 if ctx and hasattr(ctx, "__aexit__"):
                     await ctx.__aexit__(None, None, None)
         except Exception:
-            # Don’t let shutdown be noisy
             pass
 
 
@@ -569,7 +407,7 @@ async def do_discover(wait_seconds: int = 0) -> Dict[str, Any]:
     for alias, st in list(DISCOVERY.servers.items()):
         tools_raw: List[Dict[str, Any]] = []
 
-        # ---- Try stdio path, but never bail if it fails
+        # ---- Try stdio path
         if st.cfg.mode == "stdio" and st.cfg.cmd:
             try:
                 if not st.connected:
@@ -594,40 +432,13 @@ async def do_discover(wait_seconds: int = 0) -> Dict[str, Any]:
             except Exception as e:
                 print(f"[discover:http-rpc] list_tools failed via {MCP_RPC_URL}: {e}", file=sys.stderr)
 
-        # ---- Update local tool cache
+        # ---- Update local tool cache (generic only)
         st.tools.clear()
         for tr in tools_raw:
             name = tr["name"]
             desc = tr.get("description") or ""
             schema = tr.get("input_schema") or {}
-            td = ToolDescriptor(
-                name=name,
-                description=desc,
-                input_schema=schema,
-                convenience_params=[p for p in CONVENIENCE_PARAMS if p in (schema.get("properties") or {})]
-            )
-            td.inferred_actions = schema_enums(schema, "operation") or parse_actions_from_description(desc)
-            kinds_from_schema = schema_enums(schema, "resource")
-            if kinds_from_schema:
-                td.inferred_kinds = kinds_from_schema
-            elif is_k8s_tool(name, desc):
-                td.inferred_kinds = infer_kinds_from_description(desc)
-            if is_k8s_tool(name, desc):
-                td.output_guidance = build_k8s_output_guidance(name)
-                td.natural_examples = k8s_natural_examples(name)
-            td.usage = {
-                "schema": {
-                    "type": "object",
-                    "fields": {
-                        "args": {"required": True, "type": "string", "description": "Operation-specific arguments / flags"},
-                        "operation": {"required": True, "type": "string"},
-                        "resource": {"required": True, "type": "string"},
-                    },
-                    "requiredFields": ["args", "operation", "resource"]
-                },
-                "argstringRequired": True,
-            }
-            st.tools[name] = td
+            st.tools[name] = ToolDescriptor(name=name, description=desc, input_schema=schema)
 
     if wait_seconds > 0:
         await asyncio.sleep(min(wait_seconds, 10))
@@ -677,40 +488,22 @@ async def discovery_status():
 
 
 # =============================================================================
-# OpenAPI enrichment
+# OpenAPI enrichment (generic)
 # =============================================================================
 
 def openapi_extra_blocks() -> Dict[str, Any]:
     x_model_instructions = {
-        "callDiscipline": [
-            "Use **GET with query** or **POST with JSON**. If no args, POST `{}`.",
-            "Prefer granular endpoints `/{SERVER}/tool/{TOOL}/{action}[/{kind}]` when actions/kinds are available.",
-            "If the tool requires `args` (string), you can either provide it directly OR pass convenience params; the bridge will compose the argstring.",
-            "Use `format=json|yaml|text` to influence output; json/yaml injects '-o' when supported.",
-            "Use `dryrun=true` to preview the composed MCP call."
-        ],
-        "bodyShapes": [
-            "Direct body: `{ ... }`",
-            "Wrapped body: `{ \"args\": { ... } }`"
+        "usage": [
+            "Use **GET** with `?args={...}` (JSON-encoded) or **POST** with a JSON body.",
+            "If the tool expects no arguments, send POST `{}`.",
+            "This bridge does not modify arguments; it forwards them as-is to MCP.",
+            "Use `/mcp/tool/{tool}/schema` to inspect the input schema discovered from MCP."
         ],
         "discovery": [
             "List tools: `GET /{SERVER}/tools/list`.",
             "Per-tool schema: `GET /{SERVER}/tool/{TOOL}/schema`.",
-            "Per-tool example: `GET /{SERVER}/tool/{TOOL}/example`.",
-            "Per-tool help: `GET /{SERVER}/tool/{TOOL}/help`.",
+            "Per-tool help (generic): `GET /{SERVER}/tool/{TOOL}/help`.",
             "Zero-argument test: `GET /{SERVER}/tool/{TOOL}/try`."
-        ],
-        "typicalFlow": [
-            "1) Read `/openapi.json` and `/discovery/status`.",
-            "2) Choose a tool whose schema/description matches the user request.",
-            "3) Use a granular path when available (e.g., `/get/pods`).",
-            "4) Prefer `format=json` for machine-readable results when available."
-        ],
-        "errorFix": [
-            "If you see 'expected a request body', use GET or POST `{}`.",
-            "If a tool needs `args` (string): either send it, or pass convenience params like `namespace`, `name`, etc.",
-            "If you see a schema error, inspect `/schema`, `/example`, or try a granular endpoint.",
-            "If parsing text, leverage `x-outputGuidance.parsingHints`."
         ]
     }
 
@@ -722,7 +515,7 @@ def openapi_extra_blocks() -> Dict[str, Any]:
                 "tool": tname,
                 "description": td.description,
                 "schema": td.input_schema or {"type": "object"},
-                "requiredFields": td.usage.get("schema", {}).get("requiredFields", []),
+                "requiredFields": (td.input_schema or {}).get("required", []),
             })
 
     return {
@@ -770,35 +563,8 @@ async def forward_via_http(server: str, tool_path: str, method: str, params: Dic
 
 
 # =============================================================================
-# Generic + Granular Tool Dispatch
+# Generic Tool Dispatch (no domain logic, no inference)
 # =============================================================================
-
-async def resolve_arg_payload(
-    payload: Optional[Dict[str, Any]],
-    query_args_str: Optional[str],
-    convenience: Dict[str, Any],
-    format_hint: Optional[str]
-) -> Dict[str, Any]:
-    args_obj = (payload or {}).copy()
-    argstring = compose_argstring(
-        args_str=query_args_str or args_obj.get("args", ""),
-        namespace=convenience.get("namespace", args_obj.get("namespace")),
-        name=convenience.get("name", args_obj.get("name")),
-        labels=convenience.get("labels", args_obj.get("labels")),
-        labelSelector=convenience.get("labelSelector", args_obj.get("labelSelector")),
-        fieldSelector=convenience.get("fieldSelector", args_obj.get("fieldSelector")),
-        container=convenience.get("container", args_obj.get("container")),
-        sinceSeconds=convenience.get("sinceSeconds", args_obj.get("sinceSeconds")),
-    )
-    operation = args_obj.get("operation") or convenience.get("operation")
-    if format_hint in ("json", "yaml"):
-        if operation in (None, "get", "api-resources", "api-versions"):
-            if not re.search(r"\s\-o\s+(json|yaml)\b", argstring):
-                argstring = (argstring + f" -o {format_hint}").strip()
-    if argstring:
-        args_obj["args"] = argstring
-    return args_obj
-
 
 async def ensure_connected(server: str) -> ServerState:
     st = DISCOVERY.servers.get(server)
@@ -822,223 +588,94 @@ async def ensure_connected(server: str) -> ServerState:
 
 async def do_tool_call(
     server: str,
-    tool_path: str,
+    tool_name: str,
     body: Optional[Dict[str, Any]],
-    query_args_fallback: Optional[str],
+    qargs: Optional[str],
     dryrun: bool,
-    format_hint: Optional[str],
 ) -> Any:
-    # Try stdio; if not available and MCP_RPC_URL is set, we’ll use HTTP RPC.
-    st: Optional[ServerState] = None
-    try:
-        st = await ensure_connected(server)
-    except HTTPException as e:
-        if e.status_code != 503 or not MCP_RPC_URL:
-            raise
-        # stdio not connected; execute via HTTP RPC below
-        print(f"[rpc-fallback] Using MCP_RPC_URL={MCP_RPC_URL} for '{tool_path}'", file=sys.stderr)
-
-    components = tool_path.split("/")
-    tool = components[0]
-    suffix = "/".join(components[1:]) if len(components) > 1 else ""
-
-    td = (st.tools.get(tool) if st else None)
-    if st and not td:
-        print(f"[dispatch] Tool '{tool}' not in cache for server '{st.cfg.alias}'. Refreshing discovery...", file=sys.stderr)
-        await do_discover(wait_seconds=0)
-        td = DISCOVERY.servers.get(st.cfg.alias, st).tools.get(tool)
-
-    # helper endpoints (schema/example/help) remain stdio/discovery-based
-    if suffix in ("schema", "example", "help"):
-        if td:
-            if suffix == "schema":
-                return td.input_schema or {}
-            if suffix == "example":
-                return {"naturalExamples": td.natural_examples}
-            if suffix == "help":
-                return {
-                    "name": tool,
-                    "description": td.description,
-                    "inferred_actions": td.inferred_actions,
-                    "inferred_kinds": td.inferred_kinds,
-                    "convenience_params": td.convenience_params,
-                    "outputGuidance": td.output_guidance,
-                    "usage": td.usage
-                }
-        if suffix == "schema":
-            return {}
-        if suffix == "example":
-            return {"naturalExamples": []}
-        if suffix == "help":
-            return {
-                "name": tool, "description": "", "inferred_actions": [], "inferred_kinds": [],
-                "convenience_params": CONVENIENCE_PARAMS, "outputGuidance": {}, "usage": {}
-            }
-
-    if suffix == "try":
-        if dryrun:
-            return {"dryrun": True, "tool": tool, "args": {}}
-        if st:
-            return await mcp_call_tool(st.client, tool, {})
-        # HTTP RPC fallback
-        return await mcp_http_call_tool(tool, {})
-
-    args = {}
-    convenience = {}
-    if suffix and suffix not in ("invoke",):
-        parts = suffix.split("/")
-        action = parts[0]
-        kind = parts[1] if len(parts) > 1 else ""
-        args["operation"] = action
-        args["resource"] = kind
-
-    body = body or {}
-    if "args" in body and isinstance(body["args"], dict) and any(k in body["args"] for k in ["operation", "resource", "args"]):
-        args.update(body.get("args", {}))
+    # Prepare arguments exactly as provided
+    if body is None:
+        # If ?args= is provided and is NOT JSON, pass it as {"args": "<string>"}
+        # If it is JSON and parses to a dict, pass that dict.
+        if qargs is not None:
+            try:
+                parsed = json.loads(qargs)
+                args = parsed if isinstance(parsed, dict) else {"args": parsed}
+            except Exception:
+                args = {"args": qargs}
+        else:
+            args = {}
     else:
-        args.update(body)
-
-    for p in CONVENIENCE_PARAMS + ["operation", "resource"]:
-        if p in body:
-            convenience[p] = body[p]
-
-    final_args = await resolve_arg_payload(args, query_args_fallback, convenience, format_hint)
-
-    if td and "operation" not in final_args and td.inferred_actions:
-        final_args["operation"] = td.inferred_actions[0]
-    if td and "resource" not in final_args and td.inferred_kinds:
-        final_args["resource"] = td.inferred_kinds[0]
+        args = body
 
     if dryrun:
-        print(f"[dryrun] server={server} tool={tool} suffix='{suffix}' final_args={final_args}", file=sys.stderr)
-        return {"dryrun": True, "server": server, "tool": tool, "final_args": final_args}
+        return {"dryrun": True, "server": server, "tool": tool_name, "args": args}
 
-    # Execute via stdio if available, else via HTTP RPC
+    # Try stdio first; on 503, caller may forward via HTTP if configured
     try:
-        if st:
-            print(f"[invoke-stdio] server={st.cfg.alias} tool={tool} suffix='{suffix}' final_args={final_args}", file=sys.stderr)
-            return await mcp_call_tool(st.client, tool, final_args)
-        else:
-            print(f"[invoke-http-rpc] url={MCP_RPC_URL} tool={tool} suffix='{suffix}' final_args={final_args}", file=sys.stderr)
-            return await mcp_http_call_tool(tool, final_args)
-    except Exception as e:
-        raise HTTPException(502, f"Tool invocation failed for '{tool_path}': {e}")
+        st = await ensure_connected(server)
+        return await mcp_call_tool(st.client, tool_name, args)
+    except HTTPException as e:
+        if e.status_code == 503 and MCP_RPC_URL:
+            # Fallback to HTTP RPC
+            print(f"[invoke-http-rpc] url={MCP_RPC_URL} tool={tool_name} args={args}", file=sys.stderr)
+            return await mcp_http_call_tool(tool_name, args)
+        raise
 
-
-# =============================================================================
-# Generic dispatchers (with existing REST fallback on 503)
-# =============================================================================
 
 @app.post(
-    "/{server}/tool/{tool_path:path}",
+    "/{server}/tool/{tool_name:path}",
     tags=["tools"],
-    summary="Tool Dispatch",
+    summary="Tool Dispatch (POST)",
     responses={200: {"description": "Successful Response", "content": {"application/json": {}}}},
 )
 async def tool_dispatch_post(
     server: str = Path(..., description="Server alias (e.g., 'mcp')"),
-    tool_path: str = Path(..., description="Tool or tool path like 'kubectl_resources/get/pods'"),
-    args: Optional[str] = Query(None, description="JSON-encoded args fallback"),
+    tool_name: str = Path(..., description="Exact tool name as exposed by MCP"),
     dryrun: Optional[bool] = Query(False, description="If true, returns the would-be MCP call without executing it"),
-    format: Optional[str] = Query(None, description="Output preference: json|yaml|text (adds '-o json|yaml' when supported)"),
     body: Optional[Dict[str, Any]] = Body(None),
 ):
-    qargs = None
-    if args:
-        try:
-            qargs = json.loads(args)
-        except Exception:
-            qargs = args
-    payload_body = body or (qargs if isinstance(qargs, dict) else None)
-
     try:
-        result = await do_tool_call(server, tool_path, payload_body, None, bool(dryrun), format)
+        result = await do_tool_call(server, tool_name, body, None, bool(dryrun))
         return JSONResponse(result)
     except HTTPException as e:
         if e.status_code == 503 and MCP_FORWARD_URL:
+            # REST forward fallback
             params: Dict[str, Any] = {}
-            if format is not None:
-                params["format"] = format
             if dryrun:
                 params["dryrun"] = dryrun
-            if isinstance(qargs, str):
-                params["args"] = qargs
-            return await forward_via_http(server, tool_path, "POST", params, payload_body)
+            return await forward_via_http(server, tool_name, "POST", params, body or {})
         raise
 
 
 @app.get(
-    "/{server}/tool/{tool_path:path}",
+    "/{server}/tool/{tool_name:path}",
     tags=["tools"],
-    summary="Tool Dispatch",
+    summary="Tool Dispatch (GET)",
     responses={200: {"description": "Successful Response", "content": {"application/json": {}}}},
 )
 async def tool_dispatch_get(
     server: str = Path(..., description="Server alias (e.g., 'mcp')"),
-    tool_path: str = Path(..., description="Tool or tool path like 'kubectl_resources/get/pods'"),
-    args: Optional[str] = Query(None, description="JSON-encoded args fallback"),
+    tool_name: str = Path(..., description="Exact tool name as exposed by MCP"),
     dryrun: Optional[bool] = Query(False, description="If true, returns the would-be MCP call without executing it"),
-    format: Optional[str] = Query(None, description="Output preference: json|yaml|text (adds '-o json|yaml' when supported)"),
-    namespace: Optional[str] = Query(None),
-    name: Optional[str] = Query(None),
-    labels: Optional[str] = Query(None),
-    labelSelector: Optional[str] = Query(None),
-    fieldSelector: Optional[str] = Query(None),
-    container: Optional[str] = Query(None),
-    sinceSeconds: Optional[int] = Query(None),
+    args: Optional[str] = Query(None, description="JSON-encoded arguments; if not JSON, will be passed as {'args': '<raw>'}"),
 ):
-    qargs_fallback = None
-    if args:
-        try:
-            data = json.loads(args)
-            if isinstance(data, dict):
-                body = data
-            else:
-                body = {}
-                qargs_fallback = args
-        except Exception:
-            body = {}
-            qargs_fallback = args
-    else:
-        body = {}
-
-    for k, v in {
-        "namespace": namespace, "name": name, "labels": labels,
-        "labelSelector": labelSelector, "fieldSelector": fieldSelector,
-        "container": container, "sinceSeconds": sinceSeconds,
-    }.items():
-        if v is not None:
-            body[k] = v
-
+    body = None  # GET has no body
     try:
-        result = await do_tool_call(server, tool_path, body, qargs_fallback, bool(dryrun), format)
+        result = await do_tool_call(server, tool_name, body, args, bool(dryrun))
         return JSONResponse(result)
     except HTTPException as e:
         if e.status_code == 503 and MCP_FORWARD_URL:
             params: Dict[str, Any] = {}
-            if format is not None:
-                params["format"] = format
             if dryrun:
                 params["dryrun"] = dryrun
             if args is not None:
                 params["args"] = args
-            for k in ("namespace","name","labels","labelSelector","fieldSelector","container","sinceSeconds"):
-                if k in body:
-                    params[k] = body[k]
-            return await forward_via_http(server, tool_path, "GET", params, None)
+            return await forward_via_http(server, tool_name, "GET", params, None)
         raise
 
 
-# -------------------- explicit granular routes (add any custom ones here) --------------------
-
-
-# =============================================================================
-# Per-tool helper endpoints
-# =============================================================================
-
-@app.get("/mcp/tool/{tool}/invoke", tags=["tools", "invoke"], summary="Invoke (GET /invoke)")
-async def tool_invoke_get(tool: str, **kwargs):
-    return await tool_dispatch_get(server="mcp", tool_path=f"{tool}/invoke", **kwargs)
+# -------------------- helper endpoints (generic) --------------------
 
 @app.get("/mcp/tool/{tool}/schema", tags=["tools", "schema"], summary="Tool schema")
 async def tool_schema(tool: str):
@@ -1047,41 +684,32 @@ async def tool_schema(tool: str):
         return {}
     return st.tools[tool].input_schema or {}
 
-@app.get("/mcp/tool/{tool}/example", tags=["tools", "example"], summary="Tool example")
-async def tool_example(tool: str):
-    st = DISCOVERY.servers.get("mcp")
-    if not st or tool not in st.tools:
-        return {"naturalExamples": []}
-    return {"naturalExamples": st.tools[tool].natural_examples}
-
-@app.get("/mcp/tool/{tool}/help", tags=["tools", "help"], summary="Tool help")
+@app.get("/mcp/tool/{tool}/help", tags=["tools", "help"], summary="Tool help (generic)")
 async def tool_help(tool: str):
     st = DISCOVERY.servers.get("mcp")
     if not st or tool not in st.tools:
         return {
             "name": tool,
             "description": "",
-            "inferred_actions": [],
-            "inferred_kinds": [],
-            "convenience_params": CONVENIENCE_PARAMS,
-            "outputGuidance": {},
-            "usage": {}
+            "notes": [
+                "Arguments are forwarded to the MCP tool exactly as you send them.",
+                "Use /mcp/tool/{tool}/schema to inspect expected fields."
+            ],
         }
     td = st.tools[tool]
     return {
         "name": tool,
         "description": td.description,
-        "inferred_actions": td.inferred_actions,
-        "inferred_kinds": td.inferred_kinds,
-        "convenience_params": td.convenience_params,
-        "outputGuidance": td.output_guidance,
-        "usage": td.usage
+        "notes": [
+            "Arguments are forwarded to the MCP tool exactly as you send them.",
+            "Use /mcp/tool/{tool}/schema to inspect expected fields."
+        ],
     }
 
 @app.get("/mcp/tool/{tool}/try", tags=["tools", "try"], summary="Tool zero-arg try",
          description="Calls this tool with `{}` (no arguments).")
 async def tool_try(tool: str, dryrun: Optional[bool] = Query(False)):
-    return await tool_dispatch_get(server="mcp", tool_path=f"{tool}/try", dryrun=dryrun)
+    return await tool_dispatch_get(server="mcp", tool_name=tool, dryrun=dryrun)
 
 
 # =============================================================================
