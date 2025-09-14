@@ -22,7 +22,6 @@ import asyncio
 import inspect
 import json
 import os
-import re
 import sys
 import textwrap
 from typing import Any, Dict, List, Optional
@@ -131,15 +130,18 @@ async def _normalize_stdio_result(res):
 async def mcp_connect_stdio(cfg: ServerConfig):
     """
     Create an MCP stdio client across SDK variants while avoiding keyword-only
-    signatures. We try a minimal, safe set of shapes in this order:
+    signatures and avoiding argv/list forms entirely.
 
-      A) stdio_client(SimpleNamespace(command=<str>, args=<list>, env=<dict|None>))
-      B) stdio_client(SimpleNamespace(command=<str>, args=<list>)) with env injected into os.environ
-      C) stdio_client([command] + args) with env injected into os.environ
-      D) stdio_client(command)              (only when no args) with env injected
+    We call stdio_client with a single positional "spec"-like object that exposes:
+      - .command: str
+      - .args: list[str]
+      - .env: Optional[dict[str,str]]
 
-    We avoid passing keyword args like command=/args=/env= directly since your
-    SDK rejected them earlier, and we avoid extra positional args.
+    Order:
+      A) stdio_client(SimpleNamespace(command, args, env))
+      B) stdio_client(SimpleNamespace(command, args)) with env injected into os.environ
+
+    We do NOT try list/string variants to prevent "'list' object has no attribute 'command'".
     """
     if not MCP_AVAILABLE:
         raise RuntimeError("MCP python SDK not installed. pip install mcp[stdio]")
@@ -161,7 +163,7 @@ async def mcp_connect_stdio(cfg: ServerConfig):
     # Variant A: pass a 'spec'-like object as single positional arg (with env attr)
     try:
         spec = SimpleNamespace(command=_command, args=_args, env=(cfg.env or None))
-        res = stdio_client(spec)
+        res = stdio_client(spec)  # one positional argument
         client = await _normalize_stdio_result(res)
         init = getattr(client, "initialize", None)
         if callable(init):
@@ -172,55 +174,24 @@ async def mcp_connect_stdio(cfg: ServerConfig):
     except Exception as e:
         last_exc = e
 
-    # Variants B/C/D: temporarily inject env into process and try argv/list forms
+    # Variant B: temporarily inject env into process and pass spec without env attribute
     orig_env = None
     try:
         if cfg.env:
             orig_env = os.environ.copy()
             os.environ.update(cfg.env)
 
-        # Variant B: spec without env attribute (for SDKs that ignore spec.env)
-        try:
-            spec2 = SimpleNamespace(command=_command, args=_args)
-            res = stdio_client(spec2)
-            client = await _normalize_stdio_result(res)
-            init = getattr(client, "initialize", None)
-            if callable(init):
-                maybe = init()
-                if inspect.isawaitable(maybe):
-                    await maybe
-            return client
-        except Exception as e2:
-            last_exc = e2
-
-        # Variant C: pass argv list
-        try:
-            argv = [_command] + _args
-            res = stdio_client(argv)
-            client = await _normalize_stdio_result(res)
-            init = getattr(client, "initialize", None)
-            if callable(init):
-                maybe = init()
-                if inspect.isawaitable(maybe):
-                    await maybe
-            return client
-        except Exception as e3:
-            last_exc = e3
-
-        # Variant D: pass single string (only when no args)
-        try:
-            if not _args:
-                res = stdio_client(_command)
-                client = await _normalize_stdio_result(res)
-                init = getattr(client, "initialize", None)
-                if callable(init):
-                    maybe = init()
-                    if inspect.isawaitable(maybe):
-                        await maybe
-                return client
-        except Exception as e4:
-            last_exc = e4
-
+        spec2 = SimpleNamespace(command=_command, args=_args)
+        res = stdio_client(spec2)  # still one positional argument
+        client = await _normalize_stdio_result(res)
+        init = getattr(client, "initialize", None)
+        if callable(init):
+            maybe = init()
+            if inspect.isawaitable(maybe):
+                await maybe
+        return client
+    except Exception as e2:
+        last_exc = e2
         raise RuntimeError(f"Failed to create stdio MCP client for '{cfg.alias}': {last_exc}")
     finally:
         if orig_env is not None:
@@ -230,12 +201,25 @@ async def mcp_connect_stdio(cfg: ServerConfig):
 
 async def mcp_list_tools(session) -> List[Dict[str, Any]]:
     result = await session.list_tools()
+    # Accept either an object with .tools or a plain list
+    raw_tools = getattr(result, "tools", result)
     tools = []
-    for t in result.tools:
+    for t in raw_tools:
+        name = getattr(t, "name", None) or t.get("name")
+        if not name:
+            continue
+        description = getattr(t, "description", None)
+        if description is None and isinstance(t, dict):
+            description = t.get("description", "")
+        schema_obj = getattr(t, "inputSchema", None)
+        if schema_obj is None and isinstance(t, dict):
+            schema_obj = t.get("inputSchema") or t.get("input_schema") or {}
+        if hasattr(schema_obj, "model_dump"):
+            schema_obj = schema_obj.model_dump()
         tools.append({
-            "name": t.name,
-            "description": getattr(t, "description", "") or "",
-            "input_schema": t.inputSchema.model_dump() if getattr(t, "inputSchema", None) else {}
+            "name": name,
+            "description": description or "",
+            "input_schema": schema_obj or {}
         })
     return tools
 
@@ -243,11 +227,12 @@ async def mcp_list_tools(session) -> List[Dict[str, Any]]:
 async def mcp_call_tool(session, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     call = await session.call_tool(tool_name, args)
     normalized = {"type": "mcp_result", "content": []}
-    for item in call.content:
+    content_seq = getattr(call, "content", None) or call
+    for item in content_seq:
         if isinstance(item, TextContent):
             normalized["content"].append({"type": "text", "text": item.text})
         else:
-            payload = item.model_dump() if hasattr(item, "model_dump") else {}
+            payload = item.model_dump() if hasattr(item, "model_dump") else (item if isinstance(item, dict) else {})
             ctype = payload.get("type") or "unknown"
             normalized["content"].append(payload if ctype != "unknown" else {"type": "unknown", "data": payload})
     return normalized
@@ -277,10 +262,6 @@ async def rpc_try_methods(client: httpx.AsyncClient, url: str, candidates: List[
 
 
 async def mcp_http_list_tools() -> List[Dict[str, Any]]:
-    """
-    Minimal list_tools over HTTP RPC to MCP_RPC_URL.
-    We try a few common method names used by streamable-http servers.
-    """
     if not MCP_RPC_URL:
         return []
     rpc_url = MCP_RPC_URL.rstrip("/")
@@ -309,10 +290,6 @@ async def mcp_http_list_tools() -> List[Dict[str, Any]]:
 
 
 async def mcp_http_call_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Minimal call_tool over HTTP RPC to MCP_RPC_URL.
-    Tries a few method names, normalizes common content shapes.
-    """
     if not MCP_RPC_URL:
         raise RuntimeError("MCP_RPC_URL not set")
     rpc_url = MCP_RPC_URL.rstrip("/")
@@ -343,7 +320,7 @@ async def mcp_http_call_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, 
 
 app = FastAPI(
     title="MCP OpenAPI Bridge (Generic, Self-Discovering)",
-    version="4.1.0",
+    version="4.1.1",
     description=textwrap.dedent(
         """\
         A generic, self-discovering OpenAPI façade for MCP servers.
@@ -362,7 +339,7 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"],
 )
 
-# --- Path normalizer (keeps legacy paths working, but generic)
+# --- Path normalizer (generic legacy compatibility)
 @app.middleware("http")
 async def normalize_odd_paths(request: Request, call_next):
     raw_path = request.scope.get("path") or ""
