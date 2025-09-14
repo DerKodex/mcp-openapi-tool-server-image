@@ -27,6 +27,7 @@ import sys
 import textwrap
 from typing import Any, Dict, List, Optional
 from urllib.parse import unquote
+from types import SimpleNamespace
 
 import httpx
 from fastapi import FastAPI, Body, Query, Path, HTTPException, Request
@@ -114,10 +115,7 @@ async def _normalize_stdio_result(res):
     """
     if hasattr(res, "__aenter__"):
         entered = res.__aenter__()
-        if inspect.isawaitable(entered):
-            client = await entered
-        else:
-            client = entered
+        client = await entered if inspect.isawaitable(entered) else entered
         try:
             setattr(client, "__mcp_ctx__", res)  # keep ctx for graceful shutdown
         except Exception:
@@ -133,39 +131,37 @@ async def _normalize_stdio_result(res):
 async def mcp_connect_stdio(cfg: ServerConfig):
     """
     Create an MCP stdio client across SDK variants while avoiding keyword-only
-    signatures (e.g., `command=`) and varargs forms (your SDK rejects them).
+    signatures. We try a minimal, safe set of shapes in this order:
 
-    We try:
-      1) stdio_client(argv, env=...)      # if supported
-      2) stdio_client(argv) with process env temporarily injected
+      A) stdio_client(SimpleNamespace(command=<str>, args=<list>, env=<dict|None>))
+      B) stdio_client(SimpleNamespace(command=<str>, args=<list>)) with env injected into os.environ
+      C) stdio_client([command] + args) with env injected into os.environ
+      D) stdio_client(command)              (only when no args) with env injected
+
+    We avoid passing keyword args like command=/args=/env= directly since your
+    SDK rejected them earlier, and we avoid extra positional args.
     """
     if not MCP_AVAILABLE:
         raise RuntimeError("MCP python SDK not installed. pip install mcp[stdio]")
     if not cfg.cmd:
         raise RuntimeError(f"Server {cfg.alias}: stdio mode requires 'cmd'.")
 
-    # Build argv (list or str OK; prefer list if multiple parts)
+    # Normalize command + args
     if isinstance(cfg.cmd, list):
         if not cfg.cmd:
             raise RuntimeError(f"Server {cfg.alias}: empty cmd list.")
-        argv = [str(x) for x in cfg.cmd]
-        argv_for_call = argv
-        if len(argv) == 1:
-            # some SDKs allow a single string; keep it a list to be safe
-            argv_for_call = argv  # list with 1 element
+        _command, _args = str(cfg.cmd[0]), [str(x) for x in cfg.cmd[1:]]
     elif isinstance(cfg.cmd, str):
-        argv_for_call = cfg.cmd  # single string
+        _command, _args = cfg.cmd, []
     else:
         raise RuntimeError(f"Server {cfg.alias}: cmd must be list[str] or str, got {type(cfg.cmd)}")
 
     last_exc: Optional[BaseException] = None
 
-    # Attempt with env kwarg first
+    # Variant A: pass a 'spec'-like object as single positional arg (with env attr)
     try:
-        if cfg.env:
-            res = stdio_client(argv_for_call, env=cfg.env)
-        else:
-            res = stdio_client(argv_for_call)
+        spec = SimpleNamespace(command=_command, args=_args, env=(cfg.env or None))
+        res = stdio_client(spec)
         client = await _normalize_stdio_result(res)
         init = getattr(client, "initialize", None)
         if callable(init):
@@ -173,28 +169,58 @@ async def mcp_connect_stdio(cfg: ServerConfig):
             if inspect.isawaitable(maybe):
                 await maybe
         return client
-    except TypeError as te:
-        # Likely "unexpected keyword argument 'env'"
-        last_exc = te
     except Exception as e:
         last_exc = e
 
-    # Retry by temporarily injecting env into os.environ and calling without env kw
+    # Variants B/C/D: temporarily inject env into process and try argv/list forms
     orig_env = None
     try:
         if cfg.env:
             orig_env = os.environ.copy()
             os.environ.update(cfg.env)
-        res = stdio_client(argv_for_call)
-        client = await _normalize_stdio_result(res)
-        init = getattr(client, "initialize", None)
-        if callable(init):
-            maybe = init()
-            if inspect.isawaitable(maybe):
-                await maybe
-        return client
-    except Exception as e:
-        last_exc = e
+
+        # Variant B: spec without env attribute (for SDKs that ignore spec.env)
+        try:
+            spec2 = SimpleNamespace(command=_command, args=_args)
+            res = stdio_client(spec2)
+            client = await _normalize_stdio_result(res)
+            init = getattr(client, "initialize", None)
+            if callable(init):
+                maybe = init()
+                if inspect.isawaitable(maybe):
+                    await maybe
+            return client
+        except Exception as e2:
+            last_exc = e2
+
+        # Variant C: pass argv list
+        try:
+            argv = [_command] + _args
+            res = stdio_client(argv)
+            client = await _normalize_stdio_result(res)
+            init = getattr(client, "initialize", None)
+            if callable(init):
+                maybe = init()
+                if inspect.isawaitable(maybe):
+                    await maybe
+            return client
+        except Exception as e3:
+            last_exc = e3
+
+        # Variant D: pass single string (only when no args)
+        try:
+            if not _args:
+                res = stdio_client(_command)
+                client = await _normalize_stdio_result(res)
+                init = getattr(client, "initialize", None)
+                if callable(init):
+                    maybe = init()
+                    if inspect.isawaitable(maybe):
+                        await maybe
+                return client
+        except Exception as e4:
+            last_exc = e4
+
         raise RuntimeError(f"Failed to create stdio MCP client for '{cfg.alias}': {last_exc}")
     finally:
         if orig_env is not None:
@@ -317,7 +343,7 @@ async def mcp_http_call_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, 
 
 app = FastAPI(
     title="MCP OpenAPI Bridge (Generic, Self-Discovering)",
-    version="4.0.0",
+    version="4.1.0",
     description=textwrap.dedent(
         """\
         A generic, self-discovering OpenAPI façade for MCP servers.
@@ -595,8 +621,6 @@ async def do_tool_call(
 ) -> Any:
     # Prepare arguments exactly as provided
     if body is None:
-        # If ?args= is provided and is NOT JSON, pass it as {"args": "<string>"}
-        # If it is JSON and parses to a dict, pass that dict.
         if qargs is not None:
             try:
                 parsed = json.loads(qargs)
@@ -640,7 +664,6 @@ async def tool_dispatch_post(
         return JSONResponse(result)
     except HTTPException as e:
         if e.status_code == 503 and MCP_FORWARD_URL:
-            # REST forward fallback
             params: Dict[str, Any] = {}
             if dryrun:
                 params["dryrun"] = dryrun
