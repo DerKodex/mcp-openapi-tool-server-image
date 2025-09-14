@@ -326,7 +326,7 @@ async def mcp_http_call_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, 
 
 app = FastAPI(
     title="MCP OpenAPI Bridge (Generic, Self-Discovering)",
-    version="4.1.3",
+    version="4.1.4",
     description=textwrap.dedent(
         """\
         A generic, self-discovering OpenAPI façade for MCP servers.
@@ -558,13 +558,6 @@ async def forward_via_http(server: str, tool_path: str, method: str, params: Dic
     if not MCP_FORWARD_URL:
         raise HTTPException(503, "No MCP server connected and MCP_FORWARD_URL not set for HTTP fallback")
     url = MCP_FORWARD_URL.rstrip("/") + f"/{server}/tool/{tool_path}"
-    try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            if method.upper) == "GET":  # <-- typo fixed below; leaving here intentionally to prevent confusion
-                pass
-    except Exception:
-        pass
-    # Correct implementation:
     try:
         async with httpx.AsyncClient(timeout=60) as client:
             if method.upper() == "GET":
