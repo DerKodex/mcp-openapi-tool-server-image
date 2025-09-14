@@ -6,7 +6,7 @@ MCP OpenAPI Bridge — Generic, Self-Discovering (HTTP-first, hardened stdio)
 - Generic only (no domain assumptions)
 - HTTP RPC (MCP_RPC_URL) preferred; stdio optional
 - Stdio uses the *descriptor-only* signature expected by newer MCP SDKs
-- Stdio connector now tries multiple arg permutations automatically
+- Stdio connector tries multiple argument permutations automatically
 
 Run:
   uvicorn app:app --host 0.0.0.0 --port 8080
@@ -262,6 +262,29 @@ async def mcp_http_call_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, 
 # MCP integration — stdio (descriptor-only, multi-variant attempts)
 # =============================================================================
 
+async def _enter_ctx(cm):
+    """Safely enter an async context manager, tolerant of non-awaitable returns."""
+    if cm is None:
+        return None
+    aenter = getattr(cm, "__aenter__", None)
+    if not callable(aenter):
+        return cm
+    res = aenter()
+    return await res if inspect.isawaitable(res) else res
+
+async def _exit_ctx(cm):
+    """Safely exit an async context manager, ignoring errors."""
+    if cm is None:
+        return
+    aexit = getattr(cm, "__aexit__", None)
+    if callable(aexit):
+        try:
+            res = aexit(None, None, None)
+            if inspect.isawaitable(res):
+                await res
+        except Exception:
+            pass
+
 def _is_executable(path: str) -> bool:
     try:
         st = os.stat(path)
@@ -306,7 +329,7 @@ def _with_extra_args(args: List[str]) -> List[str]:
     return args + extra
 
 def _arg_permutations(base_args: List[str]) -> List[List[str]]:
-    """Generate a handful of sensible permutations around transport flag styles."""
+    """Generate sensible permutations around transport flag styles."""
     perms: List[List[str]] = []
 
     def has_pair(k: str) -> bool:
@@ -322,7 +345,7 @@ def _arg_permutations(base_args: List[str]) -> List[List[str]]:
     # 0) as-is
     perms.append(list(base_args))
 
-    # 1) if we see '--transport','stdio' turn into '--transport=stdio'
+    # 1) '--transport','stdio' -> '--transport=stdio'
     if has_pair("--transport"):
         i = base_args.index("--transport")
         if i < len(base_args) - 1:
@@ -330,29 +353,29 @@ def _arg_permutations(base_args: List[str]) -> List[List[str]]:
             perm = base_args[:i] + [f"--transport={v}"] + base_args[i + 2:]
             perms.append(perm)
 
-    # 2) if we see '--transport=stdio' split into pair
+    # 2) '--transport=stdio' -> split pair
     if has_equals("--transport"):
         for s in base_args:
             if s.startswith("--transport="):
                 v = s.split("=", 1)[1]
                 perm = [x for x in base_args if x != s]
-                perm[i:i] = ["--transport", v] if (i := 0) == 0 else ["--transport", v]  # position doesn't matter
+                perm = ["--transport", v] + perm
                 perms.append(perm)
                 break
 
-    # 3) if no transport flag at all, add equals style
+    # 3) add equals if missing
     if not has_pair("--transport") and not has_equals("--transport"):
         perms.append(base_args + ["--transport=stdio"])
 
-    # 4) try pair style addition too
+    # 4) add pair if missing
     if not has_pair("--transport") and not has_equals("--transport"):
         perms.append(base_args + ["--transport", "stdio"])
 
-    # 5) as a last resort, try '--stdio' (some servers use a bare switch)
+    # 5) bare switch
     if "--stdio" not in base_args:
         perms.append(base_args + ["--stdio"])
 
-    # Deduplicate while preserving order
+    # Deduplicate
     seen = set()
     uniq: List[List[str]] = []
     for p in perms:
@@ -391,7 +414,6 @@ async def _preflight_all(command: str, args: List[str], env: Dict[str, str], cwd
         return
     await _run_short(command, ["--version"], env, cwd, "version")
     await _run_short(command, ["--help"], env, cwd, "help")
-    # Also try the *configured* args briefly to surface early crashes
     await _run_short(command, args, env, cwd, "configured-args", timeout_s=4.0)
 
 async def mcp_connect_stdio(cfg: ServerConfig) -> Any:
@@ -409,7 +431,6 @@ async def mcp_connect_stdio(cfg: ServerConfig) -> Any:
     env = _env_for(cfg)
     cwd = cfg.cwd or os.getcwd()
 
-    # Preflight once with configured args
     await _preflight_all(command, base_args, env, cwd)
 
     attempts = _arg_permutations(base_args)
@@ -417,8 +438,9 @@ async def mcp_connect_stdio(cfg: ServerConfig) -> Any:
 
     for idx, args in enumerate(attempts):
         desc = _make_desc(command, args, env, cwd)
+        stdio_cm = None
         try:
-            stdio_cm = stdio_client(desc)  # descriptor-only
+            stdio_cm = stdio_client(desc)  # descriptor-only signature
             rw = await _enter_ctx(stdio_cm)
             if not isinstance(rw, (tuple, list)) or len(rw) != 2:
                 raise TypeError("stdio_client did not yield (read_stream, write_stream)")
@@ -436,9 +458,8 @@ async def mcp_connect_stdio(cfg: ServerConfig) -> Any:
             setattr(session, "__stdio_args__", list(args))
             return session
         except Exception as e:
-            # Close cm if open
             try:
-                await _exit_ctx(locals().get("stdio_cm"))
+                await _exit_ctx(stdio_cm)
             except Exception:
                 pass
             kind = type(e).__name__
@@ -492,7 +513,7 @@ async def mcp_call_tool_stdio(session, tool_name: str, args: Dict[str, Any]) -> 
 
 app = FastAPI(
     title="MCP OpenAPI Bridge (Generic, Self-Discovering)",
-    version="6.3.0",
+    version="6.3.1",
     description=textwrap.dedent(
         """\
         Generic OpenAPI façade for MCP servers.
@@ -555,9 +576,14 @@ async def on_startup():
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    # No explicit close hook in SDK; contexts auto-close when GC'd,
-    # but we don't retain the ctx, so nothing extra here.
-    pass
+    # Attempt to cleanly close any open stdio context
+    for _, st in list(DISCOVERY.servers.items()):
+        try:
+            client = st.client
+            if client is not None:
+                await _exit_ctx(getattr(client, "__stdio_ctx__", None))
+        except Exception:
+            pass
 
 
 def refresh_servers_from_env() -> bool:
