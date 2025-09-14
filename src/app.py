@@ -4,9 +4,10 @@
 MCP OpenAPI Bridge — Generic, Self-Discovering (HTTP-first, hardened stdio)
 ---------------------------------------------------------------------------
 - Generic only (no domain assumptions)
-- HTTP RPC (MCP_RPC_URL) preferred; stdio optional
-- Stdio uses the *descriptor-only* signature expected by newer MCP SDKs
-- Stdio connector tries multiple argument permutations automatically
+- HTTP RPC (MCP_RPC_URL) preferred; stdio optional and hardened
+- Stdio uses the descriptor-only signature expected by newer MCP SDKs
+- Stdio connector now tries only safe '--transport stdio' / '--transport=stdio' permutations
+- No bare '--stdio' attempt (your server does not support it)
 
 Run:
   uvicorn app:app --host 0.0.0.0 --port 8080
@@ -16,7 +17,8 @@ Env:
   MCP_STDIO_ENABLED=0            # 0/1 (default 0). If 1, stdio allowed.
   MCP_FORCE_STDIO=0              # 0/1. If 1, prefer stdio for discovery/calls.
   MCP_STDIO_INIT_TIMEOUT=45      # seconds for session.initialize()
-  MCP_STDIO_PREFLIGHT=1          # 0/1 run preflights
+  MCP_STDIO_PREFLIGHT=1          # 0/1 run version/help preflights
+  MCP_STDIO_PREFLIGHT_CONFIG=0   # 0/1 run a quick preflight with *configured args* (off by default)
   MCP_STDIO_EXTRA_ARGS=''        # optional space-separated extra args appended for stdio attempts
   MCP_SERVERS='[{"alias":"mcp","mode":"stdio","cmd":["/path/to/mcp-server","--transport","stdio","--access-level","readonly"],"env":{"K":"V"},"cwd":"/work"}]'
   MCP_DISCOVERY_WAIT=2
@@ -47,6 +49,7 @@ MCP_STDIO_ENABLED = os.getenv("MCP_STDIO_ENABLED", "0").strip().lower() in ("1",
 MCP_FORCE_STDIO = os.getenv("MCP_FORCE_STDIO", "0").strip().lower() in ("1", "true", "yes")
 MCP_STDIO_INIT_TIMEOUT = int(os.getenv("MCP_STDIO_INIT_TIMEOUT", "45"))
 MCP_STDIO_PREFLIGHT = os.getenv("MCP_STDIO_PREFLIGHT", "1").strip().lower() in ("1", "true", "yes")
+MCP_STDIO_PREFLIGHT_CONFIG = os.getenv("MCP_STDIO_PREFLIGHT_CONFIG", "0").strip().lower() in ("1", "true", "yes")
 MCP_STDIO_EXTRA_ARGS = os.getenv("MCP_STDIO_EXTRA_ARGS", "").strip()
 
 MCP_AVAILABLE = False
@@ -71,7 +74,7 @@ if MCP_STDIO_ENABLED or MCP_FORCE_STDIO:
     try:
         from mcp.client.stdio import StdioServerParameters as StdioParamsType  # type: ignore
     except Exception:
-        StdioParamsType = None  # we’ll use SimpleNamespace
+        StdioParamsType = None  # we’ll use SimpleNamespace fallback
 
 
 # =============================================================================
@@ -259,29 +262,25 @@ async def mcp_http_call_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, 
 
 
 # =============================================================================
-# MCP integration — stdio (descriptor-only, multi-variant attempts)
+# MCP integration — stdio (descriptor-only, safe permutations)
 # =============================================================================
 
 async def _enter_ctx(cm):
-    """Safely enter an async context manager, tolerant of non-awaitable returns."""
-    if cm is None:
-        return None
     aenter = getattr(cm, "__aenter__", None)
     if not callable(aenter):
-        return cm
-    res = aenter()
-    return await res if inspect.isawaitable(res) else res
+        raise TypeError("Expected an async context manager")
+    entered = aenter()
+    return await entered if inspect.isawaitable(entered) else entered
 
 async def _exit_ctx(cm):
-    """Safely exit an async context manager, ignoring errors."""
-    if cm is None:
+    if not cm:
         return
     aexit = getattr(cm, "__aexit__", None)
     if callable(aexit):
         try:
-            res = aexit(None, None, None)
-            if inspect.isawaitable(res):
-                await res
+            maybe = aexit(None, None, None)
+            if inspect.isawaitable(maybe):
+                await maybe
         except Exception:
             pass
 
@@ -329,7 +328,10 @@ def _with_extra_args(args: List[str]) -> List[str]:
     return args + extra
 
 def _arg_permutations(base_args: List[str]) -> List[List[str]]:
-    """Generate sensible permutations around transport flag styles."""
+    """
+    Generate safe permutations around '--transport stdio' vs '--transport=stdio'.
+    We DO NOT try a bare '--stdio' flag (your server does not support it).
+    """
     perms: List[List[str]] = []
 
     def has_pair(k: str) -> bool:
@@ -345,7 +347,7 @@ def _arg_permutations(base_args: List[str]) -> List[List[str]]:
     # 0) as-is
     perms.append(list(base_args))
 
-    # 1) '--transport','stdio' -> '--transport=stdio'
+    # 1) if '--transport','stdio' turn into '--transport=stdio'
     if has_pair("--transport"):
         i = base_args.index("--transport")
         if i < len(base_args) - 1:
@@ -353,29 +355,26 @@ def _arg_permutations(base_args: List[str]) -> List[List[str]]:
             perm = base_args[:i] + [f"--transport={v}"] + base_args[i + 2:]
             perms.append(perm)
 
-    # 2) '--transport=stdio' -> split pair
+    # 2) if '--transport=stdio' split to pair
     if has_equals("--transport"):
         for s in base_args:
             if s.startswith("--transport="):
                 v = s.split("=", 1)[1]
                 perm = [x for x in base_args if x != s]
+                # Insert pair near start (position doesn't matter)
                 perm = ["--transport", v] + perm
                 perms.append(perm)
                 break
 
-    # 3) add equals if missing
+    # 3) if no transport, add equals
     if not has_pair("--transport") and not has_equals("--transport"):
         perms.append(base_args + ["--transport=stdio"])
 
-    # 4) add pair if missing
+    # 4) and also try pair style
     if not has_pair("--transport") and not has_equals("--transport"):
         perms.append(base_args + ["--transport", "stdio"])
 
-    # 5) bare switch
-    if "--stdio" not in base_args:
-        perms.append(base_args + ["--stdio"])
-
-    # Deduplicate
+    # Deduplicate + add extra args if any
     seen = set()
     uniq: List[List[str]] = []
     for p in perms:
@@ -414,10 +413,12 @@ async def _preflight_all(command: str, args: List[str], env: Dict[str, str], cwd
         return
     await _run_short(command, ["--version"], env, cwd, "version")
     await _run_short(command, ["--help"], env, cwd, "help")
-    await _run_short(command, args, env, cwd, "configured-args", timeout_s=4.0)
+    if MCP_STDIO_PREFLIGHT_CONFIG:
+        # Only when explicitly enabled; otherwise we avoid starting a long-lived server during startup
+        await _run_short(command, args, env, cwd, "configured-args", timeout_s=4.0)
 
 async def mcp_connect_stdio(cfg: ServerConfig) -> Any:
-    """Descriptor-only stdio connector with multi-variant arg attempts."""
+    """Descriptor-only stdio connector with safe arg permutations."""
     if not (MCP_STDIO_ENABLED or MCP_FORCE_STDIO):
         raise RuntimeError("MCP stdio disabled (set MCP_STDIO_ENABLED=1 or MCP_FORCE_STDIO=1).")
     if not MCP_AVAILABLE or MCPClientSession is None or stdio_client is None:
@@ -436,16 +437,18 @@ async def mcp_connect_stdio(cfg: ServerConfig) -> Any:
     attempts = _arg_permutations(base_args)
     errors: List[str] = []
 
-    for idx, args in enumerate(attempts):
+    for idx, args in enumerate(attempts, start=1):
         desc = _make_desc(command, args, env, cwd)
         stdio_cm = None
+        session_ctx = None
         try:
-            stdio_cm = stdio_client(desc)  # descriptor-only signature
+            stdio_cm = stdio_client(desc)  # descriptor-only
             rw = await _enter_ctx(stdio_cm)
             if not isinstance(rw, (tuple, list)) or len(rw) != 2:
                 raise TypeError("stdio_client did not yield (read_stream, write_stream)")
             read_stream, write_stream = rw[0], rw[1]
-            session = MCPClientSession(read_stream, write_stream)
+            session_ctx = MCPClientSession(read_stream, write_stream)
+            session = await _enter_ctx(session_ctx)
 
             init = getattr(session, "initialize", None)
             if callable(init):
@@ -455,15 +458,14 @@ async def mcp_connect_stdio(cfg: ServerConfig) -> Any:
 
             # success
             setattr(session, "__stdio_ctx__", stdio_cm)
+            setattr(session, "__session_ctx__", session_ctx)
             setattr(session, "__stdio_args__", list(args))
             return session
         except Exception as e:
-            try:
-                await _exit_ctx(stdio_cm)
-            except Exception:
-                pass
-            kind = type(e).__name__
-            errors.append(f"#{idx+1} args={args} -> {kind}: {e}")
+            # close any opened contexts
+            await _exit_ctx(session_ctx)
+            await _exit_ctx(stdio_cm)
+            errors.append(f"#{idx} args={args} -> {type(e).__name__}: {e}")
 
     raise RuntimeError(
         "Failed to open stdio_client for "
@@ -513,13 +515,13 @@ async def mcp_call_tool_stdio(session, tool_name: str, args: Dict[str, Any]) -> 
 
 app = FastAPI(
     title="MCP OpenAPI Bridge (Generic, Self-Discovering)",
-    version="6.3.1",
+    version="6.4.0",
     description=textwrap.dedent(
         """\
         Generic OpenAPI façade for MCP servers.
         - HTTP RPC preferred (MCP_RPC_URL).
         - Stdio optional (enable with MCP_STDIO_ENABLED=1). Descriptor-only signature.
-        - Multi-variant stdio arg attempts (pair/equal/bare switch).
+        - Safe stdio arg attempts (pair/equal only; no bare --stdio).
         - No domain-specific logic; arguments are forwarded as provided.
         - Per-tool examples auto-generated from MCP schema.
         """
@@ -576,14 +578,8 @@ async def on_startup():
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    # Attempt to cleanly close any open stdio context
-    for _, st in list(DISCOVERY.servers.items()):
-        try:
-            client = st.client
-            if client is not None:
-                await _exit_ctx(getattr(client, "__stdio_ctx__", None))
-        except Exception:
-            pass
+    # No explicit close hook in SDK; contexts auto-close when GC'd.
+    pass
 
 
 def refresh_servers_from_env() -> bool:
