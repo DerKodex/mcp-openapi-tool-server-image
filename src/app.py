@@ -1,24 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MCP OpenAPI Bridge — Generic, Self-Discovering (HTTP-first, robust stdio)
----------------------------------------------------------------------------
-- Purely generic: no domain-specific logic or assumptions
-- Discovers MCP tools at runtime and exposes generic HTTP endpoints
-- HTTP RPC (MCP_RPC_URL) is the default and recommended path
-- Optional stdio support (MCP_STDIO_ENABLED=1), with robust multi-variant open
-- Optional stdio preference (MCP_FORCE_STDIO=1) to prefer stdio before HTTP
+MCP OpenAPI Bridge — Generic, Self-Discovering (HTTP-first, stdio via descriptor)
+---------------------------------------------------------------------------------
+- Purely generic (no domain-specific logic)
+- HTTP RPC (MCP_RPC_URL) preferred; stdio optional
+- Stdio uses ONLY the descriptor-based signature (matches your SDK):
+    stdio_client(<object with .command, .args, .env, .cwd, ...>)
 
 Run:
   uvicorn app:app --host 0.0.0.0 --port 8080
 
 Env:
-  MCP_RPC_URL='http://mcp-server:8080/mcp'     # Raw MCP HTTP RPC endpoint (recommended)
-  MCP_STDIO_ENABLED=0                          # 0/1 (default 0). If 1, stdio is available.
-  MCP_FORCE_STDIO=0                            # 0/1. If 1, prefer stdio for discover & calls.
-  MCP_SERVERS='[{"alias":"mcp","mode":"stdio","cmd":["/path/to/mcp-server","--transport","stdio"],"env":{"K":"V"},"cwd":"/work"}]'
+  MCP_RPC_URL='http://mcp-server:8080/mcp'     # HTTP RPC endpoint (recommended)
+  MCP_STDIO_ENABLED=0                          # 0/1 (default 0). If 1, stdio allowed.
+  MCP_FORCE_STDIO=0                            # 0/1. If 1, prefer stdio for discovery/calls.
+  MCP_SERVERS='[{"alias":"mcp","mode":"stdio","cmd":["/path/to/mcp-server","--transport=stdio"],"env":{"K":"V"},"cwd":"/work"}]'
   MCP_DISCOVERY_WAIT=2
-  MCP_FORWARD_URL='http://mcp-upstream:8080'   # OPTIONAL: REST bridge fallback when both fail
+  MCP_FORWARD_URL='http://mcp-upstream:8080'   # OPTIONAL: REST bridge fallback
 """
 
 import asyncio
@@ -39,7 +38,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 # -----------------------------------------------------------------------------
-# Optional MCP stdio client (controlled by MCP_STDIO_ENABLED / MCP_FORCE_STDIO)
+# stdio toggles
 # -----------------------------------------------------------------------------
 MCP_STDIO_ENABLED = os.getenv("MCP_STDIO_ENABLED", "0").strip().lower() in ("1", "true", "yes")
 MCP_FORCE_STDIO = os.getenv("MCP_FORCE_STDIO", "0").strip().lower() in ("1", "true", "yes")
@@ -47,6 +46,7 @@ MCP_FORCE_STDIO = os.getenv("MCP_FORCE_STDIO", "0").strip().lower() in ("1", "tr
 MCP_AVAILABLE = False
 MCPClientSession = None
 stdio_client = None
+StdioParamsType = None
 
 if MCP_STDIO_ENABLED or MCP_FORCE_STDIO:
     try:
@@ -55,18 +55,23 @@ if MCP_STDIO_ENABLED or MCP_FORCE_STDIO:
         MCP_AVAILABLE = True
     except Exception:
         MCP_AVAILABLE = False
+    # Session type may vary by version
     try:
-        # Session type name varies by version
         from mcp.client.session import ClientSession as MCPClientSession  # type: ignore
     except Exception:
         try:
             from mcp.client.session import Session as MCPClientSession  # type: ignore
         except Exception:
             MCPClientSession = None
+    # If SDK provides a typed parameters class, keep it; otherwise we’ll use SimpleNamespace
+    try:
+        from mcp.client.stdio import StdioServerParameters as StdioParamsType  # type: ignore
+    except Exception:
+        StdioParamsType = None  # use SimpleNamespace fallback
 
 
 # =============================================================================
-# Data structures (generic)
+# Data structures
 # =============================================================================
 
 class ServerConfig(BaseModel):
@@ -163,14 +168,14 @@ def _build_examples_from_schema(tool_name: str, schema: Dict[str, Any]) -> List[
     body = sample_body()
 
     examples.append({
-        "intent": f"Call '{tool_name}' with a JSON body matching its schema",
+        "intent": f"Call '{tool_name}' with a JSON body",
         "call": {"POST": f"/mcp/tool/{tool_name}", "body": body},
-        "notes": ["Send exactly the fields your MCP tool expects. The body is forwarded as-is."]
+        "notes": ["The body is forwarded as-is to the MCP tool."]
     })
     examples.append({
-        "intent": f"Call '{tool_name}' via GET with JSON-encoded args",
+        "intent": f"GET invoke '{tool_name}' with JSON-encoded args",
         "call": {"GET": f"/mcp/tool/{tool_name}?args=" + json.dumps(body)},
-        "notes": ["The 'args' query param must be JSON-encoded. The server forwards it as-is."]
+        "notes": ["The 'args' query param must be JSON-encoded."]
     })
     interesting = [k for k in ("operation", "resource", "action", "kind", "type") if k in props]
     if interesting:
@@ -178,7 +183,7 @@ def _build_examples_from_schema(tool_name: str, schema: Dict[str, Any]) -> List[
         examples.append({
             "intent": f"Explicitly set {', '.join(interesting)} for '{tool_name}'",
             "call": {"POST": f"/mcp/tool/{tool_name}", "body": body2},
-            "notes": ["Values shown are the first enum choices when available."]
+            "notes": ["Values shown use the first enum choices when available."]
         })
 
     return examples
@@ -254,8 +259,19 @@ async def mcp_http_call_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, 
 
 
 # =============================================================================
-# MCP integration — stdio (optional / robust)
+# MCP integration — stdio (descriptor-only)
 # =============================================================================
+
+def _is_executable(path: str) -> bool:
+    try:
+        st = os.stat(path)
+        if not stat.S_ISREG(st.st_mode):
+            return False
+        return bool(st.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH))
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return False
 
 async def _enter_ctx(cm):
     aenter = getattr(cm, "__aenter__", None)
@@ -276,23 +292,7 @@ async def _exit_ctx(cm):
         except Exception:
             pass
 
-def _is_executable(path: str) -> bool:
-    try:
-        st = os.stat(path)
-        if not stat.S_ISREG(st.st_mode):
-            return False
-        return bool(st.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH))
-    except FileNotFoundError:
-        return False
-    except Exception:
-        return False
-
-def _server_descriptors(cfg: ServerConfig) -> List[SimpleNamespace]:
-    """
-    Yield descriptor variants to satisfy different SDK expectations.
-    Always include .env and .cwd (older SDKs require them).
-    Also include encoding fields to satisfy stdout_reader on some versions.
-    """
+def _make_stdio_descriptor(cfg: ServerConfig):
     if isinstance(cfg.cmd, list) and cfg.cmd:
         cmd0, args = str(cfg.cmd[0]), [str(x) for x in cfg.cmd[1:]]
     elif isinstance(cfg.cmd, str):
@@ -308,39 +308,23 @@ def _server_descriptors(cfg: ServerConfig) -> List[SimpleNamespace]:
         env.update(cfg.env)
     cwd = cfg.cwd or os.getcwd()
 
-    variants = [
-        SimpleNamespace(
+    if StdioParamsType is not None:
+        return StdioParamsType(
             command=cmd0, args=args, env=env, cwd=cwd,
             encoding="utf-8", stderr_encoding="utf-8",
-            encoding_error_handler="replace",
-            stderr_encoding_error_handler="replace",
-        ),
-        SimpleNamespace(
-            command=cmd0, args=args, env=env, cwd=cwd,
-            encoding="utf-8", stderr_encoding="utf-8",
-        ),
-        SimpleNamespace(
-            command=cmd0, args=args, env=env, cwd=cwd,
-            encoding="utf-8",
-        ),
-        SimpleNamespace(
-            command=cmd0, args=args, env=env, cwd=cwd,
-        ),
-    ]
-    return variants
+            encoding_error_handler="replace", stderr_encoding_error_handler="replace",
+        )
+    # Fallback: object with attributes
+    return SimpleNamespace(
+        command=cmd0, args=args, env=env, cwd=cwd,
+        encoding="utf-8", stderr_encoding="utf-8",
+        encoding_error_handler="replace", stderr_encoding_error_handler="replace",
+    )
 
 async def mcp_connect_stdio(cfg: ServerConfig) -> Any:
     """
-    Hyper-robust stdio connector that tries all known calling conventions:
-
-      A) stdio_client(command=..., args=..., env=..., cwd=...)          (keyword style)
-      B) stdio_client(cmd0, args)                                       (2-positional)
-      C) stdio_client([cmd0] + args)                                    (1-positional list)
-      D) stdio_client(cmd0)                                             (1-positional str)
-      E) stdio_client(server_descriptor_object)                          (object with .command, .args, .env, .cwd, ...)
-
-    On success, returns an initialized MCPClientSession(session).
-    On failure, raises with an aggregated diagnostics message of all attempts.
+    Connect using ONLY the descriptor signature that your SDK expects:
+        stdio_client(<descriptor with .command/.args/.env/.cwd/...>)
     """
     if not (MCP_STDIO_ENABLED or MCP_FORCE_STDIO):
         raise RuntimeError("MCP stdio disabled (set MCP_STDIO_ENABLED=1 or MCP_FORCE_STDIO=1).")
@@ -349,103 +333,40 @@ async def mcp_connect_stdio(cfg: ServerConfig) -> Any:
     if not cfg.cmd:
         raise RuntimeError(f"Server {cfg.alias}: stdio mode requires 'cmd'.")
 
-    if isinstance(cfg.cmd, list):
-        cmd_list = [str(x) for x in cfg.cmd]
-        cmd0, args = cmd_list[0], cmd_list[1:]
-    else:
-        cmd0, args = str(cfg.cmd), []
+    desc = _make_stdio_descriptor(cfg)
 
-    env_kw = dict(os.environ)
-    if cfg.env:
-        env_kw.update(cfg.env)
-    cwd_kw = cfg.cwd or os.getcwd()
-
-    attempts: List[str] = []
-
-    async def _finalize(stdio_cm, rw):
+    # Open stdio transport
+    stdio_cm = None
+    try:
+        stdio_cm = stdio_client(desc)  # descriptor-only
+        rw = await _enter_ctx(stdio_cm)
         if not isinstance(rw, (tuple, list)) or len(rw) != 2:
             raise TypeError("stdio_client did not yield (read_stream, write_stream)")
         read_stream, write_stream = rw[0], rw[1]
+
+        # Create session
         session = MCPClientSession(read_stream, write_stream)
         init = getattr(session, "initialize", None)
         if callable(init):
             maybe = init()
             if inspect.isawaitable(maybe):
-                await asyncio.wait_for(maybe, timeout=25)
+                await asyncio.wait_for(maybe, timeout=30)
+
         setattr(session, "__stdio_ctx__", stdio_cm)
         setattr(session, "__stdio_pair__", rw)
         return session
-
-    # Attempt A: keyword style
-    try:
-        stdio_cm = stdio_client(command=cmd0, args=args, env=env_kw, cwd=cwd_kw)  # type: ignore
-        rw = await _enter_ctx(stdio_cm)
-        return await _finalize(stdio_cm, rw)
     except Exception as e:
-        attempts.append(f"A(keyword) -> {type(e).__name__}: {e!s}")
+        # Include descriptor essentials in the message for debugging, but not env
         try:
-            await _exit_ctx(stdio_cm)
+            cmd = getattr(desc, "command", "<unknown>")
+            args = getattr(desc, "args", [])
+            cwd = getattr(desc, "cwd", "<none>")
+            msg = f"Failed to open stdio_client for '{cfg.alias}': cmd='{cmd}' args={args} cwd='{cwd}' -> {type(e).__name__}: {e!s}"
         except Exception:
-            pass
+            msg = f"Failed to open stdio_client for '{cfg.alias}': {type(e).__name__}: {e!s}"
+        raise RuntimeError(msg) from e
+    # no finally: ctx stored in session for shutdown
 
-    # Attempt B: two-positionals
-    try:
-        stdio_cm = stdio_client(cmd0, args)  # type: ignore
-        rw = await _enter_ctx(stdio_cm)
-        return await _finalize(stdio_cm, rw)
-    except Exception as e:
-        attempts.append(f"B(pos2) -> {type(e).__name__}: {e!s}")
-        try:
-            await _exit_ctx(stdio_cm)
-        except Exception:
-            pass
-
-    # Attempt C: single positional list
-    try:
-        stdio_cm = stdio_client([cmd0] + args)  # type: ignore
-        rw = await _enter_ctx(stdio_cm)
-        return await _finalize(stdio_cm, rw)
-    except Exception as e:
-        attempts.append(f"C(list1) -> {type(e).__name__}: {e!s}")
-        try:
-            await _exit_ctx(stdio_cm)
-        except Exception:
-            pass
-
-    # Attempt D: single positional str
-    try:
-        stdio_cm = stdio_client(cmd0)  # type: ignore
-        rw = await _enter_ctx(stdio_cm)
-        return await _finalize(stdio_cm, rw)
-    except Exception as e:
-        attempts.append(f"D(str1) -> {type(e).__name__}: {e!s}")
-        try:
-            await _exit_ctx(stdio_cm)
-        except Exception:
-            pass
-
-    # Attempt E: descriptor objects
-    last_exc: Optional[BaseException] = None
-    try:
-        for desc in _server_descriptors(cfg):
-            stdio_cm = None
-            try:
-                stdio_cm = stdio_client(desc)  # type: ignore
-                rw = await _enter_ctx(stdio_cm)
-                return await _finalize(stdio_cm, rw)
-            except Exception as e:
-                last_exc = e
-                attempts.append(f"E(desc:{list(vars(desc).keys())}) -> {type(e).__name__}: {e!s}")
-                try:
-                    await _exit_ctx(stdio_cm)
-                except Exception:
-                    pass
-    except Exception as e:
-        last_exc = e
-        attempts.append(f"E(preflight) -> {type(e).__name__}: {e!s}")
-
-    detail = " | ".join(attempts)
-    raise RuntimeError(f"Failed to open stdio_client for '{cfg.alias}': {detail}")
 
 async def mcp_list_tools_stdio(session) -> List[Dict[str, Any]]:
     result = await session.list_tools()
@@ -490,15 +411,14 @@ async def mcp_call_tool_stdio(session, tool_name: str, args: Dict[str, Any]) -> 
 
 app = FastAPI(
     title="MCP OpenAPI Bridge (Generic, Self-Discovering)",
-    version="5.6.0",
+    version="6.0.0",
     description=textwrap.dedent(
         """\
-        A generic, self-discovering OpenAPI façade for MCP servers.
-        - HTTP RPC is the primary path (MCP_RPC_URL).
-        - Stdio is optional (MCP_STDIO_ENABLED=1), robustly handled across SDK variants.
-        - Use MCP_FORCE_STDIO=1 to prefer stdio for discovery and invocation.
-        - No domain-specific logic; arguments are forwarded exactly as provided.
-        - Per-tool examples are auto-generated from each tool's schema.
+        Generic OpenAPI façade for MCP servers.
+        - HTTP RPC preferred (MCP_RPC_URL).
+        - Stdio optional (enable with MCP_STDIO_ENABLED=1). Uses descriptor-only signature.
+        - No domain-specific logic; arguments are forwarded as provided.
+        - Per-tool examples are auto-generated from the MCP schema.
         """
     ),
     servers=[{"url": "http://localhost:8080"}],
@@ -596,19 +516,15 @@ async def do_discover(wait_seconds: int = 0) -> Dict[str, Any]:
             except Exception as e:
                 print(f"[discover:http-rpc] list_tools failed via {MCP_RPC_URL}: {e}", file=sys.stderr)
 
-        # stdio discovery
+        # stdio discovery (descriptor-only)
         if (prefer_stdio or not tools_raw) and (MCP_STDIO_ENABLED or MCP_FORCE_STDIO) and st.cfg.mode == "stdio" and st.cfg.cmd:
             try:
                 if not st.connected or st.client is None:
                     st.client = await mcp_connect_stdio(st.cfg)
                     st.connected = True
-                try:
-                    tools_raw = await mcp_list_tools_stdio(st.client)
-                except Exception as e:
-                    print(f"[discover] list_tools via stdio failed for '{alias}': {e}", file=sys.stderr)
-                    tools_raw = tools_raw or []
+                tools_raw = await mcp_list_tools_stdio(st.client)
             except Exception as e:
-                print(f"[discover] stdio connect failed for '{alias}': {e}", file=sys.stderr)
+                print(f"[discover] stdio connect/list failed for '{alias}': {e}", file=sys.stderr)
                 st.connected = False
                 st.client = None
 
@@ -658,7 +574,7 @@ async def servers_info():
 # =============================================================================
 
 @app.post("/discover", tags=["discovery"], summary="Discover Endpoint")
-async def discover_endpoint(wait: Optional[int] = Query(0, description="Seconds to wait (max 10) for discovery")):
+async def discover_endpoint(wait: Optional[int] = Query(0, description="Seconds to wait (max 10)")):
     wait = max(0, min(int(wait or 0), 10))
     refresh_servers_from_env()
     return await do_discover(wait_seconds=wait)
@@ -669,22 +585,22 @@ async def discovery_status():
 
 
 # =============================================================================
-# OpenAPI enrichment (generic, with examples)
+# OpenAPI enrichment
 # =============================================================================
 
 def openapi_extra_blocks() -> Dict[str, Any]:
     x_model_instructions = {
         "usage": [
-            "Use **GET** with `?args={...}` (JSON-encoded) or **POST** with a JSON body.",
-            "If the tool expects no arguments, send POST `{}`.",
-            "This bridge forwards arguments exactly as provided to the MCP tool.",
-            "Inspect `/mcp/tool/{tool}/schema` and `/mcp/tool/{tool}/example` for guidance derived from the MCP tool schema."
+            "Use GET with ?args={...} (JSON-encoded) or POST with a JSON body.",
+            "If the tool expects no arguments, send POST {}.",
+            "Arguments are forwarded exactly as provided to the MCP tool.",
+            "See /mcp/tool/{tool}/schema and /mcp/tool/{tool}/example for schema-derived guidance."
         ],
         "discovery": [
-            "List tools: `GET /{SERVER}/tools/list`.",
-            "Per-tool schema: `GET /{SERVER}/tool/{TOOL}/schema`.",
-            "Per-tool examples: `GET /{SERVER}/tool/{TOOL}/example`.",
-            "Zero-argument test: `GET /{SERVER}/tool/{TOOL}/try`."
+            "List tools: GET /{SERVER}/tools/list",
+            "Per-tool schema: GET /{SERVER}/tool/{TOOL}/schema",
+            "Per-tool examples: GET /{SERVER}/tool/{TOOL}/example",
+            "Zero-argument test: GET /{SERVER}/tool/{TOOL}/try"
         ]
     }
 
@@ -714,21 +630,17 @@ async def tools_list(server: str = Path(..., description="Server alias")):
         raise HTTPException(404, f"Unknown server '{server}'")
     tools = []
     for tname, td in st.tools.items():
-        tools.append({
-            "name": tname,
-            "description": td.description,
-            "input_schema": td.input_schema
-        })
+        tools.append({"name": tname, "description": td.description, "input_schema": td.input_schema})
     return {"server": server, "tools": tools}
 
 
 # =============================================================================
-# HTTP Fallback helper
+# HTTP fallback
 # =============================================================================
 
 async def forward_via_http(server: str, tool_path: str, method: str, params: Dict[str, Any], body: Optional[Dict[str, Any]]):
     if not MCP_FORWARD_URL:
-        raise HTTPException(503, "No MCP server connected and MCP_FORWARD_URL not set for HTTP fallback")
+        raise HTTPException(503, "No MCP server connected and MCP_FORWARD_URL not set")
     url = MCP_FORWARD_URL.rstrip("/") + f"/{server}/tool/{tool_path}"
     try:
         async with httpx.AsyncClient(timeout=60) as client:
@@ -744,7 +656,7 @@ async def forward_via_http(server: str, tool_path: str, method: str, params: Dic
 
 
 # =============================================================================
-# Generic Tool Dispatch (HTTP-first unless MCP_FORCE_STDIO)
+# Generic Tool Dispatch
 # =============================================================================
 
 async def do_tool_call(
@@ -754,7 +666,6 @@ async def do_tool_call(
     qargs: Optional[str],
     dryrun: bool,
 ) -> Any:
-    # Prepare arguments exactly as provided
     if body is None:
         if qargs is not None:
             try:
@@ -770,20 +681,18 @@ async def do_tool_call(
     if dryrun:
         return {"dryrun": True, "server": server, "tool": tool_name, "args": args}
 
-    # Decide path order
     prefer_stdio = MCP_FORCE_STDIO
 
-    # HTTP path (preferred unless forced to stdio)
+    # HTTP first (unless forced stdio)
     if not prefer_stdio and MCP_RPC_URL:
         try:
             return await mcp_http_call_tool(tool_name, args)
         except Exception as e:
             if MCP_FORWARD_URL:
-                params: Dict[str, Any] = {}
-                return await forward_via_http(server, tool_name, "POST", params, args)
+                return await forward_via_http(server, tool_name, "POST", {}, args)
             raise HTTPException(502, f"HTTP RPC invocation failed: {e}")
 
-    # stdio path (only if enabled and configured)
+    # stdio (descriptor only)
     if MCP_STDIO_ENABLED or MCP_FORCE_STDIO:
         st = DISCOVERY.servers.get(server)
         if not st or not st.cfg.cmd:
@@ -800,8 +709,7 @@ async def do_tool_call(
         except Exception as e:
             raise HTTPException(502, f"Stdio invocation failed: {e}")
 
-    # Nothing usable
-    raise HTTPException(503, "No usable transport: set MCP_RPC_URL or enable MCP_STDIO_ENABLED=1 / MCP_FORCE_STDIO=1.")
+    raise HTTPException(503, "No usable transport: set MCP_RPC_URL or enable MCP_STDIO_ENABLED/MCP_FORCE_STDIO")
 
 
 @app.post(
@@ -838,7 +746,7 @@ async def tool_dispatch_get(
     server: str = Path(..., description="Server alias (e.g., 'mcp')"),
     tool_name: str = Path(..., description="Exact tool name as exposed by MCP"),
     dryrun: Optional[bool] = Query(False, description="If true, returns the would-be MCP call without executing it"),
-    args: Optional[str] = Query(None, description="JSON-encoded arguments; if not JSON, will be sent as {'args': '<raw>'}"),
+    args: Optional[str] = Query(None, description="JSON-encoded arguments; sent as-is (or {'args': '<raw>'})"),
 ):
     body = None  # GET has no body
     try:
@@ -878,13 +786,13 @@ async def tool_help(tool: str):
         }
     td = st.tools[tool]
     return {
-        "name": tool,
-        "description": td.description,
-        "notes": [
-            "Arguments are forwarded to the MCP tool exactly as you send them.",
-            "Use /mcp/tool/{tool}/schema and /mcp/tool/{tool}/example for guidance."
-        ],
-    }
+            "name": tool,
+            "description": td.description,
+            "notes": [
+                "Arguments are forwarded to the MCP tool exactly as you send them.",
+                "Use /mcp/tool/{tool}/schema and /mcp/tool/{tool}/example for guidance."
+            ],
+        }
 
 @app.get("/mcp/tool/{tool}/example", tags=["tools", "example"], summary="Tool examples (schema-derived)")
 async def tool_example(tool: str):
