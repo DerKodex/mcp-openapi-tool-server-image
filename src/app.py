@@ -135,11 +135,11 @@ async def mcp_connect_stdio(cfg: ServerConfig):
     We call stdio_client with a single positional "spec"-like object that exposes:
       - .command: str
       - .args: list[str]
-      - .env: Optional[dict[str,str]]
+      - .env: dict[str,str] (always present, may be empty)
 
-    Order:
-      A) stdio_client(SimpleNamespace(command, args, env))
-      B) stdio_client(SimpleNamespace(command, args)) with env injected into os.environ
+    Order tried:
+      A) stdio_client(SimpleNamespace(command, args, env=<cfg.env or {}>))
+      B) Inject env into os.environ and still pass a spec WITH env attribute ({})
 
     We do NOT try list/string variants to prevent "'list' object has no attribute 'command'".
     """
@@ -160,9 +160,9 @@ async def mcp_connect_stdio(cfg: ServerConfig):
 
     last_exc: Optional[BaseException] = None
 
-    # Variant A: pass a 'spec'-like object as single positional arg (with env attr)
+    # Variant A: pass a 'spec'-like object as single positional arg (env attr always present)
     try:
-        spec = SimpleNamespace(command=_command, args=_args, env=(cfg.env or None))
+        spec = SimpleNamespace(command=_command, args=_args, env=(cfg.env or {}))
         res = stdio_client(spec)  # one positional argument
         client = await _normalize_stdio_result(res)
         init = getattr(client, "initialize", None)
@@ -174,14 +174,14 @@ async def mcp_connect_stdio(cfg: ServerConfig):
     except Exception as e:
         last_exc = e
 
-    # Variant B: temporarily inject env into process and pass spec without env attribute
+    # Variant B: temporarily inject env into process and pass spec WITH env attribute (empty dict if needed)
     orig_env = None
     try:
         if cfg.env:
             orig_env = os.environ.copy()
             os.environ.update(cfg.env)
 
-        spec2 = SimpleNamespace(command=_command, args=_args)
+        spec2 = SimpleNamespace(command=_command, args=_args, env={})
         res = stdio_client(spec2)  # still one positional argument
         client = await _normalize_stdio_result(res)
         init = getattr(client, "initialize", None)
@@ -205,7 +205,7 @@ async def mcp_list_tools(session) -> List[Dict[str, Any]]:
     raw_tools = getattr(result, "tools", result)
     tools = []
     for t in raw_tools:
-        name = getattr(t, "name", None) or t.get("name")
+        name = getattr(t, "name", None) or (t.get("name") if isinstance(t, dict) else None)
         if not name:
             continue
         description = getattr(t, "description", None)
@@ -320,7 +320,7 @@ async def mcp_http_call_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, 
 
 app = FastAPI(
     title="MCP OpenAPI Bridge (Generic, Self-Discovering)",
-    version="4.1.1",
+    version="4.1.2",
     description=textwrap.dedent(
         """\
         A generic, self-discovering OpenAPI façade for MCP servers.
