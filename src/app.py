@@ -6,8 +6,7 @@ MCP OpenAPI Bridge — Generic, Self-Discovering (HTTP-first, hardened stdio)
 - Generic only (no domain assumptions)
 - HTTP RPC (MCP_RPC_URL) preferred; stdio optional and hardened
 - Stdio uses the descriptor-only signature expected by newer MCP SDKs
-- Stdio connector now tries only safe '--transport stdio' / '--transport=stdio' permutations
-- No bare '--stdio' attempt (your server does not support it)
+- OpenAPI now includes concrete per-tool POST endpoints with real schemas
 
 Run:
   uvicorn app:app --host 0.0.0.0 --port 8080
@@ -18,9 +17,9 @@ Env:
   MCP_FORCE_STDIO=0              # 0/1. If 1, prefer stdio for discovery/calls.
   MCP_STDIO_INIT_TIMEOUT=45      # seconds for session.initialize()
   MCP_STDIO_PREFLIGHT=1          # 0/1 run version/help preflights
-  MCP_STDIO_PREFLIGHT_CONFIG=0   # 0/1 run a quick preflight with *configured args* (off by default)
-  MCP_STDIO_EXTRA_ARGS=''        # optional space-separated extra args appended for stdio attempts
-  MCP_SERVERS='[{"alias":"mcp","mode":"stdio","cmd":["/path/to/mcp-server","--transport","stdio","--access-level","readonly"],"env":{"K":"V"},"cwd":"/work"}]'
+  MCP_STDIO_PREFLIGHT_CONFIG=0   # 0/1 preflight with configured args (off by default)
+  MCP_STDIO_EXTRA_ARGS=''        # optional extra args appended for stdio attempts
+  MCP_SERVERS='[{"alias":"mcp","mode":"stdio","cmd":["/mcpbin/mcp-kubernetes","--transport","stdio","--access-level","readonly"],"env":{"K":"V"},"cwd":"/app"}]'
   MCP_DISCOVERY_WAIT=2
   MCP_FORWARD_URL='http://mcp-upstream:8080'
 """
@@ -74,7 +73,7 @@ if MCP_STDIO_ENABLED or MCP_FORCE_STDIO:
     try:
         from mcp.client.stdio import StdioServerParameters as StdioParamsType  # type: ignore
     except Exception:
-        StdioParamsType = None  # we’ll use SimpleNamespace fallback
+        StdioParamsType = None  # fallback
 
 
 # =============================================================================
@@ -329,8 +328,8 @@ def _with_extra_args(args: List[str]) -> List[str]:
 
 def _arg_permutations(base_args: List[str]) -> List[List[str]]:
     """
-    Generate safe permutations around '--transport stdio' vs '--transport=stdio'.
-    We DO NOT try a bare '--stdio' flag (your server does not support it).
+    Safe permutations: '--transport stdio' vs '--transport=stdio'.
+    No bare '--stdio' attempt.
     """
     perms: List[List[str]] = []
 
@@ -344,10 +343,9 @@ def _arg_permutations(base_args: List[str]) -> List[List[str]]:
     def has_equals(k: str) -> bool:
         return any(s.startswith(k + "=") for s in base_args)
 
-    # 0) as-is
-    perms.append(list(base_args))
+    perms.append(list(base_args))  # 0) as-is
 
-    # 1) if '--transport','stdio' turn into '--transport=stdio'
+    # 1) pair -> equals
     if has_pair("--transport"):
         i = base_args.index("--transport")
         if i < len(base_args) - 1:
@@ -355,26 +353,24 @@ def _arg_permutations(base_args: List[str]) -> List[List[str]]:
             perm = base_args[:i] + [f"--transport={v}"] + base_args[i + 2:]
             perms.append(perm)
 
-    # 2) if '--transport=stdio' split to pair
+    # 2) equals -> pair
     if has_equals("--transport"):
         for s in base_args:
             if s.startswith("--transport="):
                 v = s.split("=", 1)[1]
                 perm = [x for x in base_args if x != s]
-                # Insert pair near start (position doesn't matter)
-                perm = ["--transport", v] + perm
-                perms.append(perm)
+                perms.append(["--transport", v] + perm)
                 break
 
-    # 3) if no transport, add equals
+    # 3) none -> equals
     if not has_pair("--transport") and not has_equals("--transport"):
         perms.append(base_args + ["--transport=stdio"])
 
-    # 4) and also try pair style
+    # 4) none -> pair
     if not has_pair("--transport") and not has_equals("--transport"):
         perms.append(base_args + ["--transport", "stdio"])
 
-    # Deduplicate + add extra args if any
+    # Dedup + extra
     seen = set()
     uniq: List[List[str]] = []
     for p in perms:
@@ -414,7 +410,6 @@ async def _preflight_all(command: str, args: List[str], env: Dict[str, str], cwd
     await _run_short(command, ["--version"], env, cwd, "version")
     await _run_short(command, ["--help"], env, cwd, "help")
     if MCP_STDIO_PREFLIGHT_CONFIG:
-        # Only when explicitly enabled; otherwise we avoid starting a long-lived server during startup
         await _run_short(command, args, env, cwd, "configured-args", timeout_s=4.0)
 
 async def mcp_connect_stdio(cfg: ServerConfig) -> Any:
@@ -456,13 +451,11 @@ async def mcp_connect_stdio(cfg: ServerConfig) -> Any:
                 if inspect.isawaitable(maybe):
                     await asyncio.wait_for(maybe, timeout=MCP_STDIO_INIT_TIMEOUT)
 
-            # success
             setattr(session, "__stdio_ctx__", stdio_cm)
             setattr(session, "__session_ctx__", session_ctx)
             setattr(session, "__stdio_args__", list(args))
             return session
         except Exception as e:
-            # close any opened contexts
             await _exit_ctx(session_ctx)
             await _exit_ctx(stdio_cm)
             errors.append(f"#{idx} args={args} -> {type(e).__name__}: {e}")
@@ -515,7 +508,7 @@ async def mcp_call_tool_stdio(session, tool_name: str, args: Dict[str, Any]) -> 
 
 app = FastAPI(
     title="MCP OpenAPI Bridge (Generic, Self-Discovering)",
-    version="6.4.0",
+    version="6.5.0",
     description=textwrap.dedent(
         """\
         Generic OpenAPI façade for MCP servers.
@@ -578,7 +571,6 @@ async def on_startup():
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    # No explicit close hook in SDK; contexts auto-close when GC'd.
     pass
 
 
@@ -676,54 +668,6 @@ async def discover_endpoint(wait: Optional[int] = Query(0, description="Seconds 
 @app.get("/discovery/status", tags=["discovery"], summary="Discovery Status")
 async def discovery_status():
     return {"servers": DISCOVERY.list_servers()}
-
-
-# =============================================================================
-# OpenAPI enrichment
-# =============================================================================
-
-def openapi_extra_blocks() -> Dict[str, Any]:
-    x_model_instructions = {
-        "usage": [
-            "Use GET with ?args={...} (JSON-encoded) or POST with a JSON body.",
-            "If the tool expects no arguments, send POST {}.",
-            "Arguments are forwarded exactly as provided to the MCP tool.",
-            "See /mcp/tool/{tool}/schema and /mcp/tool/{tool}/example for schema-derived guidance."
-        ],
-        "discovery": [
-            "List tools: GET /{SERVER}/tools/list",
-            "Per-tool schema: GET /{SERVER}/tool/{TOOL}/schema",
-            "Per-tool examples: GET /{SERVER}/tool/{TOOL}/example",
-            "Zero-argument test: GET /{SERVER}/tool/{TOOL}/try"
-        ]
-    }
-    x_mcp_tool_catalog: List[Dict[str, Any]] = []
-    for alias, st in DISCOVERY.servers.items():
-        for tname, td in st.tools.items():
-            x_mcp_tool_catalog.append({
-                "server": alias,
-                "tool": tname,
-                "description": td.description,
-                "schema": td.input_schema or {"type": "object"},
-                "requiredFields": (td.input_schema or {}).get("required", []),
-                "examples": td.examples,
-            })
-    return {
-        "x-model-instructions": x_model_instructions,
-        "x-mcp-tool-catalog": x_mcp_tool_catalog,
-        "x-mcp-prompts": {},
-        "x-mcp-resources": {}
-    }
-
-@app.get("/{server}/tools/list", tags=["discovery"], summary="Tools List")
-async def tools_list(server: str = Path(..., description="Server alias")):
-    st = DISCOVERY.servers.get(server)
-    if not st:
-        raise HTTPException(404, f"Unknown server '{server}'")
-    tools = []
-    for tname, td in st.tools.items():
-        tools.append({"name": tname, "description": td.description, "input_schema": td.input_schema})
-    return {"server": server, "tools": tools}
 
 
 # =============================================================================
@@ -898,13 +842,105 @@ async def tool_try(tool: str, dryrun: Optional[bool] = Query(False)):
 
 
 # =============================================================================
-# OpenAPI Post-processor
+# OpenAPI Post-processor (adds per-tool POST operations)
 # =============================================================================
+
+def _inject_tool_operations(openapi_schema: Dict[str, Any]) -> None:
+    """
+    Add one concrete POST endpoint per discovered tool at /mcp/tool/{tool_name},
+    using the tool's input_schema as the requestBody schema. These point at the
+    existing dynamic handler path; FastAPI routing already matches them.
+    """
+    paths = openapi_schema.setdefault("paths", {})
+    # For each known tool, add a POST path
+    for alias, st in DISCOVERY.servers.items():
+        if alias != "mcp":
+            # You can drop this condition if you want per-alias paths too
+            continue
+        for tname, td in st.tools.items():
+            p = f"/mcp/tool/{tname}"
+            if p not in paths:
+                paths[p] = {}
+            # Build operation
+            op = {
+                "tags": ["tools"],
+                "summary": f"Call MCP tool '{tname}'",
+                "description": (td.description or "").strip(),
+                "operationId": f"call_{alias}_{tname}",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            # OpenAPI 3.1 accepts JSON Schema directly
+                            "schema": td.input_schema or {"type": "object"}
+                        }
+                    }
+                },
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {"type": "object"}  # generic MCP result envelope
+                            }
+                        }
+                    }
+                }
+            }
+            # Only set if not already present
+            if "post" not in paths[p]:
+                paths[p]["post"] = op
+
+def openapi_extra_blocks() -> Dict[str, Any]:
+    x_model_instructions = {
+        "usage": [
+            "Use GET with ?args={...} (JSON-encoded) or POST with a JSON body.",
+            "If the tool expects no arguments, send POST {}.",
+            "Arguments are forwarded exactly as provided to the MCP tool.",
+            "See /mcp/tool/{tool}/schema and /mcp/tool/{tool}/example for schema-derived guidance."
+        ],
+        "discovery": [
+            "List tools: GET /{SERVER}/tools/list",
+            "Per-tool schema: GET /{SERVER}/tool/{TOOL}/schema",
+            "Per-tool examples: GET /{SERVER}/tool/{TOOL}/example",
+            "Zero-argument test: GET /{SERVER}/tool/{TOOL}/try"
+        ]
+    }
+    x_mcp_tool_catalog: List[Dict[str, Any]] = []
+    for alias, st in DISCOVERY.servers.items():
+        for tname, td in st.tools.items():
+            x_mcp_tool_catalog.append({
+                "server": alias,
+                "tool": tname,
+                "description": td.description,
+                "schema": td.input_schema or {"type": "object"},
+                "requiredFields": (td.input_schema or {}).get("required", []),
+                "examples": td.examples,
+            })
+    return {
+        "x-model-instructions": x_model_instructions,
+        "x-mcp-tool-catalog": x_mcp_tool_catalog,
+        "x-mcp-prompts": {},
+        "x-mcp-resources": {}
+    }
+
+@app.get("/{server}/tools/list", tags=["discovery"], summary="Tools List")
+async def tools_list(server: str = Path(..., description="Server alias")):
+    st = DISCOVERY.servers.get(server)
+    if not st:
+        raise HTTPException(404, f"Unknown server '{server}'")
+    tools = []
+    for tname, td in st.tools.items():
+        tools.append({"name": tname, "description": td.description, "input_schema": td.input_schema})
+    return {"server": server, "tools": tools}
+
 
 _original_openapi = app.openapi
 def custom_openapi():
     openapi_schema = _original_openapi()
+    # Enrich with extras and concrete tool operations
     openapi_schema.update({ **openapi_extra_blocks() })
+    _inject_tool_operations(openapi_schema)
     app.openapi_schema = openapi_schema
     return app.openapi_schema
 app.openapi = custom_openapi
