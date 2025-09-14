@@ -7,7 +7,7 @@ MCP OpenAPI Bridge — Generic, Self-Discovering (HTTP-first, robust stdio)
 - Discovers MCP tools at runtime and exposes generic HTTP endpoints
 - HTTP RPC (MCP_RPC_URL) is the default and recommended path
 - Optional stdio support (MCP_STDIO_ENABLED=1), with robust multi-variant open
-- Force stdio for discovery/invocation via MCP_FORCE_STDIO=1
+- Optional stdio preference (MCP_FORCE_STDIO=1) to prefer stdio before HTTP
 
 Run:
   uvicorn app:app --host 0.0.0.0 --port 8080
@@ -16,7 +16,7 @@ Env:
   MCP_RPC_URL='http://mcp-server:8080/mcp'     # Raw MCP HTTP RPC endpoint (recommended)
   MCP_STDIO_ENABLED=0                          # 0/1 (default 0). If 1, stdio is available.
   MCP_FORCE_STDIO=0                            # 0/1. If 1, prefer stdio for discover & calls.
-  MCP_SERVERS='[{"alias":"mcp","mode":"stdio","cmd":["/path/to/mcp-server","--flag"],"env":{"K":"V"},"cwd":"/work"}]'
+  MCP_SERVERS='[{"alias":"mcp","mode":"stdio","cmd":["/path/to/mcp-server","--transport","stdio"],"env":{"K":"V"},"cwd":"/work"}]'
   MCP_DISCOVERY_WAIT=2
   MCP_FORWARD_URL='http://mcp-upstream:8080'   # OPTIONAL: REST bridge fallback when both fail
 """
@@ -25,6 +25,7 @@ import asyncio
 import inspect
 import json
 import os
+import stat
 import sys
 import textwrap
 from typing import Any, Dict, List, Optional, Tuple
@@ -126,7 +127,6 @@ def getenv_json(name: str, default: Any) -> Any:
 
 
 def _schema_enums(schema: Dict[str, Any]) -> Dict[str, List[str]]:
-    """Return {field: [enum values]} for fields that define enum arrays."""
     out: Dict[str, List[str]] = {}
     try:
         props = (schema or {}).get("properties", {})
@@ -139,7 +139,6 @@ def _schema_enums(schema: Dict[str, Any]) -> Dict[str, List[str]]:
 
 
 def _schema_fields(schema: Dict[str, Any]) -> List[str]:
-    """Return list of top-level property names from schema (best-effort)."""
     try:
         props = (schema or {}).get("properties", {})
         return list(props.keys())
@@ -148,11 +147,6 @@ def _schema_fields(schema: Dict[str, Any]) -> List[str]:
 
 
 def _build_examples_from_schema(tool_name: str, schema: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    GENERIC example generator:
-    - Build GET/POST examples from the schema with simple placeholder values.
-    - No domain assumptions.
-    """
     props = _schema_fields(schema)
     enums = _schema_enums(schema)
     examples: List[Dict[str, Any]] = []
@@ -282,6 +276,18 @@ async def _exit_ctx(cm):
         except Exception:
             pass
 
+def _is_executable(path: str) -> bool:
+    try:
+        st = os.stat(path)
+        if not stat.S_ISREG(st.st_mode):
+            return False
+        # executable for any of user/group/other
+        return bool(st.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH))
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return False
+
 def _server_descriptors(cfg: ServerConfig) -> List[SimpleNamespace]:
     """
     Yield descriptor variants to satisfy different SDK expectations.
@@ -295,7 +301,10 @@ def _server_descriptors(cfg: ServerConfig) -> List[SimpleNamespace]:
     else:
         raise RuntimeError(f"Server {cfg.alias}: invalid cmd; expected str or non-empty list[str].")
 
-    # Ensure env and cwd ALWAYS exist
+    # Preflight: if absolute path, verify it exists and is executable
+    if os.path.isabs(cmd0) and not _is_executable(cmd0):
+        raise RuntimeError(f"Executable not found or not executable: '{cmd0}' for server '{cfg.alias}'")
+
     env = dict(os.environ)
     if cfg.env:
         env.update(cfg.env)
@@ -366,7 +375,7 @@ async def mcp_connect_stdio(cfg: ServerConfig) -> Any:
             maybe = init()
             if inspect.isawaitable(maybe):
                 # prevent startup hangs
-                await asyncio.wait_for(maybe, timeout=30)
+                await asyncio.wait_for(maybe, timeout=25)
         setattr(session, "__stdio_ctx__", stdio_cm)
         setattr(session, "__stdio_pair__", rw)
         return session
@@ -421,19 +430,23 @@ async def mcp_connect_stdio(cfg: ServerConfig) -> Any:
 
     # Attempt E: descriptor objects (with guaranteed env/cwd defaults)
     last_exc: Optional[BaseException] = None
-    for desc in _server_descriptors(cfg):
-        stdio_cm = None
-        try:
-            stdio_cm = stdio_client(desc)  # type: ignore
-            rw = await _enter_ctx(stdio_cm)
-            return await _finalize(stdio_cm, rw)
-        except Exception as e:
-            last_exc = e
-            attempts.append(f"E(desc:{list(vars(desc).keys())}) -> {type(e).__name__}: {e!s}")
+    try:
+        for desc in _server_descriptors(cfg):
+            stdio_cm = None
             try:
-                await _exit_ctx(stdio_cm)
-            except Exception:
-                pass
+                stdio_cm = stdio_client(desc)  # type: ignore
+                rw = await _enter_ctx(stdio_cm)
+                return await _finalize(stdio_cm, rw)
+            except Exception as e:
+                last_exc = e
+                attempts.append(f"E(desc:{list(vars(desc).keys())}) -> {type(e).__name__}: {e!s}")
+                try:
+                    await _exit_ctx(stdio_cm)
+                except Exception:
+                    pass
+    except Exception as e:  # preflight failures bubble here (e.g., not executable)
+        last_exc = e
+        attempts.append(f"E(preflight) -> {type(e).__name__}: {e!s}")
 
     detail = " | ".join(attempts)  # include all attempts for clarity
     raise RuntimeError(f"Failed to open stdio_client for '{cfg.alias}': {detail}")
@@ -481,7 +494,7 @@ async def mcp_call_tool_stdio(session, tool_name: str, args: Dict[str, Any]) -> 
 
 app = FastAPI(
     title="MCP OpenAPI Bridge (Generic, Self-Discovering)",
-    version="5.5.0",
+    version="5.6.0",
     description=textwrap.dedent(
         """\
         A generic, self-discovering OpenAPI façade for MCP servers.
@@ -532,7 +545,6 @@ async def normalize_odd_paths(request: Request, call_next):
 
 @app.on_event("startup")
 async def on_startup():
-    # Seed server list from env (for stdio mode only)
     servers_cfg = getenv_json("MCP_SERVERS", None) or []
     for cfg in servers_cfg:
         cfg_obj = ServerConfig(**cfg)
@@ -544,7 +556,6 @@ async def on_startup():
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    # Close any active stdio contexts/sessions
     for _, st in list(DISCOVERY.servers.items()):
         try:
             if st.client is not None:
@@ -580,7 +591,7 @@ async def do_discover(wait_seconds: int = 0) -> Dict[str, Any]:
 
         prefer_stdio = MCP_FORCE_STDIO
 
-        # ---- HTTP RPC discovery (unless we force stdio)
+        # HTTP discovery (unless we force stdio)
         if not prefer_stdio and MCP_RPC_URL:
             try:
                 tools_raw = await mcp_http_list_tools()
@@ -589,7 +600,7 @@ async def do_discover(wait_seconds: int = 0) -> Dict[str, Any]:
             except Exception as e:
                 print(f"[discover:http-rpc] list_tools failed via {MCP_RPC_URL}: {e}", file=sys.stderr)
 
-        # ---- stdio discovery
+        # stdio discovery
         if (prefer_stdio or not tools_raw) and (MCP_STDIO_ENABLED or MCP_FORCE_STDIO) and st.cfg.mode == "stdio" and st.cfg.cmd:
             try:
                 if not st.connected or st.client is None:
@@ -605,7 +616,6 @@ async def do_discover(wait_seconds: int = 0) -> Dict[str, Any]:
                 st.connected = False
                 st.client = None
 
-        # ---- Update local tool cache (with schema-driven examples)
         st.tools.clear()
         for tr in tools_raw:
             name = tr["name"]
@@ -876,8 +886,8 @@ async def tool_help(tool: str):
         "name": tool,
         "description": td.description,
         "notes": [
-                "Arguments are forwarded to the MCP tool exactly as you send them.",
-                "Use /mcp/tool/{tool}/schema and /mcp/tool/{tool}/example for guidance."
+            "Arguments are forwarded to the MCP tool exactly as you send them.",
+            "Use /mcp/tool/{tool}/schema and /mcp/tool/{tool}/example for guidance."
         ],
     }
 
@@ -897,6 +907,41 @@ async def tool_try(tool: str, dryrun: Optional[bool] = Query(False)):
 # =============================================================================
 # OpenAPI Post-processor
 # =============================================================================
+
+def openapi_extra_blocks() -> Dict[str, Any]]:
+    x_model_instructions = {
+        "usage": [
+            "Use **GET** with `?args={...}` (JSON-encoded) or **POST** with a JSON body.",
+            "If the tool expects no arguments, send POST `{}`.",
+            "This bridge forwards arguments exactly as provided to the MCP tool.",
+            "Inspect `/mcp/tool/{tool}/schema` and `/mcp/tool/{tool}/example` for guidance derived from the MCP tool schema."
+        ],
+        "discovery": [
+            "List tools: `GET /{SERVER}/tools/list`.",
+            "Per-tool schema: `GET /{SERVER}/tool/{TOOL}/schema`.",
+            "Per-tool examples: `GET /{SERVER}/tool/{TOOL}/example`.",
+            "Zero-argument test: `GET /{SERVER}/tool/{TOOL}/try`."
+        ]
+    }
+
+    x_mcp_tool_catalog: List[Dict[str, Any]] = []
+    for alias, st in DISCOVERY.servers.items():
+        for tname, td in st.tools.items():
+            x_mcp_tool_catalog.append({
+                "server": alias,
+                "tool": tname,
+                "description": td.description,
+                "schema": td.input_schema or {"type": "object"},
+                "requiredFields": (td.input_schema or {}).get("required", []),
+                "examples": td.examples,
+            })
+
+    return {
+        "x-model-instructions": x_model_instructions,
+        "x-mcp-tool-catalog": x_mcp_tool_catalog,
+        "x-mcp-prompts": {},
+        "x-mcp-resources": {}
+    }
 
 _original_openapi = app.openapi
 def custom_openapi():
