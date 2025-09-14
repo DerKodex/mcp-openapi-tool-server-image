@@ -24,9 +24,8 @@ import json
 import os
 import sys
 import textwrap
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import unquote
-from types import SimpleNamespace
 
 import httpx
 from fastapi import FastAPI, Body, Query, Path, HTTPException, Request
@@ -36,11 +35,21 @@ from pydantic import BaseModel, Field
 
 # ---- Optional MCP stdio client ---------------------------------------------
 try:
-    from mcp.client.stdio import stdio_client
+    from mcp.client.stdio import stdio_client  # async context manager in many versions
     from mcp.types import TextContent
     MCP_AVAILABLE = True
 except Exception:
     MCP_AVAILABLE = False
+
+# Try to import a session type (name changed across versions)
+MCPClientSession = None
+try:
+    from mcp.client.session import ClientSession as MCPClientSession  # preferred
+except Exception:
+    try:
+        from mcp.client.session import Session as MCPClientSession     # older
+    except Exception:
+        MCPClientSession = None
 
 
 # =============================================================================
@@ -68,8 +77,12 @@ class ServerState:
     def __init__(self, cfg: ServerConfig):
         self.cfg = cfg
         self.connected = False
-        self.client = None
+        self.client = None  # holds the MCP session
         self.tools: Dict[str, ToolDescriptor] = {}
+
+        # For clean shutdown (we manually entered two async context managers)
+        self._stdio_ctx = None
+        self._session_ctx = None
 
 
 class DiscoveryState:
@@ -109,100 +122,144 @@ def getenv_json(name: str, default: Any) -> Any:
 # MCP integration (stdio)
 # =============================================================================
 
-async def _normalize_stdio_result(res):
-    """
-    Normalize stdio_client result:
-    - If it is an async context manager: await __aenter__().
-    - Else if it's awaitable: await it.
-    - Else return the instance.
-    """
-    if hasattr(res, "__aenter__"):
-        entered = res.__aenter__()
-        client = await entered if inspect.isawaitable(entered) else entered
+async def _enter_ctx(cm):
+    """Manually enter an async context manager and return the entered value."""
+    aenter = getattr(cm, "__aenter__", None)
+    if not callable(aenter):
+        raise TypeError("Expected an async context manager")
+    entered = aenter()
+    return await entered if inspect.isawaitable(entered) else entered
+
+
+async def _exit_ctx(cm):
+    """Manually exit an async context manager, ignoring errors."""
+    aexit = getattr(cm, "__aexit__", None)
+    if callable(aexit):
         try:
-            setattr(client, "__mcp_ctx__", res)  # keep ctx for graceful shutdown
+            maybe = aexit(None, None, None)
+            if inspect.isawaitable(maybe):
+                await maybe
         except Exception:
             pass
-        return client
-
-    if inspect.isawaitable(res):
-        return await res
-
-    return res
 
 
-async def mcp_connect_stdio(cfg: ServerConfig):
+async def _open_stdio_context(cfg: ServerConfig):
     """
-    Create an MCP stdio client across SDK variants while avoiding keyword-only
-    signatures and avoiding argv/list forms entirely.
-
-    We call stdio_client with a single positional "spec"-like object that exposes:
-      - .command: str
-      - .args: list[str]
-      - .env: dict[str,str] (always present, may be empty)
-      - .cwd: str (always present)
-
-    Order tried:
-      A) stdio_client(SimpleNamespace(command, args, env=<cfg.env or {}>, cwd=<cfg.cwd or os.getcwd()>))
-      B) Inject env into os.environ and still pass a spec WITH env attr (empty dict) and cwd.
-
-    We do NOT try list/string variants to prevent "'list' object has no attribute 'command'".
+    Open the stdio_client async context manager using several signature variants.
+    Returns (stdio_ctx, (read_stream, write_stream)).
+    We never pass invented objects; only string/list + supported kwargs.
     """
     if not MCP_AVAILABLE:
         raise RuntimeError("MCP python SDK not installed. pip install mcp[stdio]")
     if not cfg.cmd:
         raise RuntimeError(f"Server {cfg.alias}: stdio mode requires 'cmd'.")
 
-    # Normalize command + args
+    # Normalize command + args (string or list acceptable to us)
     if isinstance(cfg.cmd, list):
         if not cfg.cmd:
             raise RuntimeError(f"Server {cfg.alias}: empty cmd list.")
-        _command, _args = str(cfg.cmd[0]), [str(x) for x in cfg.cmd[1:]]
+        _as_list = [str(x) for x in cfg.cmd]
+        _as_str = str(cfg.cmd[0])
     elif isinstance(cfg.cmd, str):
-        _command, _args = cfg.cmd, []
+        _as_list = [cfg.cmd]
+        _as_str = cfg.cmd
     else:
         raise RuntimeError(f"Server {cfg.alias}: cmd must be list[str] or str, got {type(cfg.cmd)}")
 
     working_dir = cfg.cwd or os.getcwd()
+    env_dict = cfg.env or {}
     last_exc: Optional[BaseException] = None
 
-    # Variant A: pass a 'spec'-like object as single positional arg (env/cwd attrs always present)
-    try:
-        spec = SimpleNamespace(command=_command, args=_args, env=(cfg.env or {}), cwd=working_dir)
-        res = stdio_client(spec)  # one positional argument
-        client = await _normalize_stdio_result(res)
-        init = getattr(client, "initialize", None)
-        if callable(init):
-            maybe = init()
-            if inspect.isawaitable(maybe):
-                await maybe
-        return client
-    except Exception as e:
-        last_exc = e
+    # We will try in order:
+    # 1) stdio_client(command=<str>, args=[...], env=..., cwd=...)
+    # 2) stdio_client(<list>, env=..., cwd=...)
+    # 3) stdio_client(<str>, env=..., cwd=...)
+    # 4) same 1-3 without env/cwd kwargs (older SDKs)
+    # 5) same 1-3 with env injected into os.environ (when env kw unsupported)
 
-    # Variant B: temporarily inject env into process and pass spec WITH env attr (empty dict) and cwd
-    orig_env = None
-    try:
-        if cfg.env:
-            orig_env = os.environ.copy()
-            os.environ.update(cfg.env)
+    def _candidates(with_env_kwargs: bool, use_env_injection: bool):
+        # Build kw set
+        kw = {}
+        if with_env_kwargs:
+            kw["cwd"] = working_dir
+            kw["env"] = {} if use_env_injection else env_dict
 
-        spec2 = SimpleNamespace(command=_command, args=_args, env={}, cwd=working_dir)
-        res = stdio_client(spec2)  # still one positional argument
-        client = await _normalize_stdio_result(res)
-        init = getattr(client, "initialize", None)
-        if callable(init):
-            maybe = init()
-            if inspect.isawaitable(maybe):
-                await maybe
-        return client
-    except Exception as e2:
-        last_exc = e2
-        raise RuntimeError(f"Failed to create stdio MCP client for '{cfg.alias}': {last_exc}")
-    finally:
-        if orig_env is not None:
-            os.environ.clear()
-            os.environ.update(orig_env)
+        # each returns the un-entered context manager
+        def c1():
+            return stdio_client(command=_as_list[0], args=_as_list[1:], **kw)
+        def c2():
+            return stdio_client(_as_list, **kw)
+        def c3():
+            return stdio_client(_as_str, **kw)
+
+        return (c1, c2, c3)
+
+    # Try with env kwargs, then without; env injection only if env provided
+    for with_env in (True, False):
+        for use_injection in ((True, False) if (with_env and bool(env_dict)) else (False,)):
+            orig_env = None
+            if use_injection:
+                orig_env = os.environ.copy()
+                os.environ.update(env_dict)
+            try:
+                for ctor in _candidates(with_env, use_injection):
+                    try:
+                        cm = ctor()  # async context manager
+                        try:
+                            rw = await _enter_ctx(cm)  # (read, write)
+                        except TypeError as te:
+                            # Not this signature; next
+                            last_exc = te
+                            continue
+                        except AttributeError as ae:
+                            # Wrong kw (e.g., unexpected 'command') or internal mismatch
+                            last_exc = ae
+                            continue
+                        if not isinstance(rw, (tuple, list)) or len(rw) != 2:
+                            # Unexpected return (should be (read, write))
+                            await _exit_ctx(cm)
+                            last_exc = TypeError("stdio_client did not yield (read_stream, write_stream)")
+                            continue
+                        return cm, (rw[0], rw[1])
+                    except TypeError as te:
+                        last_exc = te
+                        continue
+                    except Exception as e:
+                        last_exc = e
+                        continue
+            finally:
+                if use_injection and orig_env is not None:
+                    os.environ.clear()
+                    os.environ.update(orig_env)
+
+    raise RuntimeError(f"Failed to open stdio_client for '{cfg.alias}': {last_exc}")
+
+
+async def mcp_connect_stdio(cfg: ServerConfig) -> Any:
+    """
+    Create and initialize an MCP client session using stdio streams.
+    Keeps both the stdio context manager and session context manager open.
+    Returns the session object ready for use.
+    """
+    if MCPClientSession is None:
+        raise RuntimeError("MCP client session class not available (mcp.client.session).")
+
+    stdio_ctx, (read_stream, write_stream) = await _open_stdio_context(cfg)
+
+    # Enter the session context and initialize
+    session_ctx = MCPClientSession(read_stream, write_stream)
+    session = await _enter_ctx(session_ctx)
+
+    init = getattr(session, "initialize", None)
+    if callable(init):
+        maybe = init()
+        if inspect.isawaitable(maybe):
+            await maybe
+
+    # Attach context managers for shutdown
+    setattr(session, "__mcp_stdio_ctx__", stdio_ctx)
+    setattr(session, "__mcp_session_ctx__", session_ctx)
+    return session
 
 
 async def mcp_list_tools(session) -> List[Dict[str, Any]]:
@@ -230,7 +287,7 @@ async def mcp_list_tools(session) -> List[Dict[str, Any]]:
     return tools
 
 
-async def mcp_call_tool(session, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+async def mcp_call_tool(session, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]]:
     call = await session.call_tool(tool_name, args)
     normalized = {"type": "mcp_result", "content": []}
     content_seq = getattr(call, "content", None) or call
@@ -295,7 +352,7 @@ async def mcp_http_list_tools() -> List[Dict[str, Any]]:
     return tools
 
 
-async def mcp_http_call_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+async def mcp_http_call_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]]:
     if not MCP_RPC_URL:
         raise RuntimeError("MCP_RPC_URL not set")
     rpc_url = MCP_RPC_URL.rstrip("/")
@@ -326,7 +383,7 @@ async def mcp_http_call_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, 
 
 app = FastAPI(
     title="MCP OpenAPI Bridge (Generic, Self-Discovering)",
-    version="4.1.4",
+    version="4.2.0",
     description=textwrap.dedent(
         """\
         A generic, self-discovering OpenAPI façade for MCP servers.
@@ -385,13 +442,14 @@ async def on_startup():
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    # Gracefully close any stdio sessions opened via async context manager
+    # Gracefully close any stdio + session contexts we opened
     for alias, st in list(DISCOVERY.servers.items()):
         try:
             if st.client is not None:
-                ctx = getattr(st.client, "__mcp_ctx__", None)
-                if ctx and hasattr(ctx, "__aexit__"):
-                    await ctx.__aexit__(None, None, None)
+                session_ctx = getattr(st.client, "__mcp_session_ctx__", None)
+                stdio_ctx = getattr(st.client, "__mcp_stdio_ctx__", None)
+                await _exit_ctx(session_ctx)
+                await _exit_ctx(stdio_ctx)
         except Exception:
             pass
 
@@ -406,13 +464,13 @@ def refresh_servers_from_env() -> bool:
             DISCOVERY.servers[cfg_obj.alias] = ServerState(cfg_obj)
             updated = True
         else:
-            if (not st.cfg.cmd and cfg_obj.cmd) or (st.cfg.cmd != cfg_obj.cmd) or (st.cfg.mode != cfg_obj.mode) or (st.cfg.env != cfg_obj.env) or (st.cfg.cwd != cfg_obj.cwd):
+            if (st.cfg.cmd != cfg_obj.cmd) or (st.cfg.mode != cfg_obj.mode) or (st.cfg.env != cfg_obj.env) or (st.cfg.cwd != cfg_obj.cwd):
                 DISCOVERY.servers[cfg_obj.alias] = ServerState(cfg_obj)
                 updated = True
     return updated
 
 
-async def do_discover(wait_seconds: int = 0) -> Dict[str, Any]:
+async def do_discover(wait_seconds: int = 0) -> Dict[str, Any]]:
     for alias, st in list(DISCOVERY.servers.items()):
         tools_raw: List[Dict[str, Any]] = []
 
@@ -500,7 +558,7 @@ async def discovery_status():
 # OpenAPI enrichment (generic)
 # =============================================================================
 
-def openapi_extra_blocks() -> Dict[str, Any]:
+def openapi_extra_blocks() -> Dict[str, Any]]:
     x_model_instructions = {
         "usage": [
             "Use **GET** with `?args={...}` (JSON-encoded) or **POST** with a JSON body.",
