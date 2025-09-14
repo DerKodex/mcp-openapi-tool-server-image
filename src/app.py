@@ -5,7 +5,7 @@ MCP OpenAPI Bridge — Generic, Self-Discovering (HTTP-first, stdio via descript
 ---------------------------------------------------------------------------------
 - Purely generic (no domain-specific logic)
 - HTTP RPC (MCP_RPC_URL) preferred; stdio optional
-- Stdio uses ONLY the descriptor-based signature (matches your SDK):
+- Stdio uses ONLY the descriptor-based signature:
     stdio_client(<object with .command, .args, .env, .cwd, ...>)
 
 Run:
@@ -15,6 +15,8 @@ Env:
   MCP_RPC_URL='http://mcp-server:8080/mcp'     # HTTP RPC endpoint (recommended)
   MCP_STDIO_ENABLED=0                          # 0/1 (default 0). If 1, stdio allowed.
   MCP_FORCE_STDIO=0                            # 0/1. If 1, prefer stdio for discovery/calls.
+  MCP_STDIO_INIT_TIMEOUT=45                    # seconds for session.initialize()
+  MCP_STDIO_PREFLIGHT=1                        # 0/1 run '<cmd> --version' then '--help' before connect
   MCP_SERVERS='[{"alias":"mcp","mode":"stdio","cmd":["/path/to/mcp-server","--transport=stdio"],"env":{"K":"V"},"cwd":"/work"}]'
   MCP_DISCOVERY_WAIT=2
   MCP_FORWARD_URL='http://mcp-upstream:8080'   # OPTIONAL: REST bridge fallback
@@ -42,6 +44,8 @@ from pydantic import BaseModel, Field
 # -----------------------------------------------------------------------------
 MCP_STDIO_ENABLED = os.getenv("MCP_STDIO_ENABLED", "0").strip().lower() in ("1", "true", "yes")
 MCP_FORCE_STDIO = os.getenv("MCP_FORCE_STDIO", "0").strip().lower() in ("1", "true", "yes")
+MCP_STDIO_INIT_TIMEOUT = int(os.getenv("MCP_STDIO_INIT_TIMEOUT", "45"))
+MCP_STDIO_PREFLIGHT = os.getenv("MCP_STDIO_PREFLIGHT", "1").strip().lower() in ("1", "true", "yes")
 
 MCP_AVAILABLE = False
 MCPClientSession = None
@@ -63,11 +67,11 @@ if MCP_STDIO_ENABLED or MCP_FORCE_STDIO:
             from mcp.client.session import Session as MCPClientSession  # type: ignore
         except Exception:
             MCPClientSession = None
-    # If SDK provides a typed parameters class, keep it; otherwise we’ll use SimpleNamespace
+    # Optional typed parameters class
     try:
         from mcp.client.stdio import StdioServerParameters as StdioParamsType  # type: ignore
     except Exception:
-        StdioParamsType = None  # use SimpleNamespace fallback
+        StdioParamsType = None  # fallback to SimpleNamespace
 
 
 # =============================================================================
@@ -321,9 +325,44 @@ def _make_stdio_descriptor(cfg: ServerConfig):
         encoding_error_handler="replace", stderr_encoding_error_handler="replace",
     )
 
+async def _preflight_stdio_command(desc: Any) -> None:
+    """
+    Run '<cmd> --version' then '<cmd> --help' with same env/cwd.
+    This surfaces immediate exec problems before the JSON-RPC handshake.
+    """
+    if not MCP_STDIO_PREFLIGHT:
+        return
+
+    async def _run(args: List[str], tag: str):
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                desc.command, *args,
+                cwd=getattr(desc, "cwd", None),
+                env=getattr(desc, "env", None),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                outs, errs = await asyncio.wait_for(proc.communicate(), timeout=8)
+            except asyncio.TimeoutError:
+                proc.kill()
+                print(f"[stdio-preflight] {tag} timeout: {desc.command} {' '.join(args)}", file=sys.stderr)
+                return
+            out_s = (outs or b"")[:400].decode("utf-8", "replace")
+            err_s = (errs or b"")[:400].decode("utf-8", "replace")
+            code = proc.returncode
+            print(f"[stdio-preflight] {tag} rc={code}; stdout[:400]=\n{out_s}\n--- stderr[:400]=\n{err_s}", file=sys.stderr)
+        except FileNotFoundError:
+            print(f"[stdio-preflight] {tag} NOT FOUND: {desc.command}", file=sys.stderr)
+        except Exception as e:
+            print(f"[stdio-preflight] {tag} failed: {type(e).__name__}: {e}", file=sys.stderr)
+
+    await _run(["--version"], "version")
+    await _run(["--help"], "help")
+
 async def mcp_connect_stdio(cfg: ServerConfig) -> Any:
     """
-    Connect using ONLY the descriptor signature that your SDK expects:
+    Connect using ONLY the descriptor signature:
         stdio_client(<descriptor with .command/.args/.env/.cwd/...>)
     """
     if not (MCP_STDIO_ENABLED or MCP_FORCE_STDIO):
@@ -334,6 +373,9 @@ async def mcp_connect_stdio(cfg: ServerConfig) -> Any:
         raise RuntimeError(f"Server {cfg.alias}: stdio mode requires 'cmd'.")
 
     desc = _make_stdio_descriptor(cfg)
+
+    # Preflight binary to surface immediate issues
+    await _preflight_stdio_command(desc)
 
     # Open stdio transport
     stdio_cm = None
@@ -350,7 +392,7 @@ async def mcp_connect_stdio(cfg: ServerConfig) -> Any:
         if callable(init):
             maybe = init()
             if inspect.isawaitable(maybe):
-                await asyncio.wait_for(maybe, timeout=30)
+                await asyncio.wait_for(maybe, timeout=MCP_STDIO_INIT_TIMEOUT)
 
         setattr(session, "__stdio_ctx__", stdio_cm)
         setattr(session, "__stdio_pair__", rw)
@@ -411,12 +453,12 @@ async def mcp_call_tool_stdio(session, tool_name: str, args: Dict[str, Any]) -> 
 
 app = FastAPI(
     title="MCP OpenAPI Bridge (Generic, Self-Discovering)",
-    version="6.0.0",
+    version="6.1.0",
     description=textwrap.dedent(
         """\
         Generic OpenAPI façade for MCP servers.
         - HTTP RPC preferred (MCP_RPC_URL).
-        - Stdio optional (enable with MCP_STDIO_ENABLED=1). Uses descriptor-only signature.
+        - Stdio optional (enable with MCP_STDIO_ENABLED=1). Descriptor-only signature.
         - No domain-specific logic; arguments are forwarded as provided.
         - Per-tool examples are auto-generated from the MCP schema.
         """
@@ -468,7 +510,11 @@ async def on_startup():
     if "mcp" not in DISCOVERY.servers:
         DISCOVERY.servers["mcp"] = ServerState(ServerConfig(alias="mcp"))
 
-    await do_discover(wait_seconds=int(os.getenv("MCP_DISCOVERY_WAIT", "0")))
+    try:
+        await do_discover(wait_seconds=int(os.getenv("MCP_DISCOVERY_WAIT", "0")))
+    except Exception as e:
+        # Don’t block startup; log only
+        print(f"Validation failed:\n{e}", file=sys.stderr)
 
 @app.on_event("shutdown")
 async def on_shutdown():
