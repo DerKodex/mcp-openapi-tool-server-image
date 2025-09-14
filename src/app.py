@@ -75,6 +75,7 @@ class ToolDescriptor(BaseModel):
     name: str
     description: Optional[str] = None
     input_schema: Optional[Dict[str, Any]] = None
+    examples: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class ServerState:
@@ -117,6 +118,93 @@ def getenv_json(name: str, default: Any) -> Any:
         return json.loads(val)
     except Exception:
         return default
+
+
+def _schema_enums(schema: Dict[str, Any]) -> Dict[str, List[str]]:
+    """Return {field: [enum values]} for fields that define enum arrays."""
+    out: Dict[str, List[str]] = {}
+    try:
+        props = (schema or {}).get("properties", {})
+        for k, v in (props or {}).items():
+            if isinstance(v, dict) and "enum" in v and isinstance(v["enum"], list):
+                out[k] = [str(x) for x in v["enum"]]
+    except Exception:
+        pass
+    return out
+
+
+def _schema_fields(schema: Dict[str, Any]) -> List[str]:
+    """Return list of top-level property names from schema (best-effort)."""
+    try:
+        props = (schema or {}).get("properties", {})
+        return list(props.keys())
+    except Exception:
+        return []
+
+
+def _build_examples_from_schema(tool_name: str, schema: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    GENERIC example generator:
+    - If enum fields exist, create a couple of GET/POST examples using their first values.
+    - Include other fields with placeholder values.
+    - No domain assumptions. Everything is derived from names/enums only.
+    """
+    props = _schema_fields(schema)
+    enums = _schema_enums(schema)
+    required = (schema or {}).get("required", [])
+    examples: List[Dict[str, Any]] = []
+
+    # Helper: build a sample body using first enum values + placeholders
+    def sample_body() -> Dict[str, Any]:
+        body: Dict[str, Any] = {}
+        for p in props:
+            if p in enums and enums[p]:
+                body[p] = enums[p][0]
+            else:
+                # simple placeholder; keep strings for most fields
+                body[p] = f"<{p}>"
+        return body
+
+    # If we have two common enum fields, show combo examples; otherwise generic
+    body = sample_body()
+
+    # POST example
+    examples.append({
+        "intent": f"Call '{tool_name}' with a JSON body matching its schema",
+        "call": {
+            "POST": f"/mcp/tool/{tool_name}",
+            "body": body
+        },
+        "notes": [
+            "Send exactly the fields your MCP tool expects. The body is forwarded as-is."
+        ]
+    })
+
+    # GET example using ?args=
+    examples.append({
+        "intent": f"Call '{tool_name}' via GET with JSON-encoded args",
+        "call": {
+            "GET": f"/mcp/tool/{tool_name}?args=" + json.dumps(body)
+        },
+        "notes": [
+            "The 'args' query param must be JSON-encoded. The server forwards it as-is."
+        ]
+    })
+
+    # If there are obvious enums like operation/resource, add one more explicit sample
+    interesting = [k for k in ("operation", "resource", "action", "kind", "type") if k in props]
+    if interesting:
+        body2 = sample_body()
+        examples.append({
+            "intent": f"Explicitly set {', '.join(interesting)} for '{tool_name}'",
+            "call": {
+                "POST": f"/mcp/tool/{tool_name}",
+                "body": body2
+            },
+            "notes": ["Values shown are the first enum choices when available."]
+        })
+
+    return examples
 
 
 # =============================================================================
@@ -213,9 +301,8 @@ async def mcp_connect_stdio(cfg: ServerConfig):
     """
     Extremely conservative stdio connector:
     - Only attempts the simplest signatures observed across SDKs
-    - No 'command=' or other keyword variants that caused prior errors
-    - No invented objects; pass list[str] or str positionally
-    - env/cwd aren't passed (older SDKs differ); if needed, use wrappers outside
+    - No keyword variants; pass list[str] or str positionally
+    - env/cwd aren't passed (older SDKs differ); wrap externally if needed
     """
     if not MCP_STDIO_ENABLED:
         raise RuntimeError("MCP stdio disabled (set MCP_STDIO_ENABLED=1 to enable).")
@@ -307,7 +394,6 @@ async def mcp_call_tool_stdio(session, tool_name: str, args: Dict[str, Any]) -> 
     call = await session.call_tool(tool_name, args)
     content_seq = getattr(call, "content", None) or call
     normalized = {"type": "mcp_result", "content": []}
-    # We don't import TextContent when stdio disabled; guard dynamically
     try:
         from mcp.types import TextContent as _TC  # type: ignore
     except Exception:
@@ -328,13 +414,14 @@ async def mcp_call_tool_stdio(session, tool_name: str, args: Dict[str, Any]) -> 
 
 app = FastAPI(
     title="MCP OpenAPI Bridge (Generic, Self-Discovering)",
-    version="5.0.0",
+    version="5.1.0",
     description=textwrap.dedent(
         """\
         A generic, self-discovering OpenAPI façade for MCP servers.
         - HTTP RPC is the primary path (MCP_RPC_URL).
         - Stdio is optional and OFF by default (set MCP_STDIO_ENABLED=1 to enable).
         - No domain-specific logic; arguments are forwarded exactly as provided.
+        - Per-tool examples are auto-generated from each tool's schema.
         """
     ),
     servers=[{"url": "http://localhost:8080"}],
@@ -444,13 +531,14 @@ async def do_discover(wait_seconds: int = 0) -> Dict[str, Any]:
                 st.connected = False
                 st.client = None
 
-        # ---- Update local tool cache
+        # ---- Update local tool cache (with schema-driven examples)
         st.tools.clear()
         for tr in tools_raw:
             name = tr["name"]
             desc = tr.get("description") or ""
             schema = tr.get("input_schema") or {}
-            st.tools[name] = ToolDescriptor(name=name, description=desc, input_schema=schema)
+            examples = _build_examples_from_schema(name, schema or {})
+            st.tools[name] = ToolDescriptor(name=name, description=desc, input_schema=schema, examples=examples)
 
     if wait_seconds > 0:
         await asyncio.sleep(min(wait_seconds, 10))
@@ -500,7 +588,7 @@ async def discovery_status():
 
 
 # =============================================================================
-# OpenAPI enrichment (generic)
+# OpenAPI enrichment (generic, with examples)
 # =============================================================================
 
 def openapi_extra_blocks() -> Dict[str, Any]:
@@ -509,12 +597,12 @@ def openapi_extra_blocks() -> Dict[str, Any]:
             "Use **GET** with `?args={...}` (JSON-encoded) or **POST** with a JSON body.",
             "If the tool expects no arguments, send POST `{}`.",
             "This bridge forwards arguments exactly as provided to the MCP tool.",
-            "Use `/mcp/tool/{tool}/schema` to inspect the tool's input schema discovered from MCP."
+            "Inspect `/mcp/tool/{tool}/schema` and `/mcp/tool/{tool}/example` for guidance derived from the MCP tool schema."
         ],
         "discovery": [
             "List tools: `GET /{SERVER}/tools/list`.",
             "Per-tool schema: `GET /{SERVER}/tool/{TOOL}/schema`.",
-            "Per-tool help (generic): `GET /{SERVER}/tool/{TOOL}/help`.",
+            "Per-tool examples: `GET /{SERVER}/tool/{TOOL}/example`.",
             "Zero-argument test: `GET /{SERVER}/tool/{TOOL}/try`."
         ]
     }
@@ -528,6 +616,7 @@ def openapi_extra_blocks() -> Dict[str, Any]:
                 "description": td.description,
                 "schema": td.input_schema or {"type": "object"},
                 "requiredFields": (td.input_schema or {}).get("required", []),
+                "examples": td.examples,
             })
 
     return {
@@ -605,7 +694,6 @@ async def do_tool_call(
         try:
             return await mcp_http_call_tool(tool_name, args)
         except Exception as e:
-            # If configured, try forwarding to a generic upstream REST bridge
             if MCP_FORWARD_URL:
                 params: Dict[str, Any] = {}
                 return await forward_via_http(server, tool_name, "POST", params, args)
@@ -646,7 +734,6 @@ async def tool_dispatch_post(
         result = await do_tool_call(server, tool_name, body, None, bool(dryrun))
         return JSONResponse(result)
     except HTTPException as e:
-        # Secondary forward (if MCP_RPC_URL missing and stdio disabled)
         if e.status_code == 503 and MCP_FORWARD_URL:
             params: Dict[str, Any] = {}
             if dryrun:
@@ -700,7 +787,7 @@ async def tool_help(tool: str):
             "description": "",
             "notes": [
                 "Arguments are forwarded to the MCP tool exactly as you send them.",
-                "Use /mcp/tool/{tool}/schema to inspect expected fields."
+                "Use /mcp/tool/{tool}/schema and /mcp/tool/{tool}/example for guidance."
             ],
         }
     td = st.tools[tool]
@@ -709,9 +796,16 @@ async def tool_help(tool: str):
         "description": td.description,
         "notes": [
             "Arguments are forwarded to the MCP tool exactly as you send them.",
-            "Use /mcp/tool/{tool}/schema to inspect expected fields."
+            "Use /mcp/tool/{tool}/schema and /mcp/tool/{tool}/example for guidance."
         ],
     }
+
+@app.get("/mcp/tool/{tool}/example", tags=["tools", "example"], summary="Tool examples (schema-derived)")
+async def tool_example(tool: str):
+    st = DISCOVERY.servers.get("mcp")
+    if not st or tool not in st.tools:
+        return {"examples": []}
+    return {"examples": st.tools[tool].examples}
 
 @app.get("/mcp/tool/{tool}/try", tags=["tools", "try"], summary="Tool zero-arg try",
          description="Calls this tool with `{}` (no arguments).")
