@@ -281,7 +281,6 @@ def _is_executable(path: str) -> bool:
         st = os.stat(path)
         if not stat.S_ISREG(st.st_mode):
             return False
-        # executable for any of user/group/other
         return bool(st.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH))
     except FileNotFoundError:
         return False
@@ -301,7 +300,6 @@ def _server_descriptors(cfg: ServerConfig) -> List[SimpleNamespace]:
     else:
         raise RuntimeError(f"Server {cfg.alias}: invalid cmd; expected str or non-empty list[str].")
 
-    # Preflight: if absolute path, verify it exists and is executable
     if os.path.isabs(cmd0) and not _is_executable(cmd0):
         raise RuntimeError(f"Executable not found or not executable: '{cmd0}' for server '{cfg.alias}'")
 
@@ -351,7 +349,6 @@ async def mcp_connect_stdio(cfg: ServerConfig) -> Any:
     if not cfg.cmd:
         raise RuntimeError(f"Server {cfg.alias}: stdio mode requires 'cmd'.")
 
-    # Normalize command pieces
     if isinstance(cfg.cmd, list):
         cmd_list = [str(x) for x in cfg.cmd]
         cmd0, args = cmd_list[0], cmd_list[1:]
@@ -374,13 +371,12 @@ async def mcp_connect_stdio(cfg: ServerConfig) -> Any:
         if callable(init):
             maybe = init()
             if inspect.isawaitable(maybe):
-                # prevent startup hangs
                 await asyncio.wait_for(maybe, timeout=25)
         setattr(session, "__stdio_ctx__", stdio_cm)
         setattr(session, "__stdio_pair__", rw)
         return session
 
-    # Attempt A: keyword style (if supported)
+    # Attempt A: keyword style
     try:
         stdio_cm = stdio_client(command=cmd0, args=args, env=env_kw, cwd=cwd_kw)  # type: ignore
         rw = await _enter_ctx(stdio_cm)
@@ -428,7 +424,7 @@ async def mcp_connect_stdio(cfg: ServerConfig) -> Any:
         except Exception:
             pass
 
-    # Attempt E: descriptor objects (with guaranteed env/cwd defaults)
+    # Attempt E: descriptor objects
     last_exc: Optional[BaseException] = None
     try:
         for desc in _server_descriptors(cfg):
@@ -444,11 +440,11 @@ async def mcp_connect_stdio(cfg: ServerConfig) -> Any:
                     await _exit_ctx(stdio_cm)
                 except Exception:
                     pass
-    except Exception as e:  # preflight failures bubble here (e.g., not executable)
+    except Exception as e:
         last_exc = e
         attempts.append(f"E(preflight) -> {type(e).__name__}: {e!s}")
 
-    detail = " | ".join(attempts)  # include all attempts for clarity
+    detail = " | ".join(attempts)
     raise RuntimeError(f"Failed to open stdio_client for '{cfg.alias}': {detail}")
 
 async def mcp_list_tools_stdio(session) -> List[Dict[str, Any]]:
@@ -796,7 +792,6 @@ async def do_tool_call(
             if not st.connected or st.client is None:
                 st.client = await mcp_connect_stdio(st.cfg)
                 st.connected = True
-                # Refresh discovery after connect (best effort)
                 try:
                     await do_discover(0)
                 except Exception:
@@ -907,41 +902,6 @@ async def tool_try(tool: str, dryrun: Optional[bool] = Query(False)):
 # =============================================================================
 # OpenAPI Post-processor
 # =============================================================================
-
-def openapi_extra_blocks() -> Dict[str, Any]]:
-    x_model_instructions = {
-        "usage": [
-            "Use **GET** with `?args={...}` (JSON-encoded) or **POST** with a JSON body.",
-            "If the tool expects no arguments, send POST `{}`.",
-            "This bridge forwards arguments exactly as provided to the MCP tool.",
-            "Inspect `/mcp/tool/{tool}/schema` and `/mcp/tool/{tool}/example` for guidance derived from the MCP tool schema."
-        ],
-        "discovery": [
-            "List tools: `GET /{SERVER}/tools/list`.",
-            "Per-tool schema: `GET /{SERVER}/tool/{TOOL}/schema`.",
-            "Per-tool examples: `GET /{SERVER}/tool/{TOOL}/example`.",
-            "Zero-argument test: `GET /{SERVER}/tool/{TOOL}/try`."
-        ]
-    }
-
-    x_mcp_tool_catalog: List[Dict[str, Any]] = []
-    for alias, st in DISCOVERY.servers.items():
-        for tname, td in st.tools.items():
-            x_mcp_tool_catalog.append({
-                "server": alias,
-                "tool": tname,
-                "description": td.description,
-                "schema": td.input_schema or {"type": "object"},
-                "requiredFields": (td.input_schema or {}).get("required", []),
-                "examples": td.examples,
-            })
-
-    return {
-        "x-model-instructions": x_model_instructions,
-        "x-mcp-tool-catalog": x_mcp_tool_catalog,
-        "x-mcp-prompts": {},
-        "x-mcp-resources": {}
-    }
 
 _original_openapi = app.openapi
 def custom_openapi():
