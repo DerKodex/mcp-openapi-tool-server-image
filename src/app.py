@@ -24,7 +24,7 @@ import json
 import os
 import sys
 import textwrap
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 from urllib.parse import unquote
 
 import httpx
@@ -287,7 +287,7 @@ async def mcp_list_tools(session) -> List[Dict[str, Any]]:
     return tools
 
 
-async def mcp_call_tool(session, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]]:
+async def mcp_call_tool(session, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     call = await session.call_tool(tool_name, args)
     normalized = {"type": "mcp_result", "content": []}
     content_seq = getattr(call, "content", None) or call
@@ -352,7 +352,7 @@ async def mcp_http_list_tools() -> List[Dict[str, Any]]:
     return tools
 
 
-async def mcp_http_call_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]]:
+async def mcp_http_call_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     if not MCP_RPC_URL:
         raise RuntimeError("MCP_RPC_URL not set")
     rpc_url = MCP_RPC_URL.rstrip("/")
@@ -383,7 +383,7 @@ async def mcp_http_call_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, 
 
 app = FastAPI(
     title="MCP OpenAPI Bridge (Generic, Self-Discovering)",
-    version="4.2.0",
+    version="4.2.1",
     description=textwrap.dedent(
         """\
         A generic, self-discovering OpenAPI façade for MCP servers.
@@ -470,7 +470,7 @@ def refresh_servers_from_env() -> bool:
     return updated
 
 
-async def do_discover(wait_seconds: int = 0) -> Dict[str, Any]]:
+async def do_discover(wait_seconds: int = 0) -> Dict[str, Any]:
     for alias, st in list(DISCOVERY.servers.items()):
         tools_raw: List[Dict[str, Any]] = []
 
@@ -558,7 +558,7 @@ async def discovery_status():
 # OpenAPI enrichment (generic)
 # =============================================================================
 
-def openapi_extra_blocks() -> Dict[str, Any]]:
+def openapi_extra_blocks() -> Dict[str, Any]:
     x_model_instructions = {
         "usage": [
             "Use **GET** with `?args={...}` (JSON-encoded) or **POST** with a JSON body.",
