@@ -1,4 +1,16 @@
 fastapi==0.114.2
-uvicorn==0.30.6
+uvicorn[standard]==0.30.6
 httpx==0.27.2
+
+# MCP Python SDK (stdio transport used by your bridge)
 mcp[stdio]
+
+# Redis-backed cache
+redis>=5.0,<6
+
+# Yugabyte (Postgres wire) async pool
+psycopg[binary]>=3.2,<3.3
+psycopg_pool>=3.2,<3.3
+
+# Keycloak-style YAML manifest parsing
+PyYAML>=6.0.1,<7

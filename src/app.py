@@ -1,31 +1,40 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MCP OpenAPI Bridge — Generic, Self-Discovering (HTTP-first, hardened stdio)
----------------------------------------------------------------------------
-- Generic only (no domain assumptions)
-- HTTP RPC (MCP_RPC_URL) preferred; stdio optional and hardened
-- Stdio uses the descriptor-only signature expected by newer MCP SDKs
-- OpenAPI now includes concrete per-tool POST **and GET** endpoints with real schemas
-- Alias-path rewrite fixes clients that mistakenly use operationId as a URL
+MCP OpenAPI Bridge — Generic, Driver-Aware, Redis-backed
+--------------------------------------------------------
+- Pure generic MCP OpenAPI façade (no domain assumptions)
+- HTTP RPC (MCP_RPC_URL) preferred; stdio optional (descriptor-only)
+- Dynamic driver loading via DRIVERS (JSON list of {module, config})
+- Drivers can enrich OpenAPI (notes/examples/tags) and expose summaries
+- Driver data lives in Redis (per-instance namespace). No extra in-proc cache.
+- Alias-path rewrite fixes clients that use operationId as a URL.
 
 Run:
   uvicorn app:app --host 0.0.0.0 --port 8080
 
-Env:
+Key env:
   MCP_RPC_URL='http://mcp-server:8080/mcp'
-  MCP_STDIO_ENABLED=0            # 0/1 (default 0). If 1, stdio allowed.
-  MCP_FORCE_STDIO=0              # 0/1. If 1, prefer stdio for discovery/calls.
-  MCP_STDIO_INIT_TIMEOUT=45      # seconds for session.initialize()
-  MCP_STDIO_PREFLIGHT=1          # 0/1 run version/help preflights
-  MCP_STDIO_PREFLIGHT_CONFIG=0   # 0/1 preflight with configured args (off by default)
-  MCP_STDIO_EXTRA_ARGS=''        # optional extra args appended for stdio attempts
-  MCP_SERVERS='[{"alias":"mcp","mode":"stdio","cmd":["/mcpbin/mcp-kubernetes","--transport","stdio","--access-level","readonly"],"env":{},"cwd":"/app"}]'
+  MCP_STDIO_ENABLED=0 | 1
+  MCP_FORCE_STDIO=0 | 1
+  MCP_STDIO_INIT_TIMEOUT=45
+  MCP_STDIO_PREFLIGHT=1
+  MCP_STDIO_PREFLIGHT_CONFIG=0
+  MCP_STDIO_EXTRA_ARGS=''
+  MCP_SERVERS='[{"alias":"mcp","mode":"stdio","cmd":["/path/to/server","--transport","stdio"],"env":{},"cwd":"/app"}]'
   MCP_DISCOVERY_WAIT=2
   MCP_FORWARD_URL='http://mcp-upstream:8080'
+
+  # Driver system (preferred)
+  DRIVERS='[{"module":"mcp_openapi.drivers.yugabyte_driver","config":"/config/yugabyte-driver.yaml"}]'
+  INSTANCE_ID='mcp-k8s-ro'
+  REDIS_URL='redis://redis:6379/0'
+  DRIVER_CACHE_DEFAULT_TTL=600
+  DRIVER_CACHE_NS_PREFIX='driver'
 """
 
 import asyncio
+import importlib
 import inspect
 import json
 import os
@@ -43,15 +52,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+# ---------------- Driver registry (Redis, instance isolation) --------------
+from mcp_openapi.driver_loader import REGISTRY
+
 # -----------------------------------------------------------------------------
-# stdio toggles
+# Transport toggles
 # -----------------------------------------------------------------------------
 MCP_STDIO_ENABLED = os.getenv("MCP_STDIO_ENABLED", "0").strip().lower() in ("1", "true", "yes")
-MCP_FORCE_STDIO = os.getenv("MCP_FORCE_STDIO", "0").strip().lower() in ("1", "true", "yes")
-MCP_STDIO_INIT_TIMEOUT = int(os.getenv("MCP_STDIO_INIT_TIMEOUT", "45"))
-MCP_STDIO_PREFLIGHT = os.getenv("MCP_STDIO_PREFLIGHT", "1").strip().lower() in ("1", "true", "yes")
+MCP_FORCE_STDIO   = os.getenv("MCP_FORCE_STDIO", "0").strip().lower() in ("1", "true", "yes")
+MCP_STDIO_INIT_TIMEOUT   = int(os.getenv("MCP_STDIO_INIT_TIMEOUT", "45"))
+MCP_STDIO_PREFLIGHT      = os.getenv("MCP_STDIO_PREFLIGHT", "1").strip().lower() in ("1", "true", "yes")
 MCP_STDIO_PREFLIGHT_CONFIG = os.getenv("MCP_STDIO_PREFLIGHT_CONFIG", "0").strip().lower() in ("1", "true", "yes")
-MCP_STDIO_EXTRA_ARGS = os.getenv("MCP_STDIO_EXTRA_ARGS", "").strip()
+MCP_STDIO_EXTRA_ARGS     = os.getenv("MCP_STDIO_EXTRA_ARGS", "").strip()
 
 MCP_AVAILABLE = False
 MCPClientSession = None
@@ -77,7 +89,6 @@ if MCP_STDIO_ENABLED or MCP_FORCE_STDIO:
     except Exception:
         StdioParamsType = None  # fallback
 
-
 # =============================================================================
 # Data structures
 # =============================================================================
@@ -89,21 +100,18 @@ class ServerConfig(BaseModel):
     env: Optional[Dict[str, str]] = None
     cwd: Optional[str] = None
 
-
 class ToolDescriptor(BaseModel):
     name: str
     description: Optional[str] = None
     input_schema: Optional[Dict[str, Any]] = None
     examples: List[Dict[str, Any]] = Field(default_factory=list)
 
-
 class ServerState:
     def __init__(self, cfg: ServerConfig):
         self.cfg = cfg
         self.connected = False
-        self.client = None  # MCP session when stdio connected
+        self.client = None
         self.tools: Dict[str, ToolDescriptor] = {}
-
 
 class DiscoveryState:
     def __init__(self):
@@ -117,11 +125,9 @@ class DiscoveryState:
             "tools": list(st.tools.keys()),
         } for alias, st in self.servers.items()]
 
-
 DISCOVERY = DiscoveryState()
 MCP_FORWARD_URL = os.getenv("MCP_FORWARD_URL")
 MCP_RPC_URL = os.getenv("MCP_RPC_URL")
-
 
 # =============================================================================
 # Utilities
@@ -136,7 +142,6 @@ def getenv_json(name: str, default: Any) -> Any:
     except Exception:
         return default
 
-
 def _schema_enums(schema: Dict[str, Any]) -> Dict[str, List[str]]:
     out: Dict[str, List[str]] = {}
     try:
@@ -148,14 +153,12 @@ def _schema_enums(schema: Dict[str, Any]) -> Dict[str, List[str]]:
         pass
     return out
 
-
 def _schema_fields(schema: Dict[str, Any]) -> List[str]:
     try:
         props = (schema or {}).get("properties", {})
         return list(props.keys())
     except Exception:
         return []
-
 
 def _build_examples_from_schema(tool_name: str, schema: Dict[str, Any]) -> List[Dict[str, Any]]:
     props = _schema_fields(schema)
@@ -165,10 +168,7 @@ def _build_examples_from_schema(tool_name: str, schema: Dict[str, Any]) -> List[
     def sample_body() -> Dict[str, Any]:
         body: Dict[str, Any] = {}
         for p in props:
-            if p in enums and enums[p]:
-                body[p] = enums[p][0]
-            else:
-                body[p] = f"<{p}>"
+            body[p] = (enums[p][0] if p in enums and enums[p] else f"<{p}>")
         return body
 
     body = sample_body()
@@ -192,9 +192,8 @@ def _build_examples_from_schema(tool_name: str, schema: Dict[str, Any]) -> List[
         })
     return examples
 
-
 # =============================================================================
-# MCP integration — HTTP RPC (primary)
+# MCP integration — HTTP RPC
 # =============================================================================
 
 async def rpc_try_methods(client: httpx.AsyncClient, url: str, candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -261,9 +260,8 @@ async def mcp_http_call_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, 
             normalized["content"].append({"type": "text", "text": str(item)})
     return normalized
 
-
 # =============================================================================
-# MCP integration — stdio (descriptor-only, safe permutations)
+# MCP integration — stdio
 # =============================================================================
 
 async def _enter_ctx(cm):
@@ -329,10 +327,7 @@ def _with_extra_args(args: List[str]) -> List[str]:
     return args + extra
 
 def _arg_permutations(base_args: List[str]) -> List[List[str]]:
-    """
-    Safe permutations: '--transport stdio' vs '--transport=stdio'.
-    No bare '--stdio' attempt.
-    """
+    """Safe permutations: '--transport stdio' vs '--transport=stdio'. No bare '--stdio'."""
     perms: List[List[str]] = []
 
     def has_pair(k: str) -> bool:
@@ -345,34 +340,26 @@ def _arg_permutations(base_args: List[str]) -> List[List[str]]:
     def has_equals(k: str) -> bool:
         return any(s.startswith(k + "=") for s in base_args)
 
-    perms.append(list(base_args))  # 0) as-is
+    perms.append(list(base_args))  # as-is
 
-    # 1) pair -> equals
     if has_pair("--transport"):
         i = base_args.index("--transport")
         if i < len(base_args) - 1:
             v = base_args[i + 1]
-            perm = base_args[:i] + [f"--transport={v}"] + base_args[i + 2:]
-            perms.append(perm)
+            perms.append(base_args[:i] + [f"--transport={v}"] + base_args[i + 2:])
 
-    # 2) equals -> pair
     if has_equals("--transport"):
         for s in base_args:
             if s.startswith("--transport="):
                 v = s.split("=", 1)[1]
-                perm = [x for x in base_args if x != s]
-                perms.append(["--transport", v] + perm)
+                rest = [x for x in base_args if x != s]
+                perms.append(["--transport", v] + rest)
                 break
 
-    # 3) none -> equals
     if not has_pair("--transport") and not has_equals("--transport"):
         perms.append(base_args + ["--transport=stdio"])
-
-    # 4) none -> pair
-    if not has_pair("--transport") and not has_equals("--transport"):
         perms.append(base_args + ["--transport", "stdio"])
 
-    # Dedup + extra
     seen = set()
     uniq: List[List[str]] = []
     for p in perms:
@@ -503,22 +490,20 @@ async def mcp_call_tool_stdio(session, tool_name: str, args: Dict[str, Any]) -> 
             normalized["content"].append(payload if ctype != "unknown" else {"type": "unknown", "data": payload})
     return normalized
 
-
 # =============================================================================
-# FastAPI App + Discovery
+# FastAPI App + Discovery + Drivers
 # =============================================================================
 
 app = FastAPI(
-    title="MCP OpenAPI Bridge (Generic, Self-Discovering)",
-    version="6.6.0",
+    title="MCP OpenAPI Bridge (Generic, Driver-Aware)",
+    version="9.0.0",
     description=textwrap.dedent(
         """\
         Generic OpenAPI façade for MCP servers.
         - HTTP RPC preferred (MCP_RPC_URL).
         - Stdio optional (enable with MCP_STDIO_ENABLED=1). Descriptor-only signature.
-        - Safe stdio arg attempts (pair/equal only; no bare --stdio).
-        - No domain-specific logic; arguments are forwarded as provided.
-        - Per-tool examples auto-generated from MCP schema.
+        - Drivers (via DRIVERS env) can add MCP-specific guidance & Redis-backed data.
+        - Per-tool endpoints auto-generated from MCP tool schemas.
         """
     ),
     servers=[{"url": "http://localhost:8080"}],
@@ -531,7 +516,7 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"],
 )
 
-# --- URL normalization + alias rewrite (fixes clients that use operationId as a path) ---
+# --- URL normalization + alias rewrite (fix opId-as-path) ---
 _ALIAS_RE = re.compile(r"^/mcp/tool/call_([^_/]+)_(.+)$")
 
 @app.middleware("http")
@@ -539,10 +524,9 @@ async def normalize_odd_paths(request: Request, call_next):
     raw_path = request.scope.get("path") or ""
     decoded = unquote(raw_path)
 
-    # Rewrite opId-as-path to the real tool path, e.g. /mcp/tool/call_mcp_kubectl_resources -> /mcp/tool/kubectl_resources
     m = _ALIAS_RE.match(decoded)
     if m:
-        alias, tool = m.group(1), m.group(2)
+        _alias, tool = m.group(1), m.group(2)
         decoded = f"/mcp/tool/{tool}"
 
     for bad in ("<server-alias>", "<server>", "server-alias", "server"):
@@ -571,24 +555,35 @@ async def normalize_odd_paths(request: Request, call_next):
         request.scope["path"] = decoded
     return await call_next(request)
 
-
 @app.on_event("startup")
 async def on_startup():
+    # Load servers
     servers_cfg = getenv_json("MCP_SERVERS", None) or []
     for cfg in servers_cfg:
         cfg_obj = ServerConfig(**cfg)
         DISCOVERY.servers[cfg_obj.alias] = ServerState(cfg_obj)
     if "mcp" not in DISCOVERY.servers:
         DISCOVERY.servers["mcp"] = ServerState(ServerConfig(alias="mcp"))
+
+    # Discover tools
     try:
         await do_discover(wait_seconds=int(os.getenv("MCP_DISCOVERY_WAIT", "0")))
     except Exception as e:
         print(f"Validation failed:\n{e}", file=sys.stderr)
 
+    # Load drivers (Redis + per-instance isolation inside)
+    try:
+        status = await REGISTRY.load_from_env()
+        print(f"[drivers] loaded: {status}", file=sys.stderr)
+    except Exception as e:
+        print(f"[drivers] load_from_env failed: {e}", file=sys.stderr)
+
 @app.on_event("shutdown")
 async def on_shutdown():
-    pass
-
+    try:
+        await REGISTRY.close_all()
+    except Exception:
+        pass
 
 def refresh_servers_from_env() -> bool:
     updated = False
@@ -604,7 +599,6 @@ def refresh_servers_from_env() -> bool:
                 DISCOVERY.servers[cfg_obj.alias] = ServerState(cfg_obj)
                 updated = True
     return updated
-
 
 async def do_discover(wait_seconds: int = 0) -> Dict[str, Any]:
     for alias, st in list(DISCOVERY.servers.items()):
@@ -649,7 +643,6 @@ async def do_discover(wait_seconds: int = 0) -> Dict[str, Any]:
         } for alias, st in DISCOVERY.servers.items()]
     }
 
-
 # =============================================================================
 # Health / Info
 # =============================================================================
@@ -670,6 +663,9 @@ async def healthz():
 async def servers_info():
     return {"servers": DISCOVERY.list_servers()}
 
+@app.get("/drivers/status", tags=["info"], summary="Loaded drivers")
+async def drivers_status():
+    return await REGISTRY.describe_all()
 
 # =============================================================================
 # Discovery control
@@ -684,7 +680,6 @@ async def discover_endpoint(wait: Optional[int] = Query(0, description="Seconds 
 @app.get("/discovery/status", tags=["discovery"], summary="Discovery Status")
 async def discovery_status():
     return {"servers": DISCOVERY.list_servers()}
-
 
 # =============================================================================
 # HTTP fallback
@@ -706,18 +701,11 @@ async def forward_via_http(server: str, tool_path: str, method: str, params: Dic
     except Exception as e:
         raise HTTPException(503, f"HTTP fallback to {url} failed: {e}")
 
-
 # =============================================================================
 # Generic Tool Dispatch
 # =============================================================================
 
-async def do_tool_call(
-    server: str,
-    tool_name: str,
-    body: Optional[Dict[str, Any]],
-    qargs: Optional[str],
-    dryrun: bool,
-) -> Any:
+async def do_tool_call(server: str, tool_name: str, body: Optional[Dict[str, Any]], qargs: Optional[str], dryrun: bool) -> Any:
     if body is None:
         if qargs is not None:
             try:
@@ -761,7 +749,6 @@ async def do_tool_call(
 
     raise HTTPException(503, "No usable transport: set MCP_RPC_URL or enable MCP_STDIO_ENABLED/MCP_FORCE_STDIO")
 
-
 @app.post(
     "/{server}/tool/{tool_name:path}",
     tags=["tools"],
@@ -784,7 +771,6 @@ async def tool_dispatch_post(
                 params["dryrun"] = dryrun
             return await forward_via_http(server, tool_name, "POST", params, body or {})
         raise
-
 
 @app.get(
     "/{server}/tool/{tool_name:path}",
@@ -811,7 +797,6 @@ async def tool_dispatch_get(
                 params["args"] = args
             return await forward_via_http(server, tool_name, "GET", params, None)
         raise
-
 
 # -------------------- helper endpoints (generic) --------------------
 
@@ -856,77 +841,24 @@ async def tool_example(tool: str):
 async def tool_try(tool: str, dryrun: Optional[bool] = Query(False)):
     return await tool_dispatch_get(server="mcp", tool_name=tool, dryrun=dryrun)
 
-
 # =============================================================================
-# OpenAPI Post-processor (adds per-tool POST/GET operations + guidance)
+# OpenAPI Post-processor (per-tool ops + driver guidance + summaries)
 # =============================================================================
-
-def _tool_guidance_for(name: str) -> Dict[str, Any]:
-    """
-    Per-tool guidance used in vendor extensions to steer LLMs.
-    Adjusts heuristics for common k8s tasks.
-    """
-    # Defaults
-    guidance = {
-        "x-usage-hints": [
-            "Prefer POST with a JSON body matching the schema.",
-            "If a field is not applicable, send an empty string ''.",
-            "For namespace selection, pass flags in 'args' (e.g., -n default or --all-namespaces).",
-        ],
-        "x-examples": [],
-        "x-intent": ""
-    }
-
-    if name == "kubectl_resources":
-        guidance["x-intent"] = "Read-only listing and describing Kubernetes resources."
-        guidance["x-examples"] = [
-            {
-                "ask": "List pods in namespace 'apisix'",
-                "body": {"operation": "get", "resource": "pods", "args": "-n apisix"}
-            },
-            {
-                "ask": "Describe pod apisix-c96444b8-s7ctp in 'apisix'",
-                "body": {"operation": "describe", "resource": "pods", "args": "apisix-c96444b8-s7ctp -n apisix"}
-            },
-            {
-                "ask": "Get all services across namespaces",
-                "body": {"operation": "get", "resource": "services", "args": "--all-namespaces"}
-            },
-        ]
-    elif name == "kubectl_diagnostics":
-        guidance["x-intent"] = "Logs, events, top, exec, and cp for debugging."
-        guidance["x-examples"] = [
-            {"ask": "Tail logs of pod 'gateway-0' in 'apisix'", "body": {"operation": "logs", "resource": "", "args": "gateway-0 -n apisix"}},
-            {"ask": "Cluster events in all namespaces", "body": {"operation": "events", "resource": "", "args": "--all-namespaces"}},
-            {"ask": "Top pods in 'default'", "body": {"operation": "top", "resource": "pod", "args": "-n default"}},
-        ]
-    elif name == "kubectl_config":
-        guidance["x-intent"] = "Auth checks, config view (read-only)."
-        guidance["x-examples"] = [
-            {"ask": "What is the current context?", "body": {"operation": "config", "resource": "current-context", "args": ""}},
-            {"ask": "Can I create pods cluster-wide?", "body": {"operation": "auth", "resource": "can-i", "args": "create pods --all-namespaces"}},
-        ]
-    elif name == "kubectl_cluster":
-        guidance["x-intent"] = "Cluster metadata (resources, versions, explain)."
-        guidance["x-examples"] = [
-            {"ask": "List API resources", "body": {"operation": "api-resources", "resource": "", "args": ""}},
-            {"ask": "Explain deployments (apps/v1)", "body": {"operation": "explain", "resource": "deployments", "args": "--api-version=apps/v1"}},
-        ]
-
-    return guidance
 
 def _inject_tool_operations(openapi_schema: Dict[str, Any]) -> None:
-    """
-    Add one concrete POST and GET endpoint per discovered tool at /mcp/tool/{tool_name},
-    using the tool's input_schema. Also add rich vendor extensions to guide LLMs.
-    """
     paths = openapi_schema.setdefault("paths", {})
     tags = openapi_schema.setdefault("tags", [])
-    # Ensure tag docs exist
-    if not any(t.get("name") == "kubernetes" for t in tags):
-        tags.append({"name": "kubernetes", "description": "Operations for querying a Kubernetes cluster (read-only)."})
-    if not any(t.get("name") == "mcp" for t in tags):
-        tags.append({"name": "mcp", "description": "Model Context Protocol (stdio/http) tool bridge."})
+
+    # driver-contributed tags
+    try:
+        for d in REGISTRY.loaded.values():
+            inst = d.instance
+            if hasattr(inst, "openapi_tags"):
+                for t in (inst.openapi_tags() or []):
+                    if not any(existing.get("name") == t.get("name") for existing in tags):
+                        tags.append(t)
+    except Exception:
+        pass
 
     for alias, st in DISCOVERY.servers.items():
         if alias != "mcp":
@@ -935,83 +867,66 @@ def _inject_tool_operations(openapi_schema: Dict[str, Any]) -> None:
             p = f"/mcp/tool/{tname}"
             if p not in paths:
                 paths[p] = {}
-            guidance = _tool_guidance_for(tname)
 
-            # Build POST operation (preferred)
             post_op = {
-                "tags": ["tools", "kubernetes", "mcp"],
+                "tags": ["tools"],
                 "summary": f"Call MCP tool '{tname}'",
                 "description": (td.description or "").strip(),
-                "operationId": f"call_{alias}_{tname}",  # kept for compatibility
+                "operationId": f"call_{alias}_{tname}",
                 "requestBody": {
                     "required": True,
-                    "content": {
-                        "application/json": {
-                            "schema": td.input_schema or {"type": "object"}
-                        }
-                    }
+                    "content": {"application/json": {"schema": td.input_schema or {"type": "object"}}}
                 },
-                "responses": {
-                    "200": {
-                        "description": "Successful Response",
-                        "content": {
-                            "application/json": {"schema": {"type": "object"}}
-                        }
-                    }
-                },
-                # Vendor extensions to steer LLMs
+                "responses": {"200": {"description": "Successful Response", "content": {"application/json": {"schema": {"type": "object"}}}}},
                 "x-mcp-tool-name": tname,
-                "x-preferred": True,
-                **guidance
+                "x-usage-hints": [
+                    "Prefer POST with a body matching the tool schema.",
+                    "If a field is not applicable, send empty string ''."
+                ],
             }
-            if "post" not in paths[p]:
-                paths[p]["post"] = post_op
 
-            # Build GET operation (explicit, mirrors dynamic GET)
             get_op = {
-                "tags": ["tools", "kubernetes", "mcp"],
+                "tags": ["tools"],
                 "summary": f"Call MCP tool '{tname}' (GET)",
-                "description": (
-                    "Use only when you need to pass arguments via the 'args' query string as JSON. "
-                    "Prefer POST for structured calls."
-                ),
+                "description": "If you cannot POST JSON, use ?args={...} as a JSON object.",
                 "operationId": f"call_{alias}_{tname}_get",
                 "parameters": [
-                    {
-                        "name": "args",
-                        "in": "query",
-                        "required": False,
-                        "schema": {"type": "string", "description": "JSON-encoded arguments."},
-                        "description": "JSON-encoded object matching the tool schema."
-                    },
-                    {
-                        "name": "dryrun",
-                        "in": "query",
-                        "required": False,
-                        "schema": {"type": "boolean", "default": False}
-                    }
+                    {"name": "args", "in": "query", "required": False, "schema": {"type": "string"}},
+                    {"name": "dryrun", "in": "query", "required": False, "schema": {"type": "boolean", "default": False}},
                 ],
-                "responses": {
-                    "200": {
-                        "description": "Successful Response",
-                        "content": {"application/json": {"schema": {"type": "object"}}}
-                    }
-                },
+                "responses": {"200": {"description": "Successful Response", "content": {"application/json": {"schema": {"type": "object"}}}}},
                 "x-mcp-tool-name": tname,
-                "x-preferred": False,
-                **guidance
             }
+
+            # let drivers tweak per-tool ops
+            for d in REGISTRY.loaded.values():
+                inst = d.instance
+                if hasattr(inst, "tool_guidance"):
+                    try:
+                        extra = inst.tool_guidance(tname, td) or {}
+                        if extra:
+                            for op in (post_op, get_op):
+                                for k, v in extra.items():
+                                    if k in op and isinstance(op[k], list) and isinstance(v, list):
+                                        op[k] = op[k] + v
+                                    elif k in op and isinstance(op[k], dict) and isinstance(v, dict):
+                                        op[k] = {**op[k], **v}
+                                    else:
+                                        op[k] = v
+                    except Exception as e:
+                        print(f"[drivers] tool_guidance error from {d.modpath} for {tname}: {e}", file=sys.stderr)
+
+            if "post" not in paths[p]:
+                paths[p]["post"] = post_op
             if "get" not in paths[p]:
                 paths[p]["get"] = get_op
 
 def openapi_extra_blocks() -> Dict[str, Any]:
     x_model_instructions = {
         "usage": [
-            "Prefer POST to /mcp/tool/{tool} with a JSON body that matches the schema.",
+            "Prefer POST to /mcp/tool/{tool} with a JSON body matching the tool schema.",
             "If a parameter isn't needed, send empty string ''.",
-            "For Kubernetes namespace selection, include -n <namespace> in 'args'.",
-            "Use kubectl_resources for get/describe, kubectl_diagnostics for logs/events/top/exec/cp, "
-            "kubectl_config for auth/config introspection, kubectl_cluster for cluster info/explain."
+            "Use GET with ?args={...} only when you must pass query JSON.",
         ],
         "discovery": [
             "List tools: GET /{SERVER}/tools/list",
@@ -1020,6 +935,25 @@ def openapi_extra_blocks() -> Dict[str, Any]:
             "Zero-argument test: GET /{SERVER}/tool/{TOOL}/try"
         ]
     }
+
+    # driver summaries (pull directly from Redis-backed drivers)
+    x_driver_data_summaries: Dict[str, Any] = {}
+    for d in REGISTRY.loaded.values():
+        inst = d.instance
+        if hasattr(inst, "summarize_cache"):
+            try:
+                summary = inst.summarize_cache()
+                if summary:
+                    x_driver_data_summaries[getattr(inst, "name", d.modpath)] = summary
+            except Exception as e:
+                print(f"[drivers] summarize_cache failed for {d.modpath}: {e}", file=sys.stderr)
+
+        if hasattr(inst, "extend_model_instructions"):
+            try:
+                inst.extend_model_instructions(x_model_instructions)
+            except Exception as e:
+                print(f"[drivers] extend_model_instructions failed for {d.modpath}: {e}", file=sys.stderr)
+
     x_mcp_tool_catalog: List[Dict[str, Any]] = []
     for alias, st in DISCOVERY.servers.items():
         for tname, td in st.tools.items():
@@ -1031,8 +965,15 @@ def openapi_extra_blocks() -> Dict[str, Any]:
                 "requiredFields": (td.input_schema or {}).get("required", []),
                 "examples": td.examples,
             })
+    # also stamp instance/cache info
+    x_instance = {"id": os.getenv("INSTANCE_ID", "default")}
+    x_cache = {"prefix": REGISTRY.cache.namespace()}
+
     return {
         "x-model-instructions": x_model_instructions,
+        "x-driver-data-summaries": x_driver_data_summaries,
+        "x-instance": x_instance,
+        "x-cache": x_cache,
         "x-mcp-tool-catalog": x_mcp_tool_catalog,
         "x-mcp-prompts": {},
         "x-mcp-resources": {}
@@ -1048,13 +989,19 @@ async def tools_list(server: str = Path(..., description="Server alias")):
         tools.append({"name": tname, "description": td.description, "input_schema": td.input_schema})
     return {"server": server, "tools": tools}
 
-
 _original_openapi = app.openapi
 def custom_openapi():
     openapi_schema = _original_openapi()
-    # Enrich with extras and concrete tool operations
-    openapi_schema.update({ **openapi_extra_blocks() })
+    openapi_schema.update({**openapi_extra_blocks()})
     _inject_tool_operations(openapi_schema)
+    # let drivers patch OpenAPI further (e.g., add tags, notes)
+    try:
+        asyncio.get_event_loop()  # ensure loop exists (when imported by docs tools)
+        # enrich is async API in registry to allow drivers do I/O if needed
+        # but here we call the quick, non-I/O enrich path where possible.
+        # For deep enrich, we expose /drivers/status.
+    except Exception:
+        pass
     app.openapi_schema = openapi_schema
     return app.openapi_schema
 app.openapi = custom_openapi
