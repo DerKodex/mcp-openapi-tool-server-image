@@ -89,7 +89,7 @@ class ServerState:
         self.connected = False
         self.client = None  # MCP session (when stdio connected)
         self.tools: Dict[str, ToolDescriptor] = {}
-        self._stdio_cm = None   # async context manager returned by stdio_client(...)
+        self._stdio_ctx = None   # async context manager returned by stdio_client(...)
         self._stdio_pair: Optional[Tuple[Any, Any]] = None  # (read, write)
 
 
@@ -150,60 +150,40 @@ def _schema_fields(schema: Dict[str, Any]) -> List[str]:
 def _build_examples_from_schema(tool_name: str, schema: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     GENERIC example generator:
-    - If enum fields exist, create a couple of GET/POST examples using their first values.
-    - Include other fields with placeholder values.
-    - No domain assumptions. Everything is derived from names/enums only.
+    - Build GET/POST examples from the schema with simple placeholder values.
+    - No domain assumptions.
     """
     props = _schema_fields(schema)
     enums = _schema_enums(schema)
     examples: List[Dict[str, Any]] = []
 
-    # Helper: build a sample body using first enum values + placeholders
     def sample_body() -> Dict[str, Any]:
         body: Dict[str, Any] = {}
         for p in props:
             if p in enums and enums[p]:
                 body[p] = enums[p][0]
             else:
-                # simple placeholder; keep strings for most fields
                 body[p] = f"<{p}>"
         return body
 
     body = sample_body()
 
-    # POST example
     examples.append({
         "intent": f"Call '{tool_name}' with a JSON body matching its schema",
-        "call": {
-            "POST": f"/mcp/tool/{tool_name}",
-            "body": body
-        },
-        "notes": [
-            "Send exactly the fields your MCP tool expects. The body is forwarded as-is."
-        ]
+        "call": {"POST": f"/mcp/tool/{tool_name}", "body": body},
+        "notes": ["Send exactly the fields your MCP tool expects. The body is forwarded as-is."]
     })
-
-    # GET example using ?args=
     examples.append({
         "intent": f"Call '{tool_name}' via GET with JSON-encoded args",
-        "call": {
-            "GET": f"/mcp/tool/{tool_name}?args=" + json.dumps(body)
-        },
-        "notes": [
-            "The 'args' query param must be JSON-encoded. The server forwards it as-is."
-        ]
+        "call": {"GET": f"/mcp/tool/{tool_name}?args=" + json.dumps(body)},
+        "notes": ["The 'args' query param must be JSON-encoded. The server forwards it as-is."]
     })
-
-    # If there are obvious enums like operation/resource, add one more explicit sample
     interesting = [k for k in ("operation", "resource", "action", "kind", "type") if k in props]
     if interesting:
         body2 = sample_body()
         examples.append({
             "intent": f"Explicitly set {', '.join(interesting)} for '{tool_name}'",
-            "call": {
-                "POST": f"/mcp/tool/{tool_name}",
-                "body": body2
-            },
+            "call": {"POST": f"/mcp/tool/{tool_name}", "body": body2},
             "notes": ["Values shown are the first enum choices when available."]
         })
 
@@ -305,10 +285,7 @@ async def _exit_ctx(cm):
 def _server_descriptors(cfg: ServerConfig) -> List[SimpleNamespace]:
     """
     Yield descriptor variants to satisfy different SDK expectations.
-    Add explicit encoding handlers to avoid AttributeError seen in stdout_reader:
-    - encoding_error_handler
-    - stderr_encoding_error_handler
-    Also include stderr_encoding in some variants.
+    Include encoding fields to satisfy stdout_reader on some versions.
     """
     if isinstance(cfg.cmd, list) and cfg.cmd:
         cmd0, args = str(cfg.cmd[0]), [str(x) for x in cfg.cmd[1:]]
@@ -319,44 +296,45 @@ def _server_descriptors(cfg: ServerConfig) -> List[SimpleNamespace]:
 
     env = cfg.env or {}
     variants = [
-        # Most explicit
         SimpleNamespace(
             command=cmd0, args=args, env=env, cwd=cfg.cwd,
             encoding="utf-8", stderr_encoding="utf-8",
             encoding_error_handler="replace",
             stderr_encoding_error_handler="replace",
         ),
-        # Drop cwd
         SimpleNamespace(
             command=cmd0, args=args, env=env,
             encoding="utf-8", stderr_encoding="utf-8",
             encoding_error_handler="replace",
             stderr_encoding_error_handler="replace",
         ),
-        # Drop stderr_encoding
         SimpleNamespace(
             command=cmd0, args=args, env=env,
             encoding="utf-8",
             encoding_error_handler="replace",
             stderr_encoding_error_handler="replace",
         ),
-        # Minimal with encoding only
         SimpleNamespace(
             command=cmd0, args=args,
             encoding="utf-8",
             encoding_error_handler="replace",
         ),
-        # Bare minimum
         SimpleNamespace(command=cmd0, args=args),
     ]
     return variants
 
 async def mcp_connect_stdio(cfg: ServerConfig) -> Any:
     """
-    Robust stdio connector:
-      1) Try descriptor objects (with varying fields) — matches SDKs expecting `server.command`, etc.
-      2) Fallback to passing a list[str] or str positionally — matches older SDKs.
-    Then wrap (read, write) in ClientSession (non-context-manager), call initialize(), and return the session.
+    Hyper-robust stdio connector that tries all known calling conventions:
+
+      A) stdio_client(command=..., args=..., env=..., cwd=...)          (keyword style)
+      B) stdio_client(cmd0, args)                                       (2-positional)
+      C) stdio_client([cmd0] + args)                                    (1-positional list)
+      D) stdio_client(cmd0)                                             (1-positional str)
+      E) stdio_client(server_descriptor_object)                          (object with .command, .args, ...)
+
+    On success, returns an initialized MCPClientSession(session).
+    On failure, raises with an aggregated diagnostics message of all attempts.
     """
     if not (MCP_STDIO_ENABLED or MCP_FORCE_STDIO):
         raise RuntimeError("MCP stdio disabled (set MCP_STDIO_ENABLED=1 or MCP_FORCE_STDIO=1).")
@@ -365,94 +343,97 @@ async def mcp_connect_stdio(cfg: ServerConfig) -> Any:
     if not cfg.cmd:
         raise RuntimeError(f"Server {cfg.alias}: stdio mode requires 'cmd'.")
 
-    last_exc: Optional[BaseException] = None
+    # Normalize command pieces
+    if isinstance(cfg.cmd, list):
+        cmd_list = [str(x) for x in cfg.cmd]
+        cmd0, args = cmd_list[0], cmd_list[1:]
+    else:
+        cmd0, args = str(cfg.cmd), []
 
-    # 1) Descriptor-first variants
+    env = cfg.env or {}
+    attempts: List[str] = []
+
+    async def _finalize(stdio_cm, rw):
+        if not isinstance(rw, (tuple, list)) or len(rw) != 2:
+            raise TypeError("stdio_client did not yield (read_stream, write_stream)")
+        read_stream, write_stream = rw[0], rw[1]
+        session = MCPClientSession(read_stream, write_stream)
+        init = getattr(session, "initialize", None)
+        if callable(init):
+            maybe = init()
+            if inspect.isawaitable(maybe):
+                # prevent startup hangs
+                await asyncio.wait_for(maybe, timeout=30)
+        setattr(session, "__stdio_ctx__", stdio_cm)
+        setattr(session, "__stdio_pair__", rw)
+        return session
+
+    # Attempt A: keyword style (if supported)
+    try:
+        stdio_cm = stdio_client(command=cmd0, args=args, env=env, cwd=cfg.cwd)  # type: ignore
+        rw = await _enter_ctx(stdio_cm)
+        return await _finalize(stdio_cm, rw)
+    except Exception as e:
+        attempts.append(f"A(keyword) -> {type(e).__name__}: {e!s}")
+        try:
+            await _exit_ctx(stdio_cm)
+        except Exception:
+            pass
+
+    # Attempt B: two-positionals
+    try:
+        stdio_cm = stdio_client(cmd0, args)  # type: ignore
+        rw = await _enter_ctx(stdio_cm)
+        return await _finalize(stdio_cm, rw)
+    except Exception as e:
+        attempts.append(f"B(pos2) -> {type(e).__name__}: {e!s}")
+        try:
+            await _exit_ctx(stdio_cm)
+        except Exception:
+            pass
+
+    # Attempt C: single positional list
+    try:
+        stdio_cm = stdio_client([cmd0] + args)  # type: ignore
+        rw = await _enter_ctx(stdio_cm)
+        return await _finalize(stdio_cm, rw)
+    except Exception as e:
+        attempts.append(f"C(list1) -> {type(e).__name__}: {e!s}")
+        try:
+            await _exit_ctx(stdio_cm)
+        except Exception:
+            pass
+
+    # Attempt D: single positional str
+    try:
+        stdio_cm = stdio_client(cmd0)  # type: ignore
+        rw = await _enter_ctx(stdio_cm)
+        return await _finalize(stdio_cm, rw)
+    except Exception as e:
+        attempts.append(f"D(str1) -> {type(e).__name__}: {e!s}")
+        try:
+            await _exit_ctx(stdio_cm)
+        except Exception:
+            pass
+
+    # Attempt E: descriptor objects
+    last_exc: Optional[BaseException] = None
     for desc in _server_descriptors(cfg):
         stdio_cm = None
         try:
-            stdio_cm = stdio_client(desc)          # async context manager
-            rw = await _enter_ctx(stdio_cm)        # expect (read, write)
-            if not isinstance(rw, (tuple, list)) or len(rw) != 2:
-                raise TypeError("stdio_client did not yield (read_stream, write_stream)")
-            read_stream, write_stream = rw[0], rw[1]
-
-            session = MCPClientSession(read_stream, write_stream)  # not a context manager in most SDKs
-            init = getattr(session, "initialize", None)
-            if callable(init):
-                # Avoid startup hangs; 30s is generous
-                maybe = init()
-                if inspect.isawaitable(maybe):
-                    await asyncio.wait_for(maybe, timeout=30)
-
-            # success
-            sess = session
-            setattr(sess, "__stdio_ctx__", stdio_cm)
-            setattr(sess, "__stdio_pair__", rw)
-            return sess
-        except Exception as e:
-            last_exc = e
-            # ensure we exit context if it was entered
-            try:
-                await _exit_ctx(stdio_cm)
-            except Exception:
-                pass
-
-    # 2) Fallbacks: pass command as [list] or "str"
-    # a) list
-    if isinstance(cfg.cmd, list) and cfg.cmd:
-        stdio_cm = None
-        try:
-            cmd_list = [str(x) for x in cfg.cmd]
-            stdio_cm = stdio_client(cmd_list)
+            stdio_cm = stdio_client(desc)  # type: ignore
             rw = await _enter_ctx(stdio_cm)
-            if not isinstance(rw, (tuple, list)) or len(rw) != 2:
-                raise TypeError("stdio_client did not yield (read_stream, write_stream)")
-            read_stream, write_stream = rw[0], rw[1]
-            session = MCPClientSession(read_stream, write_stream)
-            init = getattr(session, "initialize", None)
-            if callable(init):
-                maybe = init()
-                if inspect.isawaitable(maybe):
-                    await asyncio.wait_for(maybe, timeout=30)
-            sess = session
-            setattr(sess, "__stdio_ctx__", stdio_cm)
-            setattr(sess, "__stdio_pair__", rw)
-            return sess
+            return await _finalize(stdio_cm, rw)
         except Exception as e:
             last_exc = e
+            attempts.append(f"E(desc:{list(vars(desc).keys())}) -> {type(e).__name__}: {e!s}")
             try:
                 await _exit_ctx(stdio_cm)
             except Exception:
                 pass
 
-    # b) str
-    if isinstance(cfg.cmd, str):
-        stdio_cm = None
-        try:
-            stdio_cm = stdio_client(cfg.cmd)
-            rw = await _enter_ctx(stdio_cm)
-            if not isinstance(rw, (tuple, list)) or len(rw) != 2:
-                raise TypeError("stdio_client did not yield (read_stream, write_stream)")
-            read_stream, write_stream = rw[0], rw[1]
-            session = MCPClientSession(read_stream, write_stream)
-            init = getattr(session, "initialize", None)
-            if callable(init):
-                maybe = init()
-                if inspect.isawaitable(maybe):
-                    await asyncio.wait_for(maybe, timeout=30)
-            sess = session
-            setattr(sess, "__stdio_ctx__", stdio_cm)
-            setattr(sess, "__stdio_pair__", rw)
-            return sess
-        except Exception as e:
-            last_exc = e
-            try:
-                await _exit_ctx(stdio_cm)
-            except Exception:
-                pass
-
-    raise RuntimeError(f"Failed to open stdio_client for '{cfg.alias}': {last_exc}")
+    detail = " | ".join(attempts[-5:])  # keep it compact
+    raise RuntimeError(f"Failed to open stdio_client for '{cfg.alias}': {detail}")
 
 async def mcp_list_tools_stdio(session) -> List[Dict[str, Any]]:
     result = await session.list_tools()
@@ -497,7 +478,7 @@ async def mcp_call_tool_stdio(session, tool_name: str, args: Dict[str, Any]) -> 
 
 app = FastAPI(
     title="MCP OpenAPI Bridge (Generic, Self-Discovering)",
-    version="5.3.0",
+    version="5.4.0",
     description=textwrap.dedent(
         """\
         A generic, self-discovering OpenAPI façade for MCP servers.
@@ -594,10 +575,9 @@ async def do_discover(wait_seconds: int = 0) -> Dict[str, Any]:
     for alias, st in list(DISCOVERY.servers.items()):
         tools_raw: List[Dict[str, Any]] = []
 
-        # ---- Choose path order based on MCP_FORCE_STDIO
         prefer_stdio = MCP_FORCE_STDIO
 
-        # ---- HTTP RPC discovery
+        # ---- HTTP RPC discovery (unless we force stdio)
         if not prefer_stdio and MCP_RPC_URL:
             try:
                 tools_raw = await mcp_http_list_tools()
@@ -671,7 +651,6 @@ async def servers_info():
 @app.post("/discover", tags=["discovery"], summary="Discover Endpoint")
 async def discover_endpoint(wait: Optional[int] = Query(0, description="Seconds to wait (max 10) for discovery")):
     wait = max(0, min(int(wait or 0), 10))
-    # Allow hot-reload of MCP_SERVERS if env changed
     refresh_servers_from_env()
     return await do_discover(wait_seconds=wait)
 
@@ -894,8 +873,8 @@ async def tool_help(tool: str):
         "name": tool,
         "description": td.description,
         "notes": [
-            "Arguments are forwarded to the MCP tool exactly as you send them.",
-            "Use /mcp/tool/{tool}/schema and /mcp/tool/{tool}/example for guidance."
+                "Arguments are forwarded to the MCP tool exactly as you send them.",
+                "Use /mcp/tool/{tool}/schema and /mcp/tool/{tool}/example for guidance."
         ],
     }
 
