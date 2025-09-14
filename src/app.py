@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MCP OpenAPI Bridge — Generic, Self-Discovering (HTTP-first)
------------------------------------------------------------
+MCP OpenAPI Bridge — Generic, Self-Discovering (HTTP-first, robust stdio)
+---------------------------------------------------------------------------
 - Purely generic: no domain-specific logic or assumptions
 - Discovers MCP tools at runtime and exposes generic HTTP endpoints
 - HTTP RPC (MCP_RPC_URL) is the default and recommended path
-- Optional stdio support is DISABLED by default (set MCP_STDIO_ENABLED=1 to opt in)
+- Optional stdio support (MCP_STDIO_ENABLED=1), with robust multi-variant open
+- Force stdio for discovery/invocation via MCP_FORCE_STDIO=1
 
 Run:
   uvicorn app:app --host 0.0.0.0 --port 8080
 
 Env:
   MCP_RPC_URL='http://mcp-server:8080/mcp'     # Raw MCP HTTP RPC endpoint (recommended)
-  MCP_STDIO_ENABLED=0                          # 0/1 (default 0). If 1, tries stdio *after* HTTP.
-  MCP_SERVERS='[{"alias":"mcp","mode":"stdio","cmd":["/path/to/mcp-server","--flag"]}]'
+  MCP_STDIO_ENABLED=0                          # 0/1 (default 0). If 1, stdio is available.
+  MCP_FORCE_STDIO=0                            # 0/1. If 1, prefer stdio for discover & calls.
+  MCP_SERVERS='[{"alias":"mcp","mode":"stdio","cmd":["/path/to/mcp-server","--flag"],"env":{"K":"V"},"cwd":"/work"}]'
   MCP_DISCOVERY_WAIT=2
-  MCP_FORWARD_URL='http://mcp-upstream:8080'   # OPTIONAL: REST bridge fallback when stdio/HTTP both not available
+  MCP_FORWARD_URL='http://mcp-upstream:8080'   # OPTIONAL: REST bridge fallback when both fail
 """
 
 import asyncio
@@ -25,8 +27,9 @@ import json
 import os
 import sys
 import textwrap
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import unquote
+from types import SimpleNamespace
 
 import httpx
 from fastapi import FastAPI, Body, Query, Path, HTTPException, Request
@@ -35,14 +38,16 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 # -----------------------------------------------------------------------------
-# Optional MCP stdio client (DISABLED by default; see MCP_STDIO_ENABLED)
+# Optional MCP stdio client (controlled by MCP_STDIO_ENABLED / MCP_FORCE_STDIO)
 # -----------------------------------------------------------------------------
 MCP_STDIO_ENABLED = os.getenv("MCP_STDIO_ENABLED", "0").strip().lower() in ("1", "true", "yes")
+MCP_FORCE_STDIO = os.getenv("MCP_FORCE_STDIO", "0").strip().lower() in ("1", "true", "yes")
 
 MCP_AVAILABLE = False
 MCPClientSession = None
 stdio_client = None
-if MCP_STDIO_ENABLED:
+
+if MCP_STDIO_ENABLED or MCP_FORCE_STDIO:
     try:
         from mcp.client.stdio import stdio_client as _stdio_client  # type: ignore
         stdio_client = _stdio_client
@@ -82,10 +87,10 @@ class ServerState:
     def __init__(self, cfg: ServerConfig):
         self.cfg = cfg
         self.connected = False
-        self.client = None  # MCP session (when stdio enabled)
+        self.client = None  # MCP session (when stdio connected)
         self.tools: Dict[str, ToolDescriptor] = {}
-        self._stdio_ctx = None
-        self._session_ctx = None
+        self._stdio_cm = None   # async context manager returned by stdio_client(...)
+        self._stdio_pair: Optional[Tuple[Any, Any]] = None  # (read, write)
 
 
 class DiscoveryState:
@@ -151,7 +156,6 @@ def _build_examples_from_schema(tool_name: str, schema: Dict[str, Any]) -> List[
     """
     props = _schema_fields(schema)
     enums = _schema_enums(schema)
-    required = (schema or {}).get("required", [])
     examples: List[Dict[str, Any]] = []
 
     # Helper: build a sample body using first enum values + placeholders
@@ -165,7 +169,6 @@ def _build_examples_from_schema(tool_name: str, schema: Dict[str, Any]) -> List[
                 body[p] = f"<{p}>"
         return body
 
-    # If we have two common enum fields, show combo examples; otherwise generic
     body = sample_body()
 
     # POST example
@@ -277,7 +280,7 @@ async def mcp_http_call_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, 
 
 
 # =============================================================================
-# MCP integration — stdio (optional / off by default)
+# MCP integration — stdio (optional / robust)
 # =============================================================================
 
 async def _enter_ctx(cm):
@@ -288,6 +291,8 @@ async def _enter_ctx(cm):
     return await entered if inspect.isawaitable(entered) else entered
 
 async def _exit_ctx(cm):
+    if cm is None:
+        return
     aexit = getattr(cm, "__aexit__", None)
     if callable(aexit):
         try:
@@ -297,77 +302,110 @@ async def _exit_ctx(cm):
         except Exception:
             pass
 
-async def mcp_connect_stdio(cfg: ServerConfig):
+def _server_descriptors(cfg: ServerConfig) -> List[SimpleNamespace]:
     """
-    Extremely conservative stdio connector:
-    - Only attempts the simplest signatures observed across SDKs
-    - No keyword variants; pass list[str] or str positionally
-    - env/cwd aren't passed (older SDKs differ); wrap externally if needed
+    Yield a few descriptor variants to satisfy different SDKs.
+    Order: most complete -> minimal.
     """
-    if not MCP_STDIO_ENABLED:
-        raise RuntimeError("MCP stdio disabled (set MCP_STDIO_ENABLED=1 to enable).")
+    if isinstance(cfg.cmd, list) and cfg.cmd:
+        cmd0, args = str(cfg.cmd[0]), [str(x) for x in cfg.cmd[1:]]
+    elif isinstance(cfg.cmd, str):
+        cmd0, args = cfg.cmd, []
+    else:
+        raise RuntimeError(f"Server {cfg.alias}: invalid cmd; expected str or non-empty list[str].")
+
+    env = cfg.env or {}
+    variants = [
+        SimpleNamespace(command=cmd0, args=args, env=env, cwd=cfg.cwd, encoding="utf-8"),
+        SimpleNamespace(command=cmd0, args=args, env=env, encoding="utf-8"),
+        SimpleNamespace(command=cmd0, args=args, encoding="utf-8"),
+        SimpleNamespace(command=cmd0, args=args),
+    ]
+    return variants
+
+async def mcp_connect_stdio(cfg: ServerConfig) -> Any:
+    """
+    Robust stdio connector:
+      1) Try descriptor objects (with varying fields) — matches SDKs expecting `server.command`, etc.
+      2) Fallback to passing a list[str] or str positionally — matches older SDKs.
+    Then wrap (read, write) in ClientSession (non-context-manager), call initialize(), and return the session.
+    """
+    if not (MCP_STDIO_ENABLED or MCP_FORCE_STDIO):
+        raise RuntimeError("MCP stdio disabled (set MCP_STDIO_ENABLED=1 or MCP_FORCE_STDIO=1).")
     if not MCP_AVAILABLE or MCPClientSession is None or stdio_client is None:
         raise RuntimeError("MCP stdio client/session not available in this environment.")
     if not cfg.cmd:
         raise RuntimeError(f"Server {cfg.alias}: stdio mode requires 'cmd'.")
 
-    # Normalize
-    if isinstance(cfg.cmd, list):
-        cmd_list = [str(x) for x in cfg.cmd]
-        cmd_str = cmd_list[0]
-    elif isinstance(cfg.cmd, str):
-        cmd_list = [cfg.cmd]
-        cmd_str = cfg.cmd
-    else:
-        raise RuntimeError(f"Server {cfg.alias}: cmd must be list[str] or str.")
-
+    # 1) Descriptor-first variants
     last_exc: Optional[BaseException] = None
+    for desc in _server_descriptors(cfg):
+        try:
+            stdio_cm = stdio_client(desc)          # async context manager
+            rw = await _enter_ctx(stdio_cm)        # expect (read, write)
+            if not isinstance(rw, (tuple, list)) or len(rw) != 2:
+                await _exit_ctx(stdio_cm)
+                raise TypeError("stdio_client did not yield (read_stream, write_stream)")
+            read_stream, write_stream = rw[0], rw[1]
 
-    # Try passing a list as a single positional argument
-    try:
-        stdio_ctx = stdio_client(cmd_list)
-        rw = await _enter_ctx(stdio_ctx)
-        if not isinstance(rw, (tuple, list)) or len(rw) != 2:
-            await _exit_ctx(stdio_ctx)
-            raise TypeError("stdio_client did not yield (read_stream, write_stream)")
-        read_stream, write_stream = rw[0], rw[1]
-        session_ctx = MCPClientSession(read_stream, write_stream)
-        session = await _enter_ctx(session_ctx)
+            session = MCPClientSession(read_stream, write_stream)  # not a context manager in most SDKs
+            init = getattr(session, "initialize", None)
+            if callable(init):
+                maybe = init()
+                if inspect.isawaitable(maybe):
+                    await maybe
 
-        init = getattr(session, "initialize", None)
-        if callable(init):
-            maybe = init()
-            if inspect.isawaitable(maybe):
-                await maybe
+            # success
+            sess = session
+            setattr(sess, "__stdio_ctx__", stdio_cm)
+            setattr(sess, "__stdio_pair__", rw)
+            return sess
+        except Exception as e:
+            last_exc = e
 
-        setattr(session, "__mcp_stdio_ctx__", stdio_ctx)
-        setattr(session, "__mcp_session_ctx__", session_ctx)
-        return session
-    except Exception as e:
-        last_exc = e
+    # 2) Fallbacks: pass command as [list] or "str"
+    if isinstance(cfg.cmd, list) and cfg.cmd:
+        cmd_list = [str(x) for x in cfg.cmd]
+        try:
+            stdio_cm = stdio_client(cmd_list)
+            rw = await _enter_ctx(stdio_cm)
+            if not isinstance(rw, (tuple, list)) or len(rw) != 2:
+                await _exit_ctx(stdio_cm)
+                raise TypeError("stdio_client did not yield (read_stream, write_stream)")
+            read_stream, write_stream = rw[0], rw[1]
+            session = MCPClientSession(read_stream, write_stream)
+            init = getattr(session, "initialize", None)
+            if callable(init):
+                maybe = init()
+                if inspect.isawaitable(maybe):
+                    await maybe
+            sess = session
+            setattr(sess, "__stdio_ctx__", stdio_cm)
+            setattr(sess, "__stdio_pair__", rw)
+            return sess
+        except Exception as e:
+            last_exc = e
 
-    # Try passing a string as a single positional argument
-    try:
-        stdio_ctx = stdio_client(cmd_str)
-        rw = await _enter_ctx(stdio_ctx)
-        if not isinstance(rw, (tuple, list)) or len(rw) != 2:
-            await _exit_ctx(stdio_ctx)
-            raise TypeError("stdio_client did not yield (read_stream, write_stream)")
-        read_stream, write_stream = rw[0], rw[1]
-        session_ctx = MCPClientSession(read_stream, write_stream)
-        session = await _enter_ctx(session_ctx)
-
-        init = getattr(session, "initialize", None)
-        if callable(init):
-            maybe = init()
-            if inspect.isawaitable(maybe):
-                await maybe
-
-        setattr(session, "__mcp_stdio_ctx__", stdio_ctx)
-        setattr(session, "__mcp_session_ctx__", session_ctx)
-        return session
-    except Exception as e:
-        last_exc = e
+    if isinstance(cfg.cmd, str):
+        try:
+            stdio_cm = stdio_client(cfg.cmd)
+            rw = await _enter_ctx(stdio_cm)
+            if not isinstance(rw, (tuple, list)) or len(rw) != 2:
+                await _exit_ctx(stdio_cm)
+                raise TypeError("stdio_client did not yield (read_stream, write_stream)")
+            read_stream, write_stream = rw[0], rw[1]
+            session = MCPClientSession(read_stream, write_stream)
+            init = getattr(session, "initialize", None)
+            if callable(init):
+                maybe = init()
+                if inspect.isawaitable(maybe):
+                    await maybe
+            sess = session
+            setattr(sess, "__stdio_ctx__", stdio_cm)
+            setattr(sess, "__stdio_pair__", rw)
+            return sess
+        except Exception as e:
+            last_exc = e
 
     raise RuntimeError(f"Failed to open stdio_client for '{cfg.alias}': {last_exc}")
 
@@ -414,12 +452,13 @@ async def mcp_call_tool_stdio(session, tool_name: str, args: Dict[str, Any]) -> 
 
 app = FastAPI(
     title="MCP OpenAPI Bridge (Generic, Self-Discovering)",
-    version="5.1.0",
+    version="5.2.0",
     description=textwrap.dedent(
         """\
         A generic, self-discovering OpenAPI façade for MCP servers.
         - HTTP RPC is the primary path (MCP_RPC_URL).
-        - Stdio is optional and OFF by default (set MCP_STDIO_ENABLED=1 to enable).
+        - Stdio is optional (MCP_STDIO_ENABLED=1), robustly handled across SDK variants.
+        - Use MCP_FORCE_STDIO=1 to prefer stdio for discovery and invocation.
         - No domain-specific logic; arguments are forwarded exactly as provided.
         - Per-tool examples are auto-generated from each tool's schema.
         """
@@ -476,12 +515,18 @@ async def on_startup():
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    # Close any active session/stdio contexts
+    # Close any active stdio contexts/sessions
     for _, st in list(DISCOVERY.servers.items()):
         try:
+            # Try session close() if present (non-fatal if missing)
             if st.client is not None:
-                await _exit_ctx(getattr(st.client, "__mcp_session_ctx__", None))
-                await _exit_ctx(getattr(st.client, "__mcp_stdio_ctx__", None))
+                close = getattr(st.client, "close", None)
+                if callable(close):
+                    maybe = close()
+                    if inspect.isawaitable(maybe):
+                        await maybe
+            # Exit the stdio context manager if present
+            await _exit_ctx(getattr(st.client, "__stdio_ctx__", None))
         except Exception:
             pass
 
@@ -506,8 +551,11 @@ async def do_discover(wait_seconds: int = 0) -> Dict[str, Any]:
     for alias, st in list(DISCOVERY.servers.items()):
         tools_raw: List[Dict[str, Any]] = []
 
-        # ---- Prefer HTTP RPC discovery first (more stable)
-        if MCP_RPC_URL:
+        # ---- Choose path order based on MCP_FORCE_STDIO
+        prefer_stdio = MCP_FORCE_STDIO
+
+        # ---- HTTP RPC discovery
+        if not prefer_stdio and MCP_RPC_URL:
             try:
                 tools_raw = await mcp_http_list_tools()
                 if tools_raw:
@@ -515,17 +563,17 @@ async def do_discover(wait_seconds: int = 0) -> Dict[str, Any]:
             except Exception as e:
                 print(f"[discover:http-rpc] list_tools failed via {MCP_RPC_URL}: {e}", file=sys.stderr)
 
-        # ---- Optional stdio discovery (only if HTTP yielded nothing and stdio is enabled)
-        if not tools_raw and MCP_STDIO_ENABLED and st.cfg.mode == "stdio" and st.cfg.cmd:
+        # ---- stdio discovery
+        if (prefer_stdio or not tools_raw) and (MCP_STDIO_ENABLED or MCP_FORCE_STDIO) and st.cfg.mode == "stdio" and st.cfg.cmd:
             try:
-                if not st.connected:
+                if not st.connected or st.client is None:
                     st.client = await mcp_connect_stdio(st.cfg)
                     st.connected = True
                 try:
                     tools_raw = await mcp_list_tools_stdio(st.client)
                 except Exception as e:
                     print(f"[discover] list_tools via stdio failed for '{alias}': {e}", file=sys.stderr)
-                    tools_raw = []
+                    tools_raw = tools_raw or []
             except Exception as e:
                 print(f"[discover] stdio connect failed for '{alias}': {e}", file=sys.stderr)
                 st.connected = False
@@ -580,6 +628,8 @@ async def servers_info():
 @app.post("/discover", tags=["discovery"], summary="Discover Endpoint")
 async def discover_endpoint(wait: Optional[int] = Query(0, description="Seconds to wait (max 10) for discovery")):
     wait = max(0, min(int(wait or 0), 10))
+    # Allow hot-reload of MCP_SERVERS if env changed
+    refresh_servers_from_env()
     return await do_discover(wait_seconds=wait)
 
 @app.get("/discovery/status", tags=["discovery"], summary="Discovery Status")
@@ -663,7 +713,7 @@ async def forward_via_http(server: str, tool_path: str, method: str, params: Dic
 
 
 # =============================================================================
-# Generic Tool Dispatch (HTTP-first; exact pass-through)
+# Generic Tool Dispatch (HTTP-first unless MCP_FORCE_STDIO)
 # =============================================================================
 
 async def do_tool_call(
@@ -689,8 +739,11 @@ async def do_tool_call(
     if dryrun:
         return {"dryrun": True, "server": server, "tool": tool_name, "args": args}
 
-    # HTTP path (preferred)
-    if MCP_RPC_URL:
+    # Decide path order
+    prefer_stdio = MCP_FORCE_STDIO
+
+    # HTTP path (preferred unless forced to stdio)
+    if not prefer_stdio and MCP_RPC_URL:
         try:
             return await mcp_http_call_tool(tool_name, args)
         except Exception as e:
@@ -699,23 +752,26 @@ async def do_tool_call(
                 return await forward_via_http(server, tool_name, "POST", params, args)
             raise HTTPException(502, f"HTTP RPC invocation failed: {e}")
 
-    # Optional stdio path (only if enabled and 'mcp' server has cmd)
-    if MCP_STDIO_ENABLED:
+    # stdio path (only if enabled and configured)
+    if MCP_STDIO_ENABLED or MCP_FORCE_STDIO:
         st = DISCOVERY.servers.get(server)
         if not st or not st.cfg.cmd:
-            raise HTTPException(503, "No MCP_RPC_URL and stdio not configured")
+            raise HTTPException(503, "stdio requested but not configured (missing server/cmd)")
         try:
-            if not st.connected:
+            if not st.connected or st.client is None:
                 st.client = await mcp_connect_stdio(st.cfg)
                 st.connected = True
-                # Refresh discovery after connect
-                await do_discover(0)
+                # Refresh discovery after connect (best effort)
+                try:
+                    await do_discover(0)
+                except Exception:
+                    pass
             return await mcp_call_tool_stdio(st.client, tool_name, args)
         except Exception as e:
             raise HTTPException(502, f"Stdio invocation failed: {e}")
 
     # Nothing usable
-    raise HTTPException(503, "No MCP_RPC_URL configured and stdio disabled. Set MCP_RPC_URL or enable MCP_STDIO_ENABLED=1.")
+    raise HTTPException(503, "No usable transport: set MCP_RPC_URL or enable MCP_STDIO_ENABLED=1 / MCP_FORCE_STDIO=1.")
 
 
 @app.post(
