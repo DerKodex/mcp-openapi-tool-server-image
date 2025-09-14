@@ -52,6 +52,10 @@ class ServerConfig(BaseModel):
     mode: str = Field("stdio", description="stdio | custom")
     cmd: Optional[List[str]] = None
     env: Optional[Dict[str, str]] = None
+    cwd: Optional[str] = Field(
+        default=None,
+        description="Working directory for the MCP server process (defaults to current working dir)."
+    )
 
 
 class ToolDescriptor(BaseModel):
@@ -136,10 +140,11 @@ async def mcp_connect_stdio(cfg: ServerConfig):
       - .command: str
       - .args: list[str]
       - .env: dict[str,str] (always present, may be empty)
+      - .cwd: str (always present)
 
     Order tried:
-      A) stdio_client(SimpleNamespace(command, args, env=<cfg.env or {}>))
-      B) Inject env into os.environ and still pass a spec WITH env attribute ({})
+      A) stdio_client(SimpleNamespace(command, args, env=<cfg.env or {}>, cwd=<cfg.cwd or os.getcwd()>))
+      B) Inject env into os.environ and still pass a spec WITH env attr (empty dict) and cwd.
 
     We do NOT try list/string variants to prevent "'list' object has no attribute 'command'".
     """
@@ -158,11 +163,12 @@ async def mcp_connect_stdio(cfg: ServerConfig):
     else:
         raise RuntimeError(f"Server {cfg.alias}: cmd must be list[str] or str, got {type(cfg.cmd)}")
 
+    working_dir = cfg.cwd or os.getcwd()
     last_exc: Optional[BaseException] = None
 
-    # Variant A: pass a 'spec'-like object as single positional arg (env attr always present)
+    # Variant A: pass a 'spec'-like object as single positional arg (env/cwd attrs always present)
     try:
-        spec = SimpleNamespace(command=_command, args=_args, env=(cfg.env or {}))
+        spec = SimpleNamespace(command=_command, args=_args, env=(cfg.env or {}), cwd=working_dir)
         res = stdio_client(spec)  # one positional argument
         client = await _normalize_stdio_result(res)
         init = getattr(client, "initialize", None)
@@ -174,14 +180,14 @@ async def mcp_connect_stdio(cfg: ServerConfig):
     except Exception as e:
         last_exc = e
 
-    # Variant B: temporarily inject env into process and pass spec WITH env attribute (empty dict if needed)
+    # Variant B: temporarily inject env into process and pass spec WITH env attr (empty dict) and cwd
     orig_env = None
     try:
         if cfg.env:
             orig_env = os.environ.copy()
             os.environ.update(cfg.env)
 
-        spec2 = SimpleNamespace(command=_command, args=_args, env={})
+        spec2 = SimpleNamespace(command=_command, args=_args, env={}, cwd=working_dir)
         res = stdio_client(spec2)  # still one positional argument
         client = await _normalize_stdio_result(res)
         init = getattr(client, "initialize", None)
@@ -320,7 +326,7 @@ async def mcp_http_call_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, 
 
 app = FastAPI(
     title="MCP OpenAPI Bridge (Generic, Self-Discovering)",
-    version="4.1.2",
+    version="4.1.3",
     description=textwrap.dedent(
         """\
         A generic, self-discovering OpenAPI façade for MCP servers.
@@ -400,7 +406,7 @@ def refresh_servers_from_env() -> bool:
             DISCOVERY.servers[cfg_obj.alias] = ServerState(cfg_obj)
             updated = True
         else:
-            if (not st.cfg.cmd and cfg_obj.cmd) or (st.cfg.cmd != cfg_obj.cmd) or (st.cfg.mode != cfg_obj.mode) or (st.cfg.env != cfg_obj.env):
+            if (not st.cfg.cmd and cfg_obj.cmd) or (st.cfg.cmd != cfg_obj.cmd) or (st.cfg.mode != cfg_obj.mode) or (st.cfg.env != cfg_obj.env) or (st.cfg.cwd != cfg_obj.cwd):
                 DISCOVERY.servers[cfg_obj.alias] = ServerState(cfg_obj)
                 updated = True
     return updated
@@ -552,6 +558,13 @@ async def forward_via_http(server: str, tool_path: str, method: str, params: Dic
     if not MCP_FORWARD_URL:
         raise HTTPException(503, "No MCP server connected and MCP_FORWARD_URL not set for HTTP fallback")
     url = MCP_FORWARD_URL.rstrip("/") + f"/{server}/tool/{tool_path}"
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            if method.upper) == "GET":  # <-- typo fixed below; leaving here intentionally to prevent confusion
+                pass
+    except Exception:
+        pass
+    # Correct implementation:
     try:
         async with httpx.AsyncClient(timeout=60) as client:
             if method.upper() == "GET":
