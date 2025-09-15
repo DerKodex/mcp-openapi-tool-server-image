@@ -45,6 +45,8 @@ import textwrap
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import unquote
+# add near top
+from migrator import Migrator
 
 import httpx
 from fastapi import Body, FastAPI, HTTPException, Path, Query, Request
@@ -64,6 +66,9 @@ MCP_STDIO_INIT_TIMEOUT   = int(os.getenv("MCP_STDIO_INIT_TIMEOUT", "45"))
 MCP_STDIO_PREFLIGHT      = os.getenv("MCP_STDIO_PREFLIGHT", "1").strip().lower() in ("1", "true", "yes")
 MCP_STDIO_PREFLIGHT_CONFIG = os.getenv("MCP_STDIO_PREFLIGHT_CONFIG", "0").strip().lower() in ("1", "true", "yes")
 MCP_STDIO_EXTRA_ARGS     = os.getenv("MCP_STDIO_EXTRA_ARGS", "").strip()
+
+MIGRATIONS_DONE = False
+MIGRATION_ERROR = None
 
 MCP_AVAILABLE = False
 MCPClientSession = None
@@ -191,6 +196,7 @@ def _build_examples_from_schema(tool_name: str, schema: Dict[str, Any]) -> List[
             "notes": ["Values shown use the first enum choices when available."]
         })
     return examples
+
 
 # =============================================================================
 # MCP integration — HTTP RPC
@@ -557,6 +563,16 @@ async def normalize_odd_paths(request: Request, call_next):
 
 @app.on_event("startup")
 async def on_startup():
+    global MIGRATIONS_DONE, MIGRATION_ERROR
+    try:
+        # Run DB migrations BEFORE driver load / discovery
+        Migrator().run_on_startup()
+        MIGRATIONS_DONE = True
+    except Exception as e:
+        MIGRATION_ERROR = str(e)
+        print(f"[migrator] FAILED: {e}", file=sys.stderr)
+        # keep server up so you can read logs / troubleshoot; readiness will fail
+        
     # Load servers
     servers_cfg = getenv_json("MCP_SERVERS", None) or []
     for cfg in servers_cfg:
@@ -657,6 +673,9 @@ async def readyz():
 
 @app.get("/healthz", tags=["health"], summary="Healthz")
 async def healthz():
+    if not MIGRATIONS_DONE:
+        # fail readiness until migrations complete successfully
+        return JSONResponse({"status":"starting","migrations":"pending","error":MIGRATION_ERROR}, status_code=503)
     return {"status": "ok"}
 
 @app.get("/servers", tags=["info"], summary="Servers Info")

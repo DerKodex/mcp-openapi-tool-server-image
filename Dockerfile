@@ -10,13 +10,18 @@ WORKDIR /app
 COPY src/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy ALL source so 'mcp_openapi' is available
-COPY src/ . 
-# Optional: ensure Python sees /app as a package root
+COPY src/ .    
+# includes app.py, migrator.py, mcp_openapi/...
+COPY migrations/ /app/migrations/
+COPY seeds/ /app/seeds/
 ENV PYTHONPATH=/app
 
 # Fail fast if the package is missing
-RUN python -c "import uvicorn, mcp_openapi; print('import ok')"
+# quick sanity
+RUN python - <<'PY'
+import psycopg, fastapi, uvicorn
+print("imports ok")
+PY
 
 USER 10001:10001
 EXPOSE 8080
