@@ -5,9 +5,13 @@ import psycopg
 
 FILENAME_RE = re.compile(r"^(\d{3,})_(.+?)\.(up\.sql|py)$")
 
+
 class Migrator:
+    """
+    Database migrator for MCP OpenAPI. Config is provided via environment variables, which are set from the manifest in app.py.
+    """
     def __init__(self):
-        # Connection from env/files (works with Vault agent files)
+        # Connection from env/files (set by manifest/app.py)
         self.host     = os.getenv("DB_HOST", "localhost")
         self.port     = int(os.getenv("DB_PORT", "5432"))
         self.database = os.getenv("DB_NAME", "postgres")

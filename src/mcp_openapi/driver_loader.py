@@ -112,17 +112,15 @@ class LoadedDriver:
 
 class DriverRegistry:
     """
-    Loads drivers from env DRIVERS JSON:
-      DRIVERS='[
-        {"module":"mcp_openapi.drivers.yugabyte_driver","config":"/config/yugabyte-driver.yaml"}
-      ]'
+    Loads drivers from the DRIVERS env, which is set by app.py from the manifest (driver-manifest.yaml).
+    DRIVERS is a JSON array of {module, config} objects, where config can be a dict or a path to a YAML file.
     """
     def __init__(self):
         if os.getenv("REDIS_URL"):
-            self.cache: CacheAPI = RedisCache()
+            self.cache = RedisCache()
         else:
-            self.cache: CacheAPI = InMemoryCache()
-        self.loaded: Dict[str, LoadedDriver] = {}
+            self.cache = InMemoryCache()
+        self.loaded = {}
         self.instance_id = os.getenv("INSTANCE_ID", "default")
 
     def _read_config(self, blob: Any) -> Dict[str, Any]:

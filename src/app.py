@@ -40,6 +40,7 @@ import importlib
 import inspect
 import json
 import os
+from mcp_openapi.manifest_loader import load_manifest
 import re
 import stat
 import sys
@@ -57,27 +58,45 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
-# ---------------- Driver registry (Redis, instance isolation) --------------
-# Import REGISTRY and cache classes so we can switch cache when instanceId changes.
 from mcp_openapi.driver_loader import REGISTRY, RedisCache, InMemoryCache  # type: ignore
 
-# -----------------------------------------------------------------------------
-# Transport toggles
-# -----------------------------------------------------------------------------
-MCP_STDIO_ENABLED = os.getenv("MCP_STDIO_ENABLED", "0").strip().lower() in ("1", "true", "yes")
-MCP_FORCE_STDIO   = os.getenv("MCP_FORCE_STDIO", "0").strip().lower() in ("1", "true", "yes")
-MCP_STDIO_INIT_TIMEOUT   = int(os.getenv("MCP_STDIO_INIT_TIMEOUT", "45"))
-MCP_STDIO_PREFLIGHT      = os.getenv("MCP_STDIO_PREFLIGHT", "1").strip().lower() in ("1", "true", "yes")
-MCP_STDIO_PREFLIGHT_CONFIG = os.getenv("MCP_STDIO_PREFLIGHT_CONFIG", "0").strip().lower() in ("1", "true", "yes")
-MCP_STDIO_EXTRA_ARGS     = os.getenv("MCP_STDIO_EXTRA_ARGS", "").strip()
+# Load manifest at startup
+MANIFEST = None
+MANIFEST_PATH = os.environ.get("MANIFEST_PATH") or os.environ.get("DRIVER_MANIFEST_PATH") or "/config/driver-manifest.yaml"
+try:
+    MANIFEST = load_manifest(MANIFEST_PATH)
+except Exception as e:
+    print(f"[manifest] Failed to load manifest: {e}", file=sys.stderr)
+    MANIFEST = None
 
-MIGRATIONS_DONE = False
-MIGRATION_ERROR = None
 
+# --- Transport config from manifest ---
+MCP_STDIO_ENABLED = False
+MCP_FORCE_STDIO = False
+MCP_STDIO_INIT_TIMEOUT = 45
+MCP_STDIO_PREFLIGHT = True
+MCP_STDIO_PREFLIGHT_CONFIG = False
+MCP_STDIO_EXTRA_ARGS = ""
 MCP_AVAILABLE = False
 MCPClientSession = None
 stdio_client = None
 StdioParamsType = None
+
+if MANIFEST and "transport" in MANIFEST["spec"]:
+    t = MANIFEST["spec"]["transport"]
+    stdio = t.get("stdio", {})
+    MCP_STDIO_ENABLED = stdio.get("enabled", False)
+    MCP_FORCE_STDIO = stdio.get("force", False)
+    MCP_STDIO_INIT_TIMEOUT = int(stdio.get("initTimeoutSeconds", 45))
+    MCP_STDIO_PREFLIGHT = stdio.get("preflight", True)
+    MCP_STDIO_PREFLIGHT_CONFIG = stdio.get("preflightConfig", False)
+    MCP_STDIO_EXTRA_ARGS = " ".join(stdio.get("extraArgs", []))
+    # Optionally set MCP_RPC_URL, MCP_FORWARD_URL from manifest
+    MCP_RPC_URL = t.get("rpc", {}).get("url", "")
+    MCP_FORWARD_URL = t.get("forward", {}).get("url", "")
+else:
+    MCP_RPC_URL = os.getenv("MCP_RPC_URL")
+    MCP_FORWARD_URL = os.getenv("MCP_FORWARD_URL")
 
 if MCP_STDIO_ENABLED or MCP_FORCE_STDIO:
     try:
@@ -560,6 +579,13 @@ async def _reload_drivers_from_manifest() -> Dict[str, Any]:
 # FastAPI App + Discovery + Drivers
 # =============================================================================
 
+
+# --- CORS config from manifest ---
+cors = MANIFEST["spec"].get("cors", {}) if MANIFEST else {}
+allow_origins = cors.get("allow_origins", ["*"])
+allow_methods = cors.get("allow_methods", ["*"])
+allow_headers = cors.get("allow_headers", ["*"])
+
 app = FastAPI(
     title="MCP OpenAPI Bridge (Generic, Driver-Aware)",
     version="9.1.0",
@@ -578,8 +604,8 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
+    allow_origins=allow_origins, allow_credentials=True,
+    allow_methods=allow_methods, allow_headers=allow_headers,
 )
 
 # --- URL normalization + alias rewrite (fix opId-as-path) ---
@@ -620,11 +646,25 @@ async def normalize_odd_paths(request: Request, call_next):
         request.scope["path"] = decoded
     return await call_next(request)
 
+
 @app.on_event("startup")
 async def on_startup():
     global MIGRATIONS_DONE, MIGRATION_ERROR
     try:
         # Run DB migrations BEFORE driver load / discovery
+        if MANIFEST and MANIFEST["spec"].get("migrator", {}).get("run", False):
+            db_cfg = MANIFEST["spec"]["migrator"]["db"]
+            # Set env vars for migrator
+            os.environ["DB_HOST"] = db_cfg.get("host", "localhost")
+            os.environ["DB_PORT"] = str(db_cfg.get("port", 5432))
+            os.environ["DB_NAME"] = db_cfg.get("name", "postgres")
+            os.environ["DB_SCHEMA"] = db_cfg.get("schema", "public")
+            os.environ["DB_SSLMODE"] = db_cfg.get("sslmode", "prefer")
+            os.environ["DB_USER_FILE"] = db_cfg.get("usernameFile", "")
+            os.environ["DB_PASS_FILE"] = db_cfg.get("passwordFile", "")
+            os.environ["DB_MIGRATIONS_DIR"] = db_cfg.get("migrationsDir", "/app/migrations")
+            os.environ["DB_SEEDS_DIR"] = db_cfg.get("seedsDir", "/app/seeds")
+            os.environ["RUN_MIGRATIONS"] = "1"
         Migrator().run_on_startup()
         MIGRATIONS_DONE = True
     except Exception as e:
@@ -632,8 +672,12 @@ async def on_startup():
         print(f"[migrator] FAILED: {e}", file=sys.stderr)
         # keep server up so you can read logs / troubleshoot; readiness will fail
 
-    # Load servers
-    servers_cfg = getenv_json("MCP_SERVERS", None) or []
+    # Load servers from manifest transport.servers
+    servers_cfg = []
+    if MANIFEST and "transport" in MANIFEST["spec"] and "servers" in MANIFEST["spec"]["transport"]:
+        servers_cfg = MANIFEST["spec"]["transport"]["servers"]
+    else:
+        servers_cfg = getenv_json("MCP_SERVERS", None) or []
     for cfg in servers_cfg:
         cfg_obj = ServerConfig(**cfg)
         DISCOVERY.servers[cfg_obj.alias] = ServerState(cfg_obj)
@@ -642,14 +686,21 @@ async def on_startup():
 
     # Discover tools
     try:
-        await do_discover(wait_seconds=int(os.getenv("MCP_DISCOVERY_WAIT", "0")))
+        wait = int(os.getenv("MCP_DISCOVERY_WAIT", "0"))
+        await do_discover(wait_seconds=wait)
     except Exception as e:
         print(f"Validation failed:\n{e}", file=sys.stderr)
 
     # Load drivers (prefer manifest if present)
     try:
-        if DRIVER_MANIFEST_PATH:
-            status = await _reload_drivers_from_manifest()
+        if MANIFEST:
+            # Set DRIVERS env for REGISTRY
+            drivers = MANIFEST["spec"].get("drivers", [])
+            driver_specs = []
+            for d in drivers:
+                driver_specs.append({"module": d["module"], "config": d.get("config")})
+            os.environ["DRIVERS"] = json.dumps(driver_specs)
+            status = await REGISTRY.load_from_env()
         else:
             status = await REGISTRY.load_from_env()
         print(f"[drivers] loaded: {status}", file=sys.stderr)
