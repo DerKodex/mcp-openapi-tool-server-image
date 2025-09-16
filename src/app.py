@@ -548,11 +548,11 @@ def _apply_manifest_to_env_and_registry(manifest: Dict[str, Any]) -> None:
         os.environ["INSTANCE_ID"] = str(iid)
         REGISTRY.instance_id = str(iid)
 
-    # Cache (registry/cache settings)
-    cache = ((spec.get("cache") or {}).get("registry") or {}).get("redis") or {}
-    redis_url = cache.get("url")
-    key_prefix = cache.get("key_prefix", "driver")
-    default_ttl = str(cache.get("default_ttl_seconds", 600))
+    # Redis config: prefer spec.redis, fallback to old spec.cache.registry.redis
+    redis_cfg = spec.get("redis") or ((spec.get("cache") or {}).get("registry") or {}).get("redis") or {}
+    redis_url = redis_cfg.get("url")
+    key_prefix = redis_cfg.get("key_prefix") or redis_cfg.get("namespace") or "driver"
+    default_ttl = str(redis_cfg.get("default_ttl_seconds", 600))
     # set envs consumed by RedisCache()
     if redis_url:
         os.environ["REDIS_URL"] = redis_url
@@ -562,9 +562,9 @@ def _apply_manifest_to_env_and_registry(manifest: Dict[str, Any]) -> None:
     # Make sure REGISTRY.cache matches desired backend
     try:
         if os.getenv("REDIS_URL"):
-            REGISTRY.cache = RedisCache()
+            REGISTRY.cache = RedisCache(url=redis_url, prefix=key_prefix, default_ttl=int(default_ttl))
         else:
-            REGISTRY.cache = InMemoryCache()
+            REGISTRY.cache = InMemoryCache(prefix=key_prefix, default_ttl=int(default_ttl))
     except Exception as e:
         print(f"[cache] failed to initialize cache from manifest: {e}", file=sys.stderr)
 
