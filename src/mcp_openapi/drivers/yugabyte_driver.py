@@ -21,7 +21,7 @@ except Exception as e:
 
 
 # -----------------------------------------------------------------------------
-# Config models (support BOTH your current file-cred style and Vault dynamic)
+# Config models (support BOTH your current file-cred style and Vault dynamic/static)
 # -----------------------------------------------------------------------------
 
 class VaultK8sAuth(BaseModel):
@@ -39,8 +39,8 @@ class VaultAppRoleAuth(BaseModel):
 
 
 class VaultDatabaseCfg(BaseModel):
-    # mode = "dynamic" -> GET <mount>/creds/<role>   (has lease)
-    # mode = "static"  -> GET <mount>/static-creds/<role> (no lease; refetch on cadence)
+    # mode = "dynamic" -> GET <mount>/creds/<role>         (has lease)
+    # mode = "static"  -> GET <mount>/static-creds/<role>   (no lease; refetch on cadence)
     mount: str = "database"
     role: str
     mode: Literal["dynamic", "static"] = "dynamic"
@@ -54,16 +54,17 @@ class VaultSpec(BaseModel):
 
 
 class YugabyteSpec(BaseModel):
-    # Silence pydantic warning about "schema" field name
-    model_config = ConfigDict(protected_namespaces=())
-
     host: str
     port: int = 5433
     # Accept either "dbname" or "database"
     dbname: Optional[str] = None
     database: Optional[str] = None
-    # Optional schema (your manifest provides this)
-    schema: Optional[str] = None
+    # External key is "schema"; internally use db_schema to avoid pydantic warnings
+    db_schema: Optional[str] = Field(
+        default=None,
+        validation_alias="schema",
+        serialization_alias="schema",
+    )
     sslmode: str = "prefer"
     # Optional plaintext creds
     username: Optional[str] = None
@@ -73,18 +74,24 @@ class YugabyteSpec(BaseModel):
     passwordFile: Optional[str] = None
     options: Dict[str, Any] = Field(default_factory=dict)
 
+    # allow population by alias and preserve alias on dumps
+    model_config = ConfigDict(populate_by_name=True)
+
     def normalized_dbname(self) -> str:
         return (self.dbname or self.database or "postgres")
 
 
 class InitSpec(BaseModel):
-    # Silence pydantic warning about "schema" field name
-    model_config = ConfigDict(protected_namespaces=())
-
-    # If omitted, we default to a safe per-instance schema name
-    schema: Optional[str] = None
+    # External key is "schema"; internally use target_schema to avoid pydantic warnings
+    target_schema: Optional[str] = Field(
+        default=None,
+        validation_alias="schema",
+        serialization_alias="schema",
+    )
     createIfMissing: bool = True
     ddl: List[str] = Field(default_factory=list)
+
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class PoolSpec(BaseModel):
@@ -161,7 +168,7 @@ class YugabyteDriverConfig(BaseModel):
         if not init_in and "bootstrap" in s:
             b = s.get("bootstrap") or {}
             init_in = {
-                "schema": y.schema,
+                "schema": y.db_schema,  # keep external key name
                 "createIfMissing": bool(b.get("create_schema", True)),
                 "ddl": [],
             }
@@ -175,7 +182,7 @@ class YugabyteDriverConfig(BaseModel):
                 "host": y.host,
                 "port": y.port,
                 "dbname": y.normalized_dbname(),
-                "schema": y.schema,
+                "schema": y.db_schema,  # keep external key name
                 "sslmode": y.sslmode,
                 "username": y.username,
                 "password": y.password,
@@ -185,7 +192,7 @@ class YugabyteDriverConfig(BaseModel):
             },
             "pool": pool.model_dump(),
             "cache": cache.model_dump(),
-            "init": init.model_dump(),
+            "init": init.model_dump(by_alias=True),  # ensure "schema" key is emitted
             "sync": sync.model_dump(),
         }
 
@@ -217,7 +224,7 @@ class DriverImpl(Driver):
         self._db_username: Optional[str] = None
         self._db_password: Optional[str] = None
         self._db_lease_id: Optional[str] = None
-        self._db_lease_exp: Optional[float] = None
+               self._db_lease_exp: Optional[float] = None
 
         self._pool: Optional[AsyncConnectionPool] = None
         self._lock = asyncio.Lock()
