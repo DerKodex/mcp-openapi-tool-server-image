@@ -6,7 +6,7 @@ import json
 import os
 import re
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Literal
 
 import httpx
 from pydantic import BaseModel, Field, ValidationError
@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field, ValidationError
 from mcp_openapi.driver_base import CacheAPI, Driver
 
 try:
-    import psycopg
+    import psycopg  # noqa: F401  # imported to ensure psycopg is present
     from psycopg_pool import AsyncConnectionPool
 except Exception as e:
     raise RuntimeError("psycopg[pool] is required for yugabyte_driver") from e
@@ -25,26 +25,30 @@ except Exception as e:
 # -----------------------------------------------------------------------------
 
 class VaultK8sAuth(BaseModel):
-    method: str = Field("kubernetes", const=True)
+    method: Literal["kubernetes"] = "kubernetes"
     mount: str = "kubernetes"
     role: str
     jwtFile: str = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 
+
 class VaultAppRoleAuth(BaseModel):
-    method: str = Field("approle", const=True)
+    method: Literal["approle"] = "approle"
     mount: str = "approle"
     role_id: str
     secret_id: str
+
 
 class VaultDatabaseCfg(BaseModel):
     mount: str = "database"
     role: str
     renewBefore: int = 120  # seconds prior to expiry to renew
 
+
 class VaultSpec(BaseModel):
     address: str
     auth: VaultK8sAuth | VaultAppRoleAuth
     database: VaultDatabaseCfg
+
 
 class YugabyteSpec(BaseModel):
     host: str
@@ -66,19 +70,23 @@ class YugabyteSpec(BaseModel):
     def normalized_dbname(self) -> str:
         return (self.dbname or self.database or "postgres")
 
+
 class InitSpec(BaseModel):
     # If omitted, we default to a safe per-instance schema name
     schema: Optional[str] = None
     createIfMissing: bool = True
     ddl: List[str] = Field(default_factory=list)
 
+
 class PoolSpec(BaseModel):
     min: int = 1
     max: int = 5
     statementTimeoutMs: int = 60000
 
+
 class CacheSpec(BaseModel):
     ttlSeconds: int = 600
+
 
 class SyncJobSpec(BaseModel):
     name: str
@@ -88,11 +96,13 @@ class SyncJobSpec(BaseModel):
     mode: str = "rows"            # rows | list | kv
     ttlSeconds: Optional[int] = None
 
+
 class SyncSpec(BaseModel):
     jobs: List[SyncJobSpec] = Field(default_factory=list)
     # Compatibility with your manifest (simple switch):
     enabled: Optional[bool] = None
     interval_seconds: Optional[int] = None
+
 
 class YugabyteDriverConfig(BaseModel):
     """
@@ -127,7 +137,7 @@ class YugabyteDriverConfig(BaseModel):
         s = self.spec or {}
         # Yugabyte block (required)
         if "yugabyte" not in s:
-            raise ValidationError("spec.yugabyte is required", YugabyteDriverConfig)
+            raise ValueError("spec.yugabyte is required")
 
         y = YugabyteSpec.model_validate(s["yugabyte"])
         pool = PoolSpec.model_validate(s.get("pool", {}))
@@ -241,7 +251,11 @@ class DriverImpl(Driver):
                 config.setdefault("pool", {})
                 config.setdefault("cache", {})
                 config.setdefault("sync", {})
-                self.cfg = YugabyteDriverConfig(apiVersion="mcp.openapi/v1alpha1", kind="YugabyteDriverConfig", spec=config).normalize()
+                self.cfg = YugabyteDriverConfig(
+                    apiVersion="mcp.openapi/v1alpha1",
+                    kind="YugabyteDriverConfig",
+                    spec=config
+                ).normalize()
         except ValidationError as e:
             raise RuntimeError(f"Yugabyte driver config invalid: {e}") from e
 
