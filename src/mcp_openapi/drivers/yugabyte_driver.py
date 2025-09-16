@@ -9,7 +9,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple, Literal
 
 import httpx
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, ConfigDict
 
 from mcp_openapi.driver_base import CacheAPI, Driver
 
@@ -39,9 +39,12 @@ class VaultAppRoleAuth(BaseModel):
 
 
 class VaultDatabaseCfg(BaseModel):
+    # mode = "dynamic" -> GET <mount>/creds/<role>   (has lease)
+    # mode = "static"  -> GET <mount>/static-creds/<role> (no lease; refetch on cadence)
     mount: str = "database"
     role: str
-    renewBefore: int = 120  # seconds prior to expiry to renew
+    mode: Literal["dynamic", "static"] = "dynamic"
+    renewBefore: int = 120  # seconds prior to expiry (or cadence for static)
 
 
 class VaultSpec(BaseModel):
@@ -51,6 +54,9 @@ class VaultSpec(BaseModel):
 
 
 class YugabyteSpec(BaseModel):
+    # Silence pydantic warning about "schema" field name
+    model_config = ConfigDict(protected_namespaces=())
+
     host: str
     port: int = 5433
     # Accept either "dbname" or "database"
@@ -72,6 +78,9 @@ class YugabyteSpec(BaseModel):
 
 
 class InitSpec(BaseModel):
+    # Silence pydantic warning about "schema" field name
+    model_config = ConfigDict(protected_namespaces=())
+
     # If omitted, we default to a safe per-instance schema name
     schema: Optional[str] = None
     createIfMissing: bool = True
@@ -93,7 +102,7 @@ class SyncJobSpec(BaseModel):
     query: str
     key: str
     intervalSeconds: int = 60
-    mode: str = "rows"            # rows | list | kv
+    mode: Literal["rows", "list", "kv"] = "rows"
     ttlSeconds: Optional[int] = None
 
 
@@ -120,9 +129,13 @@ class YugabyteDriverConfig(BaseModel):
          "sync": {"enabled": true, "interval_seconds": 15}
        }
 
-    B) Vault dynamic credentials:
+    B) Vault dynamic or static credentials:
        {
-         "vault": { "address": "http://vault:8200", "auth": {...}, "database": {...} },
+         "vault": {
+           "address": "http://vault:8200",
+           "auth": {...},
+           "database": {"mount":"yugabyte-db","role":"mcp-yb-ro","mode":"static","renewBefore":120}
+         },
          "yugabyte": {"host": "...", "port": 5433, "dbname": "mcp", "schema": "mcp_openapi_ro"},
          "pool": {...},
          "sync": {...}
@@ -176,9 +189,12 @@ class YugabyteDriverConfig(BaseModel):
             "sync": sync.model_dump(),
         }
 
-        # Optional Vault config (dynamic creds)
+        # Optional Vault config (dynamic or static creds)
         if "vault" in s and s["vault"]:
-            out["vault"] = VaultSpec.model_validate(s["vault"]).model_dump()
+            v = VaultSpec.model_validate(s["vault"]).model_dump()
+            # allow env override for address if present
+            v["address"] = os.getenv("VAULT_ADDR", v["address"]).rstrip("/")
+            out["vault"] = v
 
         return out
 
@@ -225,6 +241,11 @@ class DriverImpl(Driver):
         schema = (init.get("schema") or self.cfg["yugabyte"].get("schema") or self._default_schema())
         return str(schema).lower()
 
+    def _vault_db_mode(self) -> Literal["dynamic", "static"]:
+        v = self.cfg.get("vault") or {}
+        db = v.get("database") or {}
+        return db.get("mode", "dynamic")
+
     # ---------- lifecycle ----------
 
     async def load(self, config: Dict[str, Any], cache: CacheAPI) -> None:
@@ -258,6 +279,8 @@ class DriverImpl(Driver):
                 ).normalize()
         except ValidationError as e:
             raise RuntimeError(f"Yugabyte driver config invalid: {e}") from e
+        except ValueError as e:
+            raise RuntimeError(f"Yugabyte driver config invalid: {e}") from e
 
         # 2) Decide credentials mode
         y = self.cfg["yugabyte"]
@@ -290,6 +313,7 @@ class DriverImpl(Driver):
             "cachePrefix": self.cache.namespace() if self.cache else None,
             "schema": self._schema(),
             "mode": self._creds_mode,
+            "vault_db_mode": self._vault_db_mode() if self._creds_mode == "vault" else None,
             "yugabyte": {k: self.cfg["yugabyte"][k] for k in ("host", "port", "dbname", "sslmode") if k in self.cfg["yugabyte"]},
             "pool": self.cfg["pool"],
             "sync": self.cfg.get("sync", {}),
@@ -309,7 +333,7 @@ class DriverImpl(Driver):
         openapi_schema.setdefault("x-drivers", {})["yugabyte"] = {
             "schema": self._schema(),
             "capabilities": [
-                "Static / file-based / Vault dynamic credentials",
+                "Static / file-based / Vault dynamic or static credentials",
                 "Per-instance schema bootstrap",
                 "Background sync Yugabyte → Cache",
             ],
@@ -411,7 +435,7 @@ class DriverImpl(Driver):
 
     def _vault_headers(self) -> Dict[str, str]:
         if not self._vault_token:
-            raise RuntimeError("Vault token missing")
+            raise RuntimeError("Vault token missing (try checking Kubernetes auth role/policy)")
         return {"X-Vault-Token": self._vault_token}
 
     async def _ensure_vault_token(self) -> None:
@@ -422,19 +446,36 @@ class DriverImpl(Driver):
         await self._ensure_vault_token()
         v = self.cfg["vault"]
         addr: str = v["address"].rstrip("/")
-        path = f"{v['database']['mount'].strip('/')}/creds/{v['database']['role']}"
+        db = v["database"]
+        mode: Literal["dynamic", "static"] = db.get("mode", "dynamic")
+        if mode == "static":
+            path = f"{db['mount'].strip('/')}/static-creds/{db['role']}"
+        else:
+            path = f"{db['mount'].strip('/')}/creds/{db['role']}"
         url = f"{addr}/v1/{path}"
         r = await self._client.get(url, headers=self._vault_headers())
-        r.raise_for_status()
+        try:
+            r.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            raise RuntimeError(f"Vault DB creds fetch failed ({mode}) at '{path}': {e}") from e
         data = r.json()
         self._db_username = data["data"]["username"]
         self._db_password = data["data"]["password"]
-        self._db_lease_id = data.get("lease_id")
-        ldur = int(data.get("lease_duration", 3600))
-        self._db_lease_exp = time.time() + max(60, ldur - 30)
+
+        # Lease semantics
+        if mode == "dynamic":
+            self._db_lease_id = data.get("lease_id")
+            ldur = int(data.get("lease_duration", 3600))
+            self._db_lease_exp = time.time() + max(60, ldur - 30)
+        else:
+            # static-creds do not have a lease; just refetch on a cadence
+            self._db_lease_id = None
+            renew_before = int(db.get("renewBefore", 120))
+            self._db_lease_exp = time.time() + max(60, renew_before)
 
     async def _renew_lease(self) -> bool:
-        if not self._db_lease_id:
+        # Only makes sense for dynamic creds; for static we always refetch
+        if self._vault_db_mode() != "dynamic" or not self._db_lease_id:
             return False
         await self._ensure_vault_token()
         v = self.cfg["vault"]
@@ -476,12 +517,18 @@ class DriverImpl(Driver):
 
             # Resolve credentials for each mode
             if self._creds_mode == "vault":
+                db_mode = self._vault_db_mode()
                 renew_before = int(self.cfg["vault"]["database"].get("renewBefore", 120))
                 if not self._db_username or not self._db_password or not self._db_lease_exp:
                     await self._fetch_vault_db_creds()
                     need_new = True
                 elif (self._db_lease_exp - now) <= max(30, renew_before):
-                    if not await self._renew_lease():
+                    # dynamic -> try renew; static -> force refetch
+                    if db_mode == "dynamic":
+                        if not await self._renew_lease():
+                            await self._fetch_vault_db_creds()
+                            need_new = True
+                    else:
                         await self._fetch_vault_db_creds()
                         need_new = True
 
