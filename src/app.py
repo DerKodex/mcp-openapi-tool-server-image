@@ -6,8 +6,9 @@ MCP OpenAPI Bridge — Generic, Driver-Aware, Redis-backed
 - Pure generic MCP OpenAPI façade (no domain assumptions)
 - HTTP RPC (MCP_RPC_URL) preferred; stdio optional (descriptor-only)
 - Dynamic driver loading via DRIVERS (JSON list of {module, config})
+- Optional single-manifest configuration via DRIVER_MANIFEST_PATH (YAML)
 - Drivers can enrich OpenAPI (notes/examples/tags) and expose summaries
-- Driver data lives in Redis (per-instance namespace). No extra in-proc cache.
+- Driver data lives in Redis (per-instance namespace) or in-memory.
 - Alias-path rewrite fixes clients that use operationId as a URL.
 
 Run:
@@ -27,6 +28,7 @@ Key env:
 
   # Driver system (preferred)
   DRIVERS='[{"module":"mcp_openapi.drivers.yugabyte_driver","config":"/config/yugabyte-driver.yaml"}]'
+  DRIVER_MANIFEST_PATH='/config/driver-manifest.yaml'   # Optional: single YAML manifest
   INSTANCE_ID='mcp-k8s-ro'
   REDIS_URL='redis://redis:6379/0'
   DRIVER_CACHE_DEFAULT_TTL=600
@@ -45,17 +47,19 @@ import textwrap
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import unquote
+
 # add near top
 from migrator import Migrator
 
 import httpx
 from fastapi import Body, FastAPI, HTTPException, Path, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
 # ---------------- Driver registry (Redis, instance isolation) --------------
-from mcp_openapi.driver_loader import REGISTRY
+# Import REGISTRY and cache classes so we can switch cache when instanceId changes.
+from mcp_openapi.driver_loader import REGISTRY, RedisCache, InMemoryCache  # type: ignore
 
 # -----------------------------------------------------------------------------
 # Transport toggles
@@ -133,6 +137,7 @@ class DiscoveryState:
 DISCOVERY = DiscoveryState()
 MCP_FORWARD_URL = os.getenv("MCP_FORWARD_URL")
 MCP_RPC_URL = os.getenv("MCP_RPC_URL")
+DRIVER_MANIFEST_PATH = os.getenv("DRIVER_MANIFEST_PATH")
 
 # =============================================================================
 # Utilities
@@ -146,6 +151,18 @@ def getenv_json(name: str, default: Any) -> Any:
         return json.loads(val)
     except Exception:
         return default
+
+def _safe_yaml_load(txt: str) -> Any:
+    try:
+        import yaml  # type: ignore
+    except Exception as e:
+        raise RuntimeError("PyYAML is required to parse YAML manifests/config") from e
+    return yaml.safe_load(txt)
+
+def _mask(s: str, keep: int = 6) -> str:
+    if not s:
+        return s
+    return s if len(s) <= keep else s[:keep] + "*" * (len(s) - keep)
 
 def _schema_enums(schema: Dict[str, Any]) -> Dict[str, List[str]]:
     out: Dict[str, List[str]] = {}
@@ -497,18 +514,61 @@ async def mcp_call_tool_stdio(session, tool_name: str, args: Dict[str, Any]) -> 
     return normalized
 
 # =============================================================================
+# Manifest support (parsing + reload)
+# =============================================================================
+
+def _parse_manifest_to_specs(path: str) -> Tuple[Optional[str], List[Dict[str, Any]]]:
+    """Return (instanceId_override, driver_specs[]) normalized for REGISTRY.load_from_env."""
+    with open(path, "r", encoding="utf-8") as f:
+        doc = _safe_yaml_load(f.read())
+
+    if not isinstance(doc, dict) or "spec" not in doc:
+        raise ValueError("Invalid DriverManifest: missing top-level 'spec'")
+
+    spec = doc.get("spec") or {}
+    iid = spec.get("instanceId")
+    drivers = spec.get("drivers") or []
+    out: List[Dict[str, Any]] = []
+    for d in drivers:
+        mod = d.get("module")
+        if not mod:
+            name = d.get("name", "<unnamed>")
+            raise ValueError(f"Driver entry '{name}' missing 'module'")
+        out.append({"module": mod, "config": d.get("config")})
+    return iid, out
+
+async def _reload_drivers_from_manifest() -> Dict[str, Any]:
+    """Parse manifest, optionally switch instance/cache, then call load_from_env via DRIVERS shim."""
+    global DRIVER_MANIFEST_PATH
+    if not DRIVER_MANIFEST_PATH:
+        return {"error": "No DRIVER_MANIFEST_PATH set"}
+
+    iid, specs = _parse_manifest_to_specs(DRIVER_MANIFEST_PATH)
+
+    # If manifest defines instanceId, switch registry instance and cache namespace.
+    if iid and iid != REGISTRY.instance_id:
+        os.environ["INSTANCE_ID"] = iid
+        # Swap cache to pick up the new INSTANCE_ID prefix
+        REGISTRY.cache = RedisCache() if os.getenv("REDIS_URL") else InMemoryCache()
+        REGISTRY.instance_id = iid
+
+    # Temporarily set DRIVERS env to normalized specs so we can reuse load_from_env().
+    os.environ["DRIVERS"] = json.dumps(specs)
+    return await REGISTRY.load_from_env()
+
+# =============================================================================
 # FastAPI App + Discovery + Drivers
 # =============================================================================
 
 app = FastAPI(
     title="MCP OpenAPI Bridge (Generic, Driver-Aware)",
-    version="9.0.0",
+    version="9.1.0",
     description=textwrap.dedent(
         """\
         Generic OpenAPI façade for MCP servers.
         - HTTP RPC preferred (MCP_RPC_URL).
         - Stdio optional (enable with MCP_STDIO_ENABLED=1). Descriptor-only signature.
-        - Drivers (via DRIVERS env) can add MCP-specific guidance & Redis-backed data.
+        - Drivers via DRIVERS env or a single YAML manifest (DRIVER_MANIFEST_PATH).
         - Per-tool endpoints auto-generated from MCP tool schemas.
         """
     ),
@@ -538,8 +598,7 @@ async def normalize_odd_paths(request: Request, call_next):
     for bad in ("<server-alias>", "<server>", "server-alias", "server"):
         prefix = f"/{bad}/"
         if decoded.startswith(prefix):
-            decoded = "/mcp/" + decoded[len(prefix):]
-            break
+            decoded = "/mcp/" + decoded.len(prefix)
 
     marker = "/tool/"
     if marker in decoded:
@@ -572,7 +631,7 @@ async def on_startup():
         MIGRATION_ERROR = str(e)
         print(f"[migrator] FAILED: {e}", file=sys.stderr)
         # keep server up so you can read logs / troubleshoot; readiness will fail
-        
+
     # Load servers
     servers_cfg = getenv_json("MCP_SERVERS", None) or []
     for cfg in servers_cfg:
@@ -587,12 +646,15 @@ async def on_startup():
     except Exception as e:
         print(f"Validation failed:\n{e}", file=sys.stderr)
 
-    # Load drivers (Redis + per-instance isolation inside)
+    # Load drivers (prefer manifest if present)
     try:
-        status = await REGISTRY.load_from_env()
+        if DRIVER_MANIFEST_PATH:
+            status = await _reload_drivers_from_manifest()
+        else:
+            status = await REGISTRY.load_from_env()
         print(f"[drivers] loaded: {status}", file=sys.stderr)
     except Exception as e:
-        print(f"[drivers] load_from_env failed: {e}", file=sys.stderr)
+        print(f"[drivers] load failed: {e}", file=sys.stderr)
 
 @app.on_event("shutdown")
 async def on_shutdown():
@@ -685,6 +747,151 @@ async def servers_info():
 @app.get("/drivers/status", tags=["info"], summary="Loaded drivers")
 async def drivers_status():
     return await REGISTRY.describe_all()
+
+# =============================================================================
+# Introspection endpoints (cache/env/manifest & driver reload)
+# =============================================================================
+
+@app.get("/introspect/cache/status", tags=["introspect"])
+async def introspect_cache_status():
+    base = {
+        "namespace": REGISTRY.cache.namespace(),
+        "defaultTTL": int(os.getenv("DRIVER_CACHE_DEFAULT_TTL", "600")),
+        "maxEntries": os.getenv("DRIVER_CACHE_MAX_ENTRIES", "10000"),
+        "prefixEnv": os.getenv("DRIVER_CACHE_NS_PREFIX", "driver"),
+        "instanceId": REGISTRY.instance_id,
+        "kind": type(REGISTRY.cache).__name__,
+    }
+    # Try Redis stats if available
+    r = getattr(REGISTRY.cache, "_r", None)
+    if r is not None:
+        try:
+            pong = r.ping()
+        except Exception as e:
+            pong = f"error: {type(e).__name__}: {e}"
+        try:
+            dbsize = r.dbsize()
+        except Exception as e:
+            dbsize = f"error: {type(e).__name__}: {e}"
+        try:
+            info_server = r.info("server")
+            version = info_server.get("redis_version")
+        except Exception:
+            version = None
+        base["redis"] = {
+            "url": _mask(os.getenv("REDIS_URL", "")),
+            "ping": pong,
+            "dbsize": dbsize,
+            "version": version,
+        }
+    else:
+        # InMemory
+        size = None
+        try:
+            size = len(getattr(REGISTRY.cache, "_d", {}))
+        except Exception:
+            pass
+        base["memory"] = {"entries": size, "maxEntries": int(os.getenv("DRIVER_CACHE_MAX_ENTRIES", "10000"))}
+    return base
+
+@app.post("/introspect/cache/selftest", tags=["introspect"])
+async def introspect_cache_selftest():
+    import random, string
+    ns = "introspect"
+    key = "selftest-" + "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
+    payload = {"ok": True, "key": key}
+    try:
+        REGISTRY.cache.set(ns, key, payload, ttl_seconds=30)
+        got = REGISTRY.cache.get(ns, key)
+        success = (got == payload)
+        return {"success": success, "written": payload, "readBack": got, "cache": await introspect_cache_status()}
+    finally:
+        try:
+            REGISTRY.cache.delete(ns, key)
+        except Exception:
+            pass
+
+@app.get("/introspect/env/core", tags=["introspect"])
+async def introspect_env_core():
+    return {
+        "INSTANCE_ID": os.getenv("INSTANCE_ID", "default"),
+        "REDIS_URL": _mask(os.getenv("REDIS_URL", "")),
+        "DRIVER_CACHE_DEFAULT_TTL": os.getenv("DRIVER_CACHE_DEFAULT_TTL", "600"),
+        "DRIVER_CACHE_MAX_ENTRIES": os.getenv("DRIVER_CACHE_MAX_ENTRIES", "10000"),
+        "DRIVER_CACHE_NS_PREFIX": os.getenv("DRIVER_CACHE_NS_PREFIX", "driver"),
+        "DRIVER_MANIFEST_PATH": os.getenv("DRIVER_MANIFEST_PATH", ""),
+        "DRIVERS_present": bool(os.getenv("DRIVERS")),
+        "DRIVERS_length": len(os.getenv("DRIVERS", "")),
+    }
+
+@app.post("/introspect/drivers/reload", tags=["introspect"], summary="Reload drivers (manifest if set, else DRIVERS)")
+async def introspect_drivers_reload():
+    try:
+        if os.getenv("DRIVER_MANIFEST_PATH"):
+            status = await _reload_drivers_from_manifest()
+        else:
+            status = await REGISTRY.load_from_env()
+        return status
+    except Exception as e:
+        raise HTTPException(500, f"Driver reload failed: {e}")
+
+@app.get("/status", include_in_schema=False)
+async def html_status():
+    cache = await introspect_cache_status()
+    drivers = await REGISTRY.describe_all()
+    html = f"""
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>MCP OpenAPI — Status</title>
+<style>
+body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 2rem; }}
+code, pre {{ background: #f6f8fa; padding: 2px 4px; border-radius: 4px; }}
+section {{ margin-bottom: 2rem; }}
+summary {{ font-weight: 600; }}
+.kv td {{ padding: .25rem .5rem; vertical-align: top; }}
+.kv td:first-child {{ color: #555; }}
+</style>
+</head>
+<body>
+  <h1>MCP OpenAPI — Status</h1>
+
+  <section>
+    <div class="summary">Instance</div>
+    <table class="kv">
+      <tr><td>Instance ID</td><td><code>{cache.get("instanceId")}</code></td></tr>
+      <tr><td>Cache Kind</td><td><code>{cache.get("kind")}</code></td></tr>
+      <tr><td>Cache Namespace</td><td><code>{cache.get("namespace")}</code></td></tr>
+    </table>
+  </section>
+
+  <section>
+    <div class="summary">Cache</div>
+    <pre>{json.dumps(cache, indent=2, ensure_ascii=False)}</pre>
+  </section>
+
+  <section>
+    <div class="summary">Drivers</div>
+    <pre>{json.dumps(drivers, indent=2, ensure_ascii=False)}</pre>
+  </section>
+
+  <section>
+    <div class="summary">Useful endpoints</div>
+    <ul>
+      <li><code>/introspect/cache/status</code></li>
+      <li><code>/introspect/cache/selftest</code> (POST)</li>
+      <li><code>/introspect/drivers/reload</code> (POST)</li>
+      <li><code>/introspect/env/core</code></li>
+      <li><code>/drivers/status</code></li>
+      <li><code>/discovery/status</code></li>
+      <li><code>/discover</code> (POST)</li>
+    </ul>
+  </section>
+</body>
+</html>
+"""
+    return Response(content=html, media_type="text/html")
 
 # =============================================================================
 # Discovery control
@@ -1013,14 +1220,17 @@ def custom_openapi():
     openapi_schema = _original_openapi()
     openapi_schema.update({**openapi_extra_blocks()})
     _inject_tool_operations(openapi_schema)
-    # let drivers patch OpenAPI further (e.g., add tags, notes)
-    try:
-        asyncio.get_event_loop()  # ensure loop exists (when imported by docs tools)
-        # enrich is async API in registry to allow drivers do I/O if needed
-        # but here we call the quick, non-I/O enrich path where possible.
-        # For deep enrich, we expose /drivers/status.
-    except Exception:
-        pass
     app.openapi_schema = openapi_schema
     return app.openapi_schema
 app.openapi = custom_openapi
+
+
+# Optional: allow `python app.py` for local dev
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "app:app",
+        host=os.getenv("HOST", "0.0.0.0"),
+        port=int(os.getenv("PORT", "8080")),
+        reload=bool(os.getenv("RELOAD", "")),
+    )
