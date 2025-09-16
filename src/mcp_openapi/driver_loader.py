@@ -1,29 +1,85 @@
 # mcp_openapi/driver_loader.py
 from __future__ import annotations
+
 import importlib
 import json
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 from mcp_openapi.driver_base import CacheAPI
+
+# -------------------- helpers --------------------
+
+def _safe_load_yaml(txt: str) -> Any:
+    try:
+        import yaml  # type: ignore
+        return yaml.safe_load(txt)
+    except Exception as e:
+        raise RuntimeError("YAML parsing failed (install PyYAML?): " + str(e)) from e
+
+def _load_manifest_from_env() -> Optional[Dict[str, Any]]:
+    """
+    Try to load a manifest YAML if DRIVER_MANIFEST_PATH or MANIFEST_PATH is set.
+    Returns a dict or None.
+    """
+    path = (
+        os.getenv("DRIVER_MANIFEST_PATH")
+        or os.getenv("MANIFEST_PATH")
+        or "/etc/mcp/driver-manifest.yaml"
+    )
+    try:
+        if not os.path.exists(path):
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            return _safe_load_yaml(f.read())
+    except Exception:
+        return None
+
+def _coerce_json_or_yaml_path(s: str) -> Dict[str, Any]:
+    """
+    If s is a file path, load YAML/JSON from it; otherwise parse as JSON.
+    """
+    if os.path.exists(s):
+        with open(s, "r", encoding="utf-8") as f:
+            txt = f.read()
+        # Guess YAML by extension, else try JSON then YAML
+        lower = s.lower()
+        if lower.endswith((".yaml", ".yml")):
+            return _safe_load_yaml(txt) or {}
+        try:
+            return json.loads(txt)
+        except Exception:
+            return _safe_load_yaml(txt) or {}
+    # Not a file; parse as JSON
+    return json.loads(s)
 
 # -------------------- Redis-backed cache --------------------
 
 class RedisCache(CacheAPI):
-    def __init__(self):
+    def __init__(
+        self,
+        url: Optional[str] = None,
+        default_ttl: Optional[int] = None,
+        prefix: Optional[str] = None,
+    ):
         try:
             import redis  # redis>=4
         except Exception as e:
-            raise RuntimeError("RedisCache requires 'redis' package") from e
+            raise RuntimeError("RedisCache requires the 'redis' package") from e
 
-        url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-        self._r = redis.Redis.from_url(url, decode_responses=True)
-        self._default_ttl = int(os.getenv("DRIVER_CACHE_DEFAULT_TTL", "600"))
+        url_env = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+        self._r = redis.Redis.from_url(url or url_env, decode_responses=True)
+
+        self._default_ttl = int(
+            default_ttl
+            if default_ttl is not None
+            else os.getenv("DRIVER_CACHE_DEFAULT_TTL", "600")
+        )
         base_prefix = os.getenv("DRIVER_CACHE_NS_PREFIX", "driver")
         instance = os.getenv("INSTANCE_ID", "default")
-        self._prefix = f"{base_prefix}:{instance}"
+        self._prefix = prefix or f"{base_prefix}:{instance}"
 
     def _k(self, ns: str, key: str) -> str:
         return f"{self._prefix}:{ns}:{key}"
@@ -53,21 +109,32 @@ class RedisCache(CacheAPI):
 
 # -------------------- In-memory fallback --------------------
 
-from dataclasses import dataclass
-
 @dataclass
 class _Item:
     value: Any
     exp: Optional[float]
 
 class InMemoryCache(CacheAPI):
-    def __init__(self):
+    def __init__(
+        self,
+        default_ttl: Optional[int] = None,
+        prefix: Optional[str] = None,
+        max_entries: Optional[int] = None,
+    ):
         self._d: Dict[Tuple[str, str], _Item] = {}
-        self._default_ttl = int(os.getenv("DRIVER_CACHE_DEFAULT_TTL", "600"))
-        self._max = int(os.getenv("DRIVER_CACHE_MAX_ENTRIES", "10000"))
+        self._default_ttl = int(
+            default_ttl
+            if default_ttl is not None
+            else os.getenv("DRIVER_CACHE_DEFAULT_TTL", "600")
+        )
+        self._max = int(
+            max_entries
+            if max_entries is not None
+            else os.getenv("DRIVER_CACHE_MAX_ENTRIES", "10000")
+        )
         base_prefix = os.getenv("DRIVER_CACHE_NS_PREFIX", "driver")
         instance = os.getenv("INSTANCE_ID", "default")
-        self._prefix = f"{base_prefix}:{instance}"
+        self._prefix = prefix or f"{base_prefix}:{instance}"
 
     def _now(self) -> float:
         return time.time()
@@ -112,16 +179,64 @@ class LoadedDriver:
 
 class DriverRegistry:
     """
-    Loads drivers from the DRIVERS env, which is set by app.py from the manifest (driver-manifest.yaml).
-    DRIVERS is a JSON array of {module, config} objects, where config can be a dict or a path to a YAML file.
+    Loads drivers from:
+      1) DRIVERS environment variable (JSON array of {module, config})
+      2) If absent, from the manifest 'spec.drivers' (when DRIVER_MANIFEST_PATH/MANIFEST_PATH is set)
+
+    Cache + instanceId also prefer the manifest when present (spec.cache, spec.instanceId),
+    else fall back to environment variables.
     """
     def __init__(self):
-        if os.getenv("REDIS_URL"):
-            self.cache = RedisCache()
+        self.loaded: Dict[str, LoadedDriver] = {}
+
+        # Read manifest (optional)
+        manifest = _load_manifest_from_env()
+        spec = (manifest or {}).get("spec") or {}
+
+        # Instance id (manifest overrides env if env wasn’t set)
+        env_instance = os.getenv("INSTANCE_ID")
+        man_instance = spec.get("instanceId")
+        if env_instance:
+            self.instance_id = env_instance
         else:
-            self.cache = InMemoryCache()
-        self.loaded = {}
-        self.instance_id = os.getenv("INSTANCE_ID", "default")
+            self.instance_id = man_instance or "default"
+            os.environ["INSTANCE_ID"] = self.instance_id  # surface to others
+
+        # Cache config (manifest optional)
+        cache_cfg = spec.get("cache") or {}
+        cache_kind = (cache_cfg.get("kind") or "").lower()  # "redis" | "memory" | ""
+        cache_prefix = cache_cfg.get("prefix")
+        cache_default_ttl = cache_cfg.get("defaultTTL")
+        cache_max_entries = cache_cfg.get("maxEntries")
+        cache_url = None
+
+        # Support nested "redis: {url: ...}" or top-level "url"
+        if isinstance(cache_cfg.get("redis"), dict):
+            cache_url = cache_cfg["redis"].get("url")
+        cache_url = cache_url or cache_cfg.get("url") or os.getenv("REDIS_URL")
+
+        # Choose cache backend:
+        use_redis = bool(cache_url) or bool(os.getenv("REDIS_URL"))
+        if cache_kind == "memory":
+            use_redis = False
+        elif cache_kind == "redis":
+            use_redis = True
+
+        if use_redis:
+            self.cache = RedisCache(
+                url=cache_url,
+                default_ttl=cache_default_ttl,
+                prefix=cache_prefix or None,
+            )
+            # Make REDIS_URL visible to anyone else (introspection endpoints, etc.)
+            if cache_url and not os.getenv("REDIS_URL"):
+                os.environ["REDIS_URL"] = cache_url
+        else:
+            self.cache = InMemoryCache(
+                default_ttl=cache_default_ttl,
+                prefix=cache_prefix or None,
+                max_entries=cache_max_entries,
+            )
 
     def _read_config(self, blob: Any) -> Dict[str, Any]:
         if blob is None:
@@ -129,25 +244,49 @@ class DriverRegistry:
         if isinstance(blob, dict):
             return blob
         if isinstance(blob, str):
-            if os.path.exists(blob):
-                with open(blob, "r", encoding="utf-8") as f:
-                    txt = f.read()
-                try:
-                    import yaml
-                    return yaml.safe_load(txt)
-                except Exception:
-                    return json.loads(txt)
-            return json.loads(blob)
+            return _coerce_json_or_yaml_path(blob)
         return {}
 
+    def _drivers_from_env_or_manifest(self) -> List[Dict[str, Any]]:
+        # 1) DRIVERS env (JSON)
+        raw = os.getenv("DRIVERS")
+        if raw:
+            try:
+                arr = json.loads(raw)
+                if isinstance(arr, list):
+                    return arr
+            except Exception:
+                pass
+
+        # 2) Fallback: manifest spec.drivers
+        manifest = _load_manifest_from_env()
+        if manifest and isinstance(manifest, dict):
+            spec = manifest.get("spec") or {}
+            drivers = spec.get("drivers") or []
+            # Normalize: allow entries with {"name": "...", "module": "...", "config": ...}
+            out: List[Dict[str, Any]] = []
+            for d in drivers:
+                if not isinstance(d, dict):
+                    continue
+                mod = d.get("module") or d.get("name")
+                if not mod:
+                    continue
+                out.append({"module": mod, "config": d.get("config")})
+            return out
+
+        return []
+
     async def load_from_env(self) -> Dict[str, Any]:
-        raw = os.getenv("DRIVERS", "[]")
-        try:
-            arr = json.loads(raw)
-        except Exception:
-            arr = []
+        """
+        (Re)loads drivers using DRIVERS env or manifest fallback.
+        Closes previously loaded ones first.
+        """
+        await self.close_all()
+        self.loaded.clear()
+
+        specs = self._drivers_from_env_or_manifest()
         summary = []
-        for spec in arr:
+        for spec in specs:
             modname = spec.get("module")
             conf_blob = spec.get("config")
             if not modname:
@@ -157,8 +296,8 @@ class DriverRegistry:
                 instance = getattr(mod, "DriverImpl")()
                 cfg = self._read_config(conf_blob)
                 await instance.load(cfg, self.cache)
-                name = getattr(instance, "name", modname)
-                self.loaded[name] = LoadedDriver(modpath=modname, instance=instance, config=cfg)
+                name = getattr(instance, "name", None) or modname
+                self.loaded[name] = LoadedDriver(modpath=modname, instance=instance, config=cffg if (cffg := cfg) else {})
                 summary.append({"name": name, "module": modname, "loaded": True})
             except Exception as e:
                 summary.append({"module": modname, "loaded": False, "error": f"{type(e).__name__}: {e}"})

@@ -46,74 +46,93 @@ class Migrator:
     def run_on_startup(self):
         if os.getenv("RUN_MIGRATIONS", "0").lower() not in ("1","true","yes"):
             return  # disabled
+
         with self._connect() as conn:
-            conn.execute("SET client_min_messages TO WARNING;")
-            self._ensure_schema(conn)
-            if self.reset:
-                self._drop_schema(conn)
+            # ----- advisory lock to serialize migrations across pods -----
+            # 32-bit key derived from (database, schema)
+            key_src = f"{self.database}:{self.schema}".encode("utf-8")
+            lock_key = int.from_bytes(hashlib.sha256(key_src).digest()[:4], "big", signed=False)
+            conn.execute("SELECT pg_advisory_lock(%s);", (lock_key,))
+            try:
+                conn.execute("SET client_min_messages TO WARNING;")
                 self._ensure_schema(conn)
+                if self.reset:
+                    self._drop_schema(conn)
+                    self._ensure_schema(conn)
 
-            self._ensure_meta_tables(conn)
+                self._ensure_meta_tables(conn)
 
-            applied = self._load_applied(conn)
-            todo = self._discover_migrations(self.migrations_dir)
+                applied = self._load_applied(conn)
+                todo = self._discover_migrations(self.migrations_dir)
 
-            for version, name, kind, path in todo:
-                checksum = self._file_sha256(path)
-                prev = applied.get(version)
-                if prev:
-                    # already applied
-                    if prev["checksum"] != checksum and not self.allow_changed_checksums:
-                        raise RuntimeError(
-                          f"Checksum changed for migration {version}_{name}!\n"
-                          f" was={prev['checksum']}\n now={checksum}\n"
-                          " (set DB_MIGRATION_ALLOW_CHANGED=1 to override)"
-                        )
-                    continue
-
-                # apply within a transaction
-                with conn.transaction():
-                    if kind == "up.sql":
-                        sql = open(path, "r", encoding="utf-8").read()
-                        conn.execute(sql)
-                    elif kind == "py":
-                        self._exec_python_migration(conn, path)
-                    else:
-                        raise RuntimeError(f"Unknown migration kind: {kind}")
-
-                    conn.execute(
-                        f"INSERT INTO {self.mig_table}(version,name,checksum,executed_at) VALUES(%s,%s,%s,now());",
-                        (version, name, checksum)
-                    )
-                print(f"[migrator] applied {version}_{name}.{kind}")
-
-            # seeds (best-effort, only once each)
-            if os.path.isdir(self.seeds_dir):
-                seeded = self._load_seeded(conn)
-                for spath in sorted(glob.glob(os.path.join(self.seeds_dir, "*"))):
-                    sname = os.path.basename(spath)
-                    if sname in seeded:
+                for version, name, kind, path in todo:
+                    checksum = self._file_sha256(path)
+                    prev = applied.get(version)
+                    if prev:
+                        # already applied
+                        if prev["checksum"] != checksum and not self.allow_changed_checksums:
+                            raise RuntimeError(
+                              f"Checksum changed for migration {version}_{name}!\n"
+                              f" was={prev['checksum']}\n now={checksum}\n"
+                              " (set DB_MIGRATION_ALLOW_CHANGED=1 to override)"
+                            )
                         continue
+
+                    # apply within a transaction
                     with conn.transaction():
-                        if sname.endswith(".sql"):
-                            sql = open(spath, "r", encoding="utf-8").read()
+                        if kind == "up.sql":
+                            sql = open(path, "r", encoding="utf-8").read()
                             conn.execute(sql)
-                        elif sname.endswith(".py"):
-                            self._exec_python_seed(conn, spath)
+                        elif kind == "py":
+                            self._exec_python_migration(conn, path)
                         else:
-                            continue
+                            raise RuntimeError(f"Unknown migration kind: {kind}")
+
                         conn.execute(
-                            f"INSERT INTO {self.seed_table}(name,checksum,executed_at) VALUES(%s,%s,now());",
-                            (sname, self._file_sha256(spath))
+                            f"INSERT INTO {self.mig_table}(version,name,checksum,executed_at) VALUES(%s,%s,%s,now());",
+                            (version, name, checksum)
                         )
-                    print(f"[migrator] seeded {sname}")
+                    print(f"[migrator] applied {version}_{name}.{kind}")
+
+                # seeds (best-effort, only once each)
+                if os.path.isdir(self.seeds_dir):
+                    seeded = self._load_seeded(conn)
+                    for spath in sorted(glob.glob(os.path.join(self.seeds_dir, "*"))):
+                        sname = os.path.basename(spath)
+                        if sname in seeded:
+                            continue
+                        with conn.transaction():
+                            if sname.endswith(".sql"):
+                                sql = open(spath, "r", encoding="utf-8").read()
+                                conn.execute(sql)
+                            elif sname.endswith(".py"):
+                                self._exec_python_seed(conn, spath)
+                            else:
+                                continue
+                            conn.execute(
+                                f"INSERT INTO {self.seed_table}(name,checksum,executed_at) VALUES(%s,%s,now());",
+                                (sname, self._file_sha256(spath))
+                            )
+                        print(f"[migrator] seeded {sname}")
+            finally:
+                # always release the advisory lock
+                conn.execute("SELECT pg_advisory_unlock(%s);", (lock_key,))
 
     # -------------------- internals --------------------
     def _connect(self):
-        dsn = (
-            f"host={self.host} port={self.port} dbname={self.database} "
-            f"user={self.user} password={self.password} sslmode={self.sslmode}"
-        )
+        # Build DSN without injecting literal "None"
+        parts = [
+            f"host={self.host}",
+            f"port={self.port}",
+            f"dbname={self.database}",
+            f"sslmode={self.sslmode}",
+        ]
+        if self.user:
+            parts.append(f"user={self.user}")
+        if self.password:
+            parts.append(f"password={self.password}")
+        dsn = " ".join(parts)
+
         # autocommit False by default; we manage transactions
         conn = psycopg.connect(dsn)
         conn.execute(f"CREATE SCHEMA IF NOT EXISTS {self._qi(self.schema)};")

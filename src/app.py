@@ -1,38 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
 MCP OpenAPI Bridge — Generic, Driver-Aware, Redis-backed
 --------------------------------------------------------
-- Pure generic MCP OpenAPI façade (no domain assumptions)
-- HTTP RPC (MCP_RPC_URL) preferred; stdio optional (descriptor-only)
-- Dynamic driver loading via DRIVERS (JSON list of {module, config})
-- Optional single-manifest configuration via DRIVER_MANIFEST_PATH (YAML)
-- Drivers can enrich OpenAPI (notes/examples/tags) and expose summaries
-- Driver data lives in Redis (per-instance namespace) or in-memory.
-- Alias-path rewrite fixes clients that use operationId as a URL.
+All runtime config is sourced from a single YAML manifest mounted at
+`/etc/mcp/driver-manifest.yaml` (or MANIFEST_PATH/DRIVER_MANIFEST_PATH).
 
-Run:
-  uvicorn app:app --host 0.0.0.0 --port 8080
-
-Key env:
-  MCP_RPC_URL='http://mcp-server:8080/mcp'
-  MCP_STDIO_ENABLED=0 | 1
-  MCP_FORCE_STDIO=0 | 1
-  MCP_STDIO_INIT_TIMEOUT=45
-  MCP_STDIO_PREFLIGHT=1
-  MCP_STDIO_PREFLIGHT_CONFIG=0
-  MCP_STDIO_EXTRA_ARGS=''
-  MCP_SERVERS='[{"alias":"mcp","mode":"stdio","cmd":["/path/to/server","--transport","stdio"],"env":{},"cwd":"/app"}]'
-  MCP_DISCOVERY_WAIT=2
-  MCP_FORWARD_URL='http://mcp-upstream:8080'
-
-  # Driver system (preferred)
-  DRIVERS='[{"module":"mcp_openapi.drivers.yugabyte_driver","config":"/config/yugabyte-driver.yaml"}]'
-  DRIVER_MANIFEST_PATH='/config/driver-manifest.yaml'   # Optional: single YAML manifest
-  INSTANCE_ID='mcp-k8s-ro'
-  REDIS_URL='redis://redis:6379/0'
-  DRIVER_CACHE_DEFAULT_TTL=600
-  DRIVER_CACHE_NS_PREFIX='driver'
+- Transport (stdio/http) comes from spec.transport
+- Servers list comes from spec.transport.servers
+- Cache/Redis comes from spec.cache.registry.redis
+- Drivers come from spec.drivers
+- DB migrator config comes from spec.migrator.db
 """
 
 import asyncio
@@ -40,7 +19,6 @@ import importlib
 import inspect
 import json
 import os
-from mcp_openapi.manifest_loader import load_manifest
 import re
 import stat
 import sys
@@ -49,55 +27,70 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import unquote
 
-# add near top
 from migrator import Migrator
-
 import httpx
 from fastapi import Body, FastAPI, HTTPException, Path, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
+from mcp_openapi.manifest_loader import load_manifest
 from mcp_openapi.driver_loader import REGISTRY, RedisCache, InMemoryCache  # type: ignore
 
-# Load manifest at startup
-MANIFEST = None
-MANIFEST_PATH = os.environ.get("MANIFEST_PATH") or os.environ.get("DRIVER_MANIFEST_PATH") or "/config/driver-manifest.yaml"
+# =============================================================================
+# Manifest: load once, make it the source of truth
+# =============================================================================
+
+DEFAULT_MANIFEST_PATH = "/etc/mcp/driver-manifest.yaml"
+MANIFEST_PATH = os.getenv("MANIFEST_PATH") or os.getenv("DRIVER_MANIFEST_PATH") or DEFAULT_MANIFEST_PATH
+
+MANIFEST: Optional[Dict[str, Any]] = None
 try:
     MANIFEST = load_manifest(MANIFEST_PATH)
+    # ensure the rest of the code knows where to find it (reload route, etc.)
+    os.environ["DRIVER_MANIFEST_PATH"] = MANIFEST_PATH
 except Exception as e:
-    print(f"[manifest] Failed to load manifest: {e}", file=sys.stderr)
+    print(f"[manifest] Failed to load manifest from {MANIFEST_PATH}: {e}", file=sys.stderr)
     MANIFEST = None
 
+# Defaults for health state
+MIGRATIONS_DONE: bool = True
+MIGRATION_ERROR: str = ""
 
-# --- Transport config from manifest ---
+# =============================================================================
+# Transport config (prefer manifest; no env fallback unless manifest absent)
+# =============================================================================
+
 MCP_STDIO_ENABLED = False
 MCP_FORCE_STDIO = False
 MCP_STDIO_INIT_TIMEOUT = 45
 MCP_STDIO_PREFLIGHT = True
 MCP_STDIO_PREFLIGHT_CONFIG = False
 MCP_STDIO_EXTRA_ARGS = ""
-MCP_AVAILABLE = False
-MCPClientSession = None
-stdio_client = None
-StdioParamsType = None
+MCP_RPC_URL: Optional[str] = None
+MCP_FORWARD_URL: Optional[str] = None
 
-if MANIFEST and "transport" in MANIFEST["spec"]:
+if MANIFEST and "transport" in MANIFEST.get("spec", {}):
     t = MANIFEST["spec"]["transport"]
-    stdio = t.get("stdio", {})
-    MCP_STDIO_ENABLED = stdio.get("enabled", False)
-    MCP_FORCE_STDIO = stdio.get("force", False)
+    stdio = t.get("stdio", {}) or {}
+    MCP_STDIO_ENABLED = bool(stdio.get("enabled", False))
+    MCP_FORCE_STDIO = bool(stdio.get("force", False))
     MCP_STDIO_INIT_TIMEOUT = int(stdio.get("initTimeoutSeconds", 45))
-    MCP_STDIO_PREFLIGHT = stdio.get("preflight", True)
-    MCP_STDIO_PREFLIGHT_CONFIG = stdio.get("preflightConfig", False)
-    MCP_STDIO_EXTRA_ARGS = " ".join(stdio.get("extraArgs", []))
-    # Optionally set MCP_RPC_URL, MCP_FORWARD_URL from manifest
-    MCP_RPC_URL = t.get("rpc", {}).get("url", "")
-    MCP_FORWARD_URL = t.get("forward", {}).get("url", "")
+    MCP_STDIO_PREFLIGHT = bool(stdio.get("preflight", True))
+    MCP_STDIO_PREFLIGHT_CONFIG = bool(stdio.get("preflightConfig", False))
+    MCP_STDIO_EXTRA_ARGS = " ".join(stdio.get("extraArgs", []) or [])
+    MCP_RPC_URL = (t.get("rpc", {}) or {}).get("url") or None
+    MCP_FORWARD_URL = (t.get("forward", {}) or {}).get("url") or None
 else:
-    MCP_RPC_URL = os.getenv("MCP_RPC_URL")
-    MCP_FORWARD_URL = os.getenv("MCP_FORWARD_URL")
+    # Only fall back to env if manifest has no transport block
+    MCP_RPC_URL = os.getenv("MCP_RPC_URL") or None
+    MCP_FORWARD_URL = os.getenv("MCP_FORWARD_URL") or None
 
+# Load stdio client if enabled
+MCP_AVAILABLE = False
+stdio_client = None
+MCPClientSession = None
+StdioParamsType = None
 if MCP_STDIO_ENABLED or MCP_FORCE_STDIO:
     try:
         from mcp.client.stdio import stdio_client as _stdio_client  # type: ignore
@@ -118,7 +111,7 @@ if MCP_STDIO_ENABLED or MCP_FORCE_STDIO:
         StdioParamsType = None  # fallback
 
 # =============================================================================
-# Data structures
+# Models / in-memory discovery
 # =============================================================================
 
 class ServerConfig(BaseModel):
@@ -154,9 +147,6 @@ class DiscoveryState:
         } for alias, st in self.servers.items()]
 
 DISCOVERY = DiscoveryState()
-MCP_FORWARD_URL = os.getenv("MCP_FORWARD_URL")
-MCP_RPC_URL = os.getenv("MCP_RPC_URL")
-DRIVER_MANIFEST_PATH = os.getenv("DRIVER_MANIFEST_PATH")
 
 # =============================================================================
 # Utilities
@@ -233,9 +223,8 @@ def _build_examples_from_schema(tool_name: str, schema: Dict[str, Any]) -> List[
         })
     return examples
 
-
 # =============================================================================
-# MCP integration — HTTP RPC
+# MCP (HTTP RPC)
 # =============================================================================
 
 async def rpc_try_methods(client: httpx.AsyncClient, url: str, candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -303,7 +292,7 @@ async def mcp_http_call_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, 
     return normalized
 
 # =============================================================================
-# MCP integration — stdio
+# MCP (stdio)
 # =============================================================================
 
 async def _enter_ctx(cm):
@@ -369,7 +358,6 @@ def _with_extra_args(args: List[str]) -> List[str]:
     return args + extra
 
 def _arg_permutations(base_args: List[str]) -> List[List[str]]:
-    """Safe permutations: '--transport stdio' vs '--transport=stdio'. No bare '--stdio'."""
     perms: List[List[str]] = []
 
     def has_pair(k: str) -> bool:
@@ -382,7 +370,7 @@ def _arg_permutations(base_args: List[str]) -> List[List[str]]:
     def has_equals(k: str) -> bool:
         return any(s.startswith(k + "=") for s in base_args)
 
-    perms.append(list(base_args))  # as-is
+    perms.append(list(base_args))
 
     if has_pair("--transport"):
         i = base_args.index("--transport")
@@ -444,9 +432,8 @@ async def _preflight_all(command: str, args: List[str], env: Dict[str, str], cwd
         await _run_short(command, args, env, cwd, "configured-args", timeout_s=4.0)
 
 async def mcp_connect_stdio(cfg: ServerConfig) -> Any:
-    """Descriptor-only stdio connector with safe arg permutations."""
     if not (MCP_STDIO_ENABLED or MCP_FORCE_STDIO):
-        raise RuntimeError("MCP stdio disabled (set MCP_STDIO_ENABLED=1 or MCP_FORCE_STDIO=1).")
+        raise RuntimeError("MCP stdio disabled by manifest.")
     if not MCP_AVAILABLE or MCPClientSession is None or stdio_client is None:
         raise RuntimeError("MCP stdio client/session not available.")
     if not cfg.cmd:
@@ -491,10 +478,8 @@ async def mcp_connect_stdio(cfg: ServerConfig) -> Any:
             await _exit_ctx(stdio_cm)
             errors.append(f"#{idx} args={args} -> {type(e).__name__}: {e}")
 
-    raise RuntimeError(
-        "Failed to open stdio_client for "
-        f"'{cfg.alias}': " + " | ".join(errors)
-    )
+    raise RuntimeError("Failed to open stdio_client for "
+                       f"'{cfg.alias}': " + " | ".join(errors))
 
 async def mcp_list_tools_stdio(session) -> List[Dict[str, Any]]:
     result = await session.list_tools()
@@ -533,17 +518,14 @@ async def mcp_call_tool_stdio(session, tool_name: str, args: Dict[str, Any]) -> 
     return normalized
 
 # =============================================================================
-# Manifest support (parsing + reload)
+# Manifest helpers
 # =============================================================================
 
 def _parse_manifest_to_specs(path: str) -> Tuple[Optional[str], List[Dict[str, Any]]]:
-    """Return (instanceId_override, driver_specs[]) normalized for REGISTRY.load_from_env."""
     with open(path, "r", encoding="utf-8") as f:
         doc = _safe_yaml_load(f.read())
-
     if not isinstance(doc, dict) or "spec" not in doc:
         raise ValueError("Invalid DriverManifest: missing top-level 'spec'")
-
     spec = doc.get("spec") or {}
     iid = spec.get("instanceId")
     drivers = spec.get("drivers") or []
@@ -556,31 +538,52 @@ def _parse_manifest_to_specs(path: str) -> Tuple[Optional[str], List[Dict[str, A
         out.append({"module": mod, "config": d.get("config")})
     return iid, out
 
+def _apply_manifest_to_env_and_registry(manifest: Dict[str, Any]) -> None:
+    """Map manifest cache/instance into env + live registry before driver load."""
+    spec = manifest.get("spec", {}) or {}
+
+    # Instance ID influences cache namespace, etc.
+    iid = spec.get("instanceId")
+    if iid:
+        os.environ["INSTANCE_ID"] = str(iid)
+        REGISTRY.instance_id = str(iid)
+
+    # Cache (registry/cache settings)
+    cache = ((spec.get("cache") or {}).get("registry") or {}).get("redis") or {}
+    redis_url = cache.get("url")
+    key_prefix = cache.get("key_prefix", "driver")
+    default_ttl = str(cache.get("default_ttl_seconds", 600))
+    # set envs consumed by RedisCache()
+    if redis_url:
+        os.environ["REDIS_URL"] = redis_url
+    os.environ["DRIVER_CACHE_NS_PREFIX"] = key_prefix
+    os.environ["DRIVER_CACHE_DEFAULT_TTL"] = default_ttl
+
+    # Make sure REGISTRY.cache matches desired backend
+    try:
+        if os.getenv("REDIS_URL"):
+            REGISTRY.cache = RedisCache()
+        else:
+            REGISTRY.cache = InMemoryCache()
+    except Exception as e:
+        print(f"[cache] failed to initialize cache from manifest: {e}", file=sys.stderr)
+
 async def _reload_drivers_from_manifest() -> Dict[str, Any]:
-    """Parse manifest, optionally switch instance/cache, then call load_from_env via DRIVERS shim."""
-    global DRIVER_MANIFEST_PATH
-    if not DRIVER_MANIFEST_PATH:
+    path = os.getenv("DRIVER_MANIFEST_PATH")
+    if not path:
         return {"error": "No DRIVER_MANIFEST_PATH set"}
-
-    iid, specs = _parse_manifest_to_specs(DRIVER_MANIFEST_PATH)
-
-    # If manifest defines instanceId, switch registry instance and cache namespace.
+    iid, specs = _parse_manifest_to_specs(path)
     if iid and iid != REGISTRY.instance_id:
         os.environ["INSTANCE_ID"] = iid
-        # Swap cache to pick up the new INSTANCE_ID prefix
-        REGISTRY.cache = RedisCache() if os.getenv("REDIS_URL") else InMemoryCache()
         REGISTRY.instance_id = iid
-
-    # Temporarily set DRIVERS env to normalized specs so we can reuse load_from_env().
+        REGISTRY.cache = RedisCache() if os.getenv("REDIS_URL") else InMemoryCache()
     os.environ["DRIVERS"] = json.dumps(specs)
     return await REGISTRY.load_from_env()
 
 # =============================================================================
-# FastAPI App + Discovery + Drivers
+# FastAPI app + CORS (from manifest if available)
 # =============================================================================
 
-
-# --- CORS config from manifest ---
 cors = MANIFEST["spec"].get("cors", {}) if MANIFEST else {}
 allow_origins = cors.get("allow_origins", ["*"])
 allow_methods = cors.get("allow_methods", ["*"])
@@ -588,15 +591,9 @@ allow_headers = cors.get("allow_headers", ["*"])
 
 app = FastAPI(
     title="MCP OpenAPI Bridge (Generic, Driver-Aware)",
-    version="9.1.0",
+    version="9.2.0",
     description=textwrap.dedent(
-        """\
-        Generic OpenAPI façade for MCP servers.
-        - HTTP RPC preferred (MCP_RPC_URL).
-        - Stdio optional (enable with MCP_STDIO_ENABLED=1). Descriptor-only signature.
-        - Drivers via DRIVERS env or a single YAML manifest (DRIVER_MANIFEST_PATH).
-        - Per-tool endpoints auto-generated from MCP tool schemas.
-        """
+        """Generic OpenAPI façade for MCP servers. All configuration is read from a single manifest."""
     ),
     servers=[{"url": "http://localhost:8080"}],
     openapi_url="/openapi.json"
@@ -608,7 +605,10 @@ app.add_middleware(
     allow_methods=allow_methods, allow_headers=allow_headers,
 )
 
-# --- URL normalization + alias rewrite (fix opId-as-path) ---
+# =============================================================================
+# URL normalization
+# =============================================================================
+
 _ALIAS_RE = re.compile(r"^/mcp/tool/call_([^_/]+)_(.+)$")
 
 @app.middleware("http")
@@ -624,14 +624,12 @@ async def normalize_odd_paths(request: Request, call_next):
     for bad in ("<server-alias>", "<server>", "server-alias", "server"):
         prefix = f"/{bad}/"
         if decoded.startswith(prefix):
-            decoded = "/mcp/" + decoded.len(prefix)
+            decoded = "/mcp/" + decoded[len(prefix):]
 
     marker = "/tool/"
     if marker in decoded:
         head, tail = decoded.split(marker, 1)
-        tail = tail.replace("  ", " ").strip()
-        if " " in tail:
-            tail = "/".join([p for p in tail.split(" ") if p])
+        tail = "/".join([p for p in tail.replace("  ", " ").strip().split(" ") if p])
         decoded = head + marker + tail
 
     if decoded.startswith("/tool/"):
@@ -646,15 +644,27 @@ async def normalize_odd_paths(request: Request, call_next):
         request.scope["path"] = decoded
     return await call_next(request)
 
+# =============================================================================
+# Startup / Shutdown
+# =============================================================================
 
 @app.on_event("startup")
 async def on_startup():
     global MIGRATIONS_DONE, MIGRATION_ERROR
+
+    # 1) Apply manifest to env + registry (instance id, cache)
     try:
-        # Run DB migrations BEFORE driver load / discovery
+        if MANIFEST:
+            _apply_manifest_to_env_and_registry(MANIFEST)
+    except Exception as e:
+        print(f"[startup] cache/instance application failed: {e}", file=sys.stderr)
+
+    # 2) Run DB migrations (from manifest)
+    try:
+        MIGRATIONS_DONE = True
+        MIGRATION_ERROR = ""
         if MANIFEST and MANIFEST["spec"].get("migrator", {}).get("run", False):
             db_cfg = MANIFEST["spec"]["migrator"]["db"]
-            # Set env vars for migrator
             os.environ["DB_HOST"] = db_cfg.get("host", "localhost")
             os.environ["DB_PORT"] = str(db_cfg.get("port", 5432))
             os.environ["DB_NAME"] = db_cfg.get("name", "postgres")
@@ -666,43 +676,35 @@ async def on_startup():
             os.environ["DB_SEEDS_DIR"] = db_cfg.get("seedsDir", "/app/seeds")
             os.environ["RUN_MIGRATIONS"] = "1"
         Migrator().run_on_startup()
-        MIGRATIONS_DONE = True
     except Exception as e:
+        MIGRATIONS_DONE = False
         MIGRATION_ERROR = str(e)
         print(f"[migrator] FAILED: {e}", file=sys.stderr)
-        # keep server up so you can read logs / troubleshoot; readiness will fail
 
-    # Load servers from manifest transport.servers
+    # 3) Load servers from manifest transport.servers (no env dependency)
     servers_cfg = []
-    if MANIFEST and "transport" in MANIFEST["spec"] and "servers" in MANIFEST["spec"]["transport"]:
+    if MANIFEST and "transport" in MANIFEST.get("spec", {}) and "servers" in MANIFEST["spec"]["transport"]:
         servers_cfg = MANIFEST["spec"]["transport"]["servers"]
-    else:
-        servers_cfg = getenv_json("MCP_SERVERS", None) or []
     for cfg in servers_cfg:
         cfg_obj = ServerConfig(**cfg)
         DISCOVERY.servers[cfg_obj.alias] = ServerState(cfg_obj)
     if "mcp" not in DISCOVERY.servers:
         DISCOVERY.servers["mcp"] = ServerState(ServerConfig(alias="mcp"))
 
-    # Discover tools
+    # 4) Discover tools
     try:
-        wait = int(os.getenv("MCP_DISCOVERY_WAIT", "0"))
+        wait = 0  # purely manifest-driven; no env wait
         await do_discover(wait_seconds=wait)
     except Exception as e:
         print(f"Validation failed:\n{e}", file=sys.stderr)
 
-    # Load drivers (prefer manifest if present)
+    # 5) Load drivers (prefer manifest)
     try:
         if MANIFEST:
-            # Set DRIVERS env for REGISTRY
-            drivers = MANIFEST["spec"].get("drivers", [])
-            driver_specs = []
-            for d in drivers:
-                driver_specs.append({"module": d["module"], "config": d.get("config")})
+            drivers = MANIFEST["spec"].get("drivers", []) or []
+            driver_specs = [{"module": d["module"], "config": d.get("config")} for d in drivers]
             os.environ["DRIVERS"] = json.dumps(driver_specs)
-            status = await REGISTRY.load_from_env()
-        else:
-            status = await REGISTRY.load_from_env()
+        status = await REGISTRY.load_from_env()
         print(f"[drivers] loaded: {status}", file=sys.stderr)
     except Exception as e:
         print(f"[drivers] load failed: {e}", file=sys.stderr)
@@ -714,19 +716,20 @@ async def on_shutdown():
     except Exception:
         pass
 
+# =============================================================================
+# Discovery / Health
+# =============================================================================
+
 def refresh_servers_from_env() -> bool:
+    # kept for compatibility; not used in manifest-first flow
     updated = False
     servers_cfg = getenv_json("MCP_SERVERS", None) or []
     for cfg in servers_cfg:
         cfg_obj = ServerConfig(**cfg)
         st = DISCOVERY.servers.get(cfg_obj.alias)
-        if not st:
+        if not st or (st.cfg != cfg_obj):
             DISCOVERY.servers[cfg_obj.alias] = ServerState(cfg_obj)
             updated = True
-        else:
-            if (st.cfg.cmd != cfg_obj.cmd) or (st.cfg.mode != cfg_obj.mode) or (st.cfg.env != cfg_obj.env) or (st.cfg.cwd != cfg_obj.cwd):
-                DISCOVERY.servers[cfg_obj.alias] = ServerState(cfg_obj)
-                updated = True
     return updated
 
 async def do_discover(wait_seconds: int = 0) -> Dict[str, Any]:
@@ -772,35 +775,30 @@ async def do_discover(wait_seconds: int = 0) -> Dict[str, Any]:
         } for alias, st in DISCOVERY.servers.items()]
     }
 
-# =============================================================================
-# Health / Info
-# =============================================================================
-
-@app.get("/livez", tags=["health"], summary="Livez")
+@app.get("/livez", tags=["health"])
 async def livez():
     return {"status": "ok"}
 
-@app.get("/readyz", tags=["health"], summary="Readyz")
+@app.get("/readyz", tags=["health"])
 async def readyz():
     return {"status": "ok", "servers": DISCOVERY.list_servers()}
 
-@app.get("/healthz", tags=["health"], summary="Healthz")
+@app.get("/healthz", tags=["health"])
 async def healthz():
     if not MIGRATIONS_DONE:
-        # fail readiness until migrations complete successfully
         return JSONResponse({"status":"starting","migrations":"pending","error":MIGRATION_ERROR}, status_code=503)
     return {"status": "ok"}
 
-@app.get("/servers", tags=["info"], summary="Servers Info")
+@app.get("/servers", tags=["info"])
 async def servers_info():
     return {"servers": DISCOVERY.list_servers()}
 
-@app.get("/drivers/status", tags=["info"], summary="Loaded drivers")
+@app.get("/drivers/status", tags=["info"])
 async def drivers_status():
     return await REGISTRY.describe_all()
 
 # =============================================================================
-# Introspection endpoints (cache/env/manifest & driver reload)
+# Introspection / reload
 # =============================================================================
 
 @app.get("/introspect/cache/status", tags=["introspect"])
@@ -813,7 +811,6 @@ async def introspect_cache_status():
         "instanceId": REGISTRY.instance_id,
         "kind": type(REGISTRY.cache).__name__,
     }
-    # Try Redis stats if available
     r = getattr(REGISTRY.cache, "_r", None)
     if r is not None:
         try:
@@ -836,7 +833,6 @@ async def introspect_cache_status():
             "version": version,
         }
     else:
-        # InMemory
         size = None
         try:
             size = len(getattr(REGISTRY.cache, "_d", {}))
@@ -875,7 +871,7 @@ async def introspect_env_core():
         "DRIVERS_length": len(os.getenv("DRIVERS", "")),
     }
 
-@app.post("/introspect/drivers/reload", tags=["introspect"], summary="Reload drivers (manifest if set, else DRIVERS)")
+@app.post("/introspect/drivers/reload", tags=["introspect"])
 async def introspect_drivers_reload():
     try:
         if os.getenv("DRIVER_MANIFEST_PATH"):
@@ -885,6 +881,10 @@ async def introspect_drivers_reload():
         return status
     except Exception as e:
         raise HTTPException(500, f"Driver reload failed: {e}")
+
+# =============================================================================
+# Status page
+# =============================================================================
 
 @app.get("/status", include_in_schema=False)
 async def html_status():
@@ -948,13 +948,14 @@ summary {{ font-weight: 600; }}
 # Discovery control
 # =============================================================================
 
-@app.post("/discover", tags=["discovery"], summary="Discover Endpoint")
-async def discover_endpoint(wait: Optional[int] = Query(0, description="Seconds to wait (max 10)")):
+@app.post("/discover", tags=["discovery"])
+async def discover_endpoint(wait: Optional[int] = Query(0)):
     wait = max(0, min(int(wait or 0), 10))
+    # env refresh kept for compatibility with legacy env-based config
     refresh_servers_from_env()
     return await do_discover(wait_seconds=wait)
 
-@app.get("/discovery/status", tags=["discovery"], summary="Discovery Status")
+@app.get("/discovery/status", tags=["discovery"])
 async def discovery_status():
     return {"servers": DISCOVERY.list_servers()}
 
@@ -979,7 +980,7 @@ async def forward_via_http(server: str, tool_path: str, method: str, params: Dic
         raise HTTPException(503, f"HTTP fallback to {url} failed: {e}")
 
 # =============================================================================
-# Generic Tool Dispatch
+# Tool dispatch
 # =============================================================================
 
 async def do_tool_call(server: str, tool_name: str, body: Optional[Dict[str, Any]], qargs: Optional[str], dryrun: bool) -> Any:
@@ -1024,18 +1025,13 @@ async def do_tool_call(server: str, tool_name: str, body: Optional[Dict[str, Any
         except Exception as e:
             raise HTTPException(502, f"Stdio invocation failed: {e}")
 
-    raise HTTPException(503, "No usable transport: set MCP_RPC_URL or enable MCP_STDIO_ENABLED/MCP_FORCE_STDIO")
+    raise HTTPException(503, "No usable transport: set RPC url in manifest or enable stdio in manifest")
 
-@app.post(
-    "/{server}/tool/{tool_name:path}",
-    tags=["tools"],
-    summary="Tool Dispatch (POST)",
-    responses={200: {"description": "Successful Response", "content": {"application/json": {}}}},
-)
+@app.post("/{server}/tool/{tool_name:path}", tags=["tools"])
 async def tool_dispatch_post(
     server: str = Path(..., description="Server alias (e.g., 'mcp')"),
     tool_name: str = Path(..., description="Exact tool name as exposed by MCP"),
-    dryrun: Optional[bool] = Query(False, description="If true, returns the would-be MCP call without executing it"),
+    dryrun: Optional[bool] = Query(False),
     body: Optional[Dict[str, Any]] = Body(None),
 ):
     try:
@@ -1049,21 +1045,15 @@ async def tool_dispatch_post(
             return await forward_via_http(server, tool_name, "POST", params, body or {})
         raise
 
-@app.get(
-    "/{server}/tool/{tool_name:path}",
-    tags=["tools"],
-    summary="Tool Dispatch (GET)",
-    responses={200: {"description": "Successful Response", "content": {"application/json": {}}}},
-)
+@app.get("/{server}/tool/{tool_name:path}", tags=["tools"])
 async def tool_dispatch_get(
     server: str = Path(..., description="Server alias (e.g., 'mcp')"),
     tool_name: str = Path(..., description="Exact tool name as exposed by MCP"),
-    dryrun: Optional[bool] = Query(False, description="If true, returns the would-be MCP call without executing it"),
-    args: Optional[str] = Query(None, description="JSON-encoded arguments; sent as {'args': '<raw>'} if not JSON"),
+    dryrun: Optional[bool] = Query(False),
+    args: Optional[str] = Query(None, description="JSON-encoded arguments"),
 ):
-    body = None
     try:
-        result = await do_tool_call(server, tool_name, body, args, bool(dryrun))
+        result = await do_tool_call(server, tool_name, None, args, bool(dryrun))
         return JSONResponse(result)
     except HTTPException as e:
         if e.status_code == 503 and MCP_FORWARD_URL:
@@ -1075,16 +1065,14 @@ async def tool_dispatch_get(
             return await forward_via_http(server, tool_name, "GET", params, None)
         raise
 
-# -------------------- helper endpoints (generic) --------------------
-
-@app.get("/mcp/tool/{tool}/schema", tags=["tools", "schema"], summary="Tool schema")
+@app.get("/mcp/tool/{tool}/schema", tags=["tools", "schema"])
 async def tool_schema(tool: str):
     st = DISCOVERY.servers.get("mcp")
     if not st or tool not in st.tools:
         return {}
     return st.tools[tool].input_schema or {}
 
-@app.get("/mcp/tool/{tool}/help", tags=["tools", "help"], summary="Tool help (generic)")
+@app.get("/mcp/tool/{tool}/help", tags=["tools", "help"])
 async def tool_help(tool: str):
     st = DISCOVERY.servers.get("mcp")
     if not st or tool not in st.tools:
@@ -1101,32 +1089,30 @@ async def tool_help(tool: str):
         "name": tool,
         "description": td.description,
         "notes": [
-                "Arguments are forwarded to the MCP tool exactly as you send them.",
-                "Use /mcp/tool/{tool}/schema and /mcp/tool/{tool}/example for guidance."
+            "Arguments are forwarded to the MCP tool exactly as you send them.",
+            "Use /mcp/tool/{tool}/schema and /mcp/tool/{tool}/example for guidance."
         ],
     }
 
-@app.get("/mcp/tool/{tool}/example", tags=["tools", "example"], summary="Tool examples (schema-derived)")
+@app.get("/mcp/tool/{tool}/example", tags=["tools", "example"])
 async def tool_example(tool: str):
     st = DISCOVERY.servers.get("mcp")
     if not st or tool not in st.tools:
         return {"examples": []}
     return {"examples": st.tools[tool].examples}
 
-@app.get("/mcp/tool/{tool}/try", tags=["tools", "try"], summary="Tool zero-arg try",
-         description="Calls this tool with `{}` (no arguments).")
+@app.get("/mcp/tool/{tool}/try", tags=["tools", "try"], description="Calls this tool with `{}` (no arguments).")
 async def tool_try(tool: str, dryrun: Optional[bool] = Query(False)):
     return await tool_dispatch_get(server="mcp", tool_name=tool, dryrun=dryrun)
 
 # =============================================================================
-# OpenAPI Post-processor (per-tool ops + driver guidance + summaries)
+# OpenAPI augmentation (unchanged except for version and minor comments)
 # =============================================================================
 
 def _inject_tool_operations(openapi_schema: Dict[str, Any]) -> None:
     paths = openapi_schema.setdefault("paths", {})
     tags = openapi_schema.setdefault("tags", [])
 
-    # driver-contributed tags
     try:
         for d in REGISTRY.loaded.values():
             inst = d.instance
@@ -1175,7 +1161,6 @@ def _inject_tool_operations(openapi_schema: Dict[str, Any]) -> None:
                 "x-mcp-tool-name": tname,
             }
 
-            # let drivers tweak per-tool ops
             for d in REGISTRY.loaded.values():
                 inst = d.instance
                 if hasattr(inst, "tool_guidance"):
@@ -1213,7 +1198,6 @@ def openapi_extra_blocks() -> Dict[str, Any]:
         ]
     }
 
-    # driver summaries (pull directly from Redis-backed drivers)
     x_driver_data_summaries: Dict[str, Any] = {}
     for d in REGISTRY.loaded.values():
         inst = d.instance
@@ -1242,7 +1226,6 @@ def openapi_extra_blocks() -> Dict[str, Any]:
                 "requiredFields": (td.input_schema or {}).get("required", []),
                 "examples": td.examples,
             })
-    # also stamp instance/cache info
     x_instance = {"id": os.getenv("INSTANCE_ID", "default")}
     x_cache = {"prefix": REGISTRY.cache.namespace()}
 
@@ -1256,7 +1239,7 @@ def openapi_extra_blocks() -> Dict[str, Any]:
         "x-mcp-resources": {}
     }
 
-@app.get("/{server}/tools/list", tags=["discovery"], summary="Tools List")
+@app.get("/{server}/tools/list", tags=["discovery"])
 async def tools_list(server: str = Path(..., description="Server alias")):
     st = DISCOVERY.servers.get(server)
     if not st:
@@ -1275,8 +1258,7 @@ def custom_openapi():
     return app.openapi_schema
 app.openapi = custom_openapi
 
-
-# Optional: allow `python app.py` for local dev
+# Local dev
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(

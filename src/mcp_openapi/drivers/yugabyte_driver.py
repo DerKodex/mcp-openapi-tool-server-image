@@ -1,11 +1,12 @@
 # mcp_openapi/drivers/yugabyte_driver.py
 from __future__ import annotations
+
 import asyncio
 import json
 import os
 import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from pydantic import BaseModel, Field, ValidationError
@@ -18,7 +19,10 @@ try:
 except Exception as e:
     raise RuntimeError("psycopg[pool] is required for yugabyte_driver") from e
 
-# -------------------- Config (Keycloak-like manifest) --------------------
+
+# -----------------------------------------------------------------------------
+# Config models (support BOTH your current file-cred style and Vault dynamic)
+# -----------------------------------------------------------------------------
 
 class VaultK8sAuth(BaseModel):
     method: str = Field("kubernetes", const=True)
@@ -35,7 +39,7 @@ class VaultAppRoleAuth(BaseModel):
 class VaultDatabaseCfg(BaseModel):
     mount: str = "database"
     role: str
-    renewBefore: int = 120
+    renewBefore: int = 120  # seconds prior to expiry to renew
 
 class VaultSpec(BaseModel):
     address: str
@@ -45,11 +49,25 @@ class VaultSpec(BaseModel):
 class YugabyteSpec(BaseModel):
     host: str
     port: int = 5433
-    dbname: str
+    # Accept either "dbname" or "database"
+    dbname: Optional[str] = None
+    database: Optional[str] = None
+    # Optional schema (your manifest provides this)
+    schema: Optional[str] = None
     sslmode: str = "prefer"
+    # Optional plaintext creds
+    username: Optional[str] = None
+    password: Optional[str] = None
+    # Optional file-based creds (your manifest)
+    usernameFile: Optional[str] = None
+    passwordFile: Optional[str] = None
     options: Dict[str, Any] = Field(default_factory=dict)
 
+    def normalized_dbname(self) -> str:
+        return (self.dbname or self.database or "postgres")
+
 class InitSpec(BaseModel):
+    # If omitted, we default to a safe per-instance schema name
     schema: Optional[str] = None
     createIfMissing: bool = True
     ddl: List[str] = Field(default_factory=list)
@@ -72,25 +90,92 @@ class SyncJobSpec(BaseModel):
 
 class SyncSpec(BaseModel):
     jobs: List[SyncJobSpec] = Field(default_factory=list)
+    # Compatibility with your manifest (simple switch):
+    enabled: Optional[bool] = None
+    interval_seconds: Optional[int] = None
 
 class YugabyteDriverConfig(BaseModel):
+    """
+    Flexible config wrapper. Accepts either:
+
+    A) Your current style (as in the ConfigMap):
+       {
+         "yugabyte": {"host": "...", "port": 5433, "database": "mcp",
+                      "schema": "mcp_openapi_ro", "sslmode": "...",
+                      "usernameFile": "/vault/secrets/yb-username",
+                      "passwordFile": "/vault/secrets/yb-password",
+                      "options": {...}},
+         "pool": {"min": 1, "max": 8, "statementTimeoutMs": 60000},
+         "bootstrap": {"create_schema": true},    # mapped to init.createIfMissing
+         "sync": {"enabled": true, "interval_seconds": 15}
+       }
+
+    B) Vault dynamic credentials:
+       {
+         "vault": { "address": "http://vault:8200", "auth": {...}, "database": {...} },
+         "yugabyte": {"host": "...", "port": 5433, "dbname": "mcp", "schema": "mcp_openapi_ro"},
+         "pool": {...},
+         "sync": {...}
+       }
+    """
     apiVersion: str = "mcp.openapi/v1alpha1"
     kind: str = "YugabyteDriverConfig"
     metadata: Dict[str, Any] = Field(default_factory=dict)
     spec: Dict[str, Any]
 
     def normalize(self) -> Dict[str, Any]:
-        s = self.spec
-        return {
-            "vault": VaultSpec.model_validate(s["vault"]).model_dump(),
-            "yugabyte": YugabyteSpec.model_validate(s["yugabyte"]).model_dump(),
-            "init": InitSpec.model_validate(s.get("init", {})).model_dump(),
-            "pool": PoolSpec.model_validate(s.get("pool", {})).model_dump(),
-            "cache": CacheSpec.model_validate(s.get("cache", {})).model_dump(),
-            "sync": SyncSpec.model_validate(s.get("sync", {})).model_dump(),
+        s = self.spec or {}
+        # Yugabyte block (required)
+        if "yugabyte" not in s:
+            raise ValidationError("spec.yugabyte is required", YugabyteDriverConfig)
+
+        y = YugabyteSpec.model_validate(s["yugabyte"])
+        pool = PoolSpec.model_validate(s.get("pool", {}))
+        cache = CacheSpec.model_validate(s.get("cache", {}))
+
+        # Map your 'bootstrap' section if present
+        init_in = s.get("init", {})
+        if not init_in and "bootstrap" in s:
+            b = s.get("bootstrap") or {}
+            init_in = {
+                "schema": y.schema,
+                "createIfMissing": bool(b.get("create_schema", True)),
+                "ddl": [],
+            }
+        init = InitSpec.model_validate(init_in)
+
+        # Sync: accept either detailed jobs, or simple enabled/interval_seconds
+        sync = SyncSpec.model_validate(s.get("sync", {}))
+
+        out: Dict[str, Any] = {
+            "yugabyte": {
+                "host": y.host,
+                "port": y.port,
+                "dbname": y.normalized_dbname(),
+                "schema": y.schema,
+                "sslmode": y.sslmode,
+                "username": y.username,
+                "password": y.password,
+                "usernameFile": y.usernameFile,
+                "passwordFile": y.passwordFile,
+                "options": y.options or {},
+            },
+            "pool": pool.model_dump(),
+            "cache": cache.model_dump(),
+            "init": init.model_dump(),
+            "sync": sync.model_dump(),
         }
 
-# -------------------- Driver --------------------
+        # Optional Vault config (dynamic creds)
+        if "vault" in s and s["vault"]:
+            out["vault"] = VaultSpec.model_validate(s["vault"]).model_dump()
+
+        return out
+
+
+# -----------------------------------------------------------------------------
+# Driver
+# -----------------------------------------------------------------------------
 
 class DriverImpl(Driver):
     name = "yugabyte"
@@ -113,6 +198,8 @@ class DriverImpl(Driver):
         self._tasks: List[asyncio.Task] = []
 
         self._instance_id = os.getenv("INSTANCE_ID", "default")
+        self._creds_mode: str = "static"  # "static" | "file" | "vault"
+        self._file_creds_fingerprint: Optional[Tuple[str, str]] = None
 
     # ---------- helpers ----------
 
@@ -125,25 +212,60 @@ class DriverImpl(Driver):
 
     def _schema(self) -> str:
         init = self.cfg.get("init", {})
-        return (init.get("schema") or self._default_schema()).lower()
+        schema = (init.get("schema") or self.cfg["yugabyte"].get("schema") or self._default_schema())
+        return str(schema).lower()
 
     # ---------- lifecycle ----------
 
     async def load(self, config: Dict[str, Any], cache: CacheAPI) -> None:
+        # 1) Normalize config (accept both formats)
         try:
             if "spec" in config:
                 self.cfg = YugabyteDriverConfig.model_validate(config).normalize()
             else:
-                _ = VaultSpec.model_validate(config["vault"])
-                _ = YugabyteSpec.model_validate(config["yugabyte"])
-                self.cfg = config
+                # direct dict config (already normalized or your v1 style)
+                yg = config.get("yugabyte") or {}
+                # ensure dbname present
+                if "dbname" not in yg and "database" in yg:
+                    yg = {**yg, "dbname": yg["database"]}
+                config["yugabyte"] = yg
+                # bridge bootstrap → init if needed
+                if "init" not in config and "bootstrap" in config:
+                    b = config.get("bootstrap") or {}
+                    config["init"] = {
+                        "schema": yg.get("schema"),
+                        "createIfMissing": bool(b.get("create_schema", True)),
+                        "ddl": [],
+                    }
+                # fill missing blocks with defaults
+                config.setdefault("pool", {})
+                config.setdefault("cache", {})
+                config.setdefault("sync", {})
+                self.cfg = YugabyteDriverConfig(apiVersion="mcp.openapi/v1alpha1", kind="YugabyteDriverConfig", spec=config).normalize()
         except ValidationError as e:
             raise RuntimeError(f"Yugabyte driver config invalid: {e}") from e
 
+        # 2) Decide credentials mode
+        y = self.cfg["yugabyte"]
+        if self.cfg.get("vault"):
+            self._creds_mode = "vault"
+        elif y.get("usernameFile") or y.get("passwordFile"):
+            self._creds_mode = "file"
+        elif y.get("username") or y.get("password"):
+            self._creds_mode = "static"
+        else:
+            # Fall back to file paths commonly used in your Deployment (Vault agent-injected files)
+            self._creds_mode = "file"
+            y.setdefault("usernameFile", "/vault/secrets/yb-username")
+            y.setdefault("passwordFile", "/vault/secrets/yb-password")
+
+        # 3) Ensure defaults
         self.cfg.setdefault("init", {})
         self.cfg["init"].setdefault("schema", self._default_schema())
-
+        # Save cache
         self.cache = cache
+
+        # 4) Pool + bootstrap + sync
         await self._ensure_pool()
         await self._ensure_schema()
         await self._start_sync_jobs()
@@ -151,19 +273,14 @@ class DriverImpl(Driver):
     async def describe(self) -> Dict[str, Any]:
         return {
             "instanceId": self._instance_id,
-            "redisPrefix": self.cache.namespace() if self.cache else None,
+            "cachePrefix": self.cache.namespace() if self.cache else None,
             "schema": self._schema(),
-            "vault": {
-                "address": self.cfg["vault"]["address"],
-                "db_role": self.cfg["vault"]["database"]["role"],
-                "db_mount": self.cfg["vault"]["database"]["mount"],
-                "auth_method": self.cfg["vault"]["auth"]["method"],
-            },
-            "yugabyte": {k: self.cfg["yugabyte"][k] for k in ("host", "port", "dbname", "sslmode")},
+            "mode": self._creds_mode,
+            "yugabyte": {k: self.cfg["yugabyte"][k] for k in ("host", "port", "dbname", "sslmode") if k in self.cfg["yugabyte"]},
             "pool": self.cfg["pool"],
-            "syncJobs": [j if isinstance(j, dict) else j.model_dump() for j in self.cfg.get("sync", {}).get("jobs", [])],
+            "sync": self.cfg.get("sync", {}),
             "state": {
-                "have_token": bool(self._vault_token),
+                "have_vault_token": bool(self._vault_token),
                 "have_db_creds": bool(self._db_username and self._db_password),
                 "pool_open": bool(self._pool and not self._pool.closed),
                 "lease_exp_epoch": self._db_lease_exp,
@@ -178,13 +295,9 @@ class DriverImpl(Driver):
         openapi_schema.setdefault("x-drivers", {})["yugabyte"] = {
             "schema": self._schema(),
             "capabilities": [
-                "Vault dynamic credentials (renew/rotate)",
+                "Static / file-based / Vault dynamic credentials",
                 "Per-instance schema bootstrap",
-                "Background sync Yugabyte → Redis",
-            ],
-            "redisKeys": [
-                f"{self.cache.namespace()}:{self.name}:tables" if self.cache else f"memory:{self.name}:tables",
-                f"{self.cache.namespace()}:{self.name}:driver_kv" if self.cache else f"memory:{self.name}:driver_kv",
+                "Background sync Yugabyte → Cache",
             ],
             "tables": tables or [],
         }
@@ -193,7 +306,6 @@ class DriverImpl(Driver):
         return [{"name": "driver:yugabyte", "description": "Yugabyte/Redis integration"}]
 
     def tool_guidance(self, tool_name: str, td: Any) -> Dict[str, Any]:
-        # Provide generic hints that help tools like kubectl-like MCP servers:
         return {"x-usage-hints": ["Use concrete resource names and namespaces when available."]}
 
     def extend_model_instructions(self, inst: Dict[str, Any]) -> None:
@@ -201,7 +313,7 @@ class DriverImpl(Driver):
 
     def summarize_cache(self) -> Dict[str, Any]:
         return {
-            "redisPrefix": self.cache.namespace() if self.cache else "memory",
+            "cachePrefix": self.cache.namespace() if self.cache else "memory",
             "tables_known": len(self._cache_get("tables") or []),
         }
 
@@ -218,7 +330,10 @@ class DriverImpl(Driver):
             if self._pool and not self._pool.closed:
                 await self._pool.close()
         finally:
-            await self._client.aclose()
+            try:
+                await self._client.aclose()
+            except Exception:
+                pass
 
     # ---------- small cache helper ----------
 
@@ -229,6 +344,35 @@ class DriverImpl(Driver):
     def _cache_get(self, key: str) -> Optional[Any]:
         assert self.cache is not None
         return self.cache.get(self.name, key)
+
+    # -----------------------------------------------------------------------------
+    # Credentials handling
+    # -----------------------------------------------------------------------------
+
+    def _read_text_file(self, path: Optional[str]) -> Optional[str]:
+        if not path:
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read().strip()
+        except Exception:
+            return None
+
+    async def _file_creds(self) -> Tuple[str, str]:
+        y = self.cfg["yugabyte"]
+        u = self._read_text_file(y.get("usernameFile"))
+        p = self._read_text_file(y.get("passwordFile"))
+        if not (u and p):
+            raise RuntimeError("usernameFile/passwordFile missing or unreadable")
+        return u, p
+
+    async def _static_creds(self) -> Tuple[str, str]:
+        y = self.cfg["yugabyte"]
+        u = y.get("username")
+        p = y.get("password")
+        if not (u and p):
+            raise RuntimeError("username/password missing")
+        return u, p
 
     # ---------- Vault (login/renew/creds) ----------
 
@@ -260,7 +404,7 @@ class DriverImpl(Driver):
         if not self._vault_token or not self._vault_token_exp or time.time() >= self._vault_token_exp:
             await self._vault_login()
 
-    async def _fetch_db_creds(self) -> None:
+    async def _fetch_vault_db_creds(self) -> None:
         await self._ensure_vault_token()
         v = self.cfg["vault"]
         addr: str = v["address"].rstrip("/")
@@ -291,7 +435,9 @@ class DriverImpl(Driver):
         self._db_lease_exp = time.time() + max(60, ldur - 30)
         return True
 
-    # ---------- Pool / DSN ----------
+    # -----------------------------------------------------------------------------
+    # Pool / DSN
+    # -----------------------------------------------------------------------------
 
     def _dsn(self, user: str, pwd: str) -> str:
         y = self.cfg["yugabyte"]
@@ -305,38 +451,60 @@ class DriverImpl(Driver):
             "password": pwd,
             **opts,
         }
-        parts = [f"{k}={json.dumps(str(v))[1:-1]}" for k, v in params.items()]
+        # psycopg DSN: key=value pairs (escaping simple)
+        parts = [f"{k}={json.dumps(str(v))[1:-1]}" for k, v in params.items() if v is not None]
         return " ".join(parts)
 
     async def _ensure_pool(self) -> None:
         async with self._lock:
-            renew_before = int(self.cfg["vault"]["database"].get("renewBefore", 120))
-            now = time.time()
             need_new = False
+            now = time.time()
 
-            if not self._db_username or not self._db_password or not self._db_lease_exp:
-                await self._fetch_db_creds()
-                need_new = True
-            elif (self._db_lease_exp - now) <= max(30, renew_before):
-                if not await self._renew_lease():
-                    await self._fetch_db_creds()
+            # Resolve credentials for each mode
+            if self._creds_mode == "vault":
+                renew_before = int(self.cfg["vault"]["database"].get("renewBefore", 120))
+                if not self._db_username or not self._db_password or not self._db_lease_exp:
+                    await self._fetch_vault_db_creds()
+                    need_new = True
+                elif (self._db_lease_exp - now) <= max(30, renew_before):
+                    if not await self._renew_lease():
+                        await self._fetch_vault_db_creds()
+                        need_new = True
+
+            elif self._creds_mode == "file":
+                u, p = await self._file_creds()
+                fp = (u, p)
+                if fp != self._file_creds_fingerprint:
+                    self._db_username, self._db_password = u, p
+                    self._file_creds_fingerprint = fp
+                    need_new = True
+
+            else:  # static
+                u, p = await self._static_creds()
+                if (u != self._db_username) or (p != self._db_password):
+                    self._db_username, self._db_password = u, p
                     need_new = True
 
             if need_new or not self._pool or self._pool.closed:
                 if self._pool and not self._pool.closed:
                     await self._pool.close()
+
                 dsn = self._dsn(self._db_username, self._db_password)  # type: ignore
                 p = self.cfg["pool"]
+                # Pool kwargs allow passing libpq options; apply statement_timeout
+                kwargs = {"options": f"-c statement_timeout={int(p.get('statementTimeoutMs', 60000))}"}
                 self._pool = AsyncConnectionPool(
                     conninfo=dsn,
                     min_size=int(p.get("min", 1)),
                     max_size=int(p.get("max", 5)),
-                    kwargs={"options": f"-c statement_timeout={int(p.get('statementTimeoutMs', 60000))}"},
+                    kwargs=kwargs,
                     open=False,
                 )
                 await self._pool.open()
 
-    # ---------- Schema bootstrap ----------
+    # -----------------------------------------------------------------------------
+    # Schema bootstrap (lightweight; your app-level migrator does the heavy lifting)
+    # -----------------------------------------------------------------------------
 
     async def _ensure_schema(self) -> None:
         init = self.cfg["init"]
@@ -358,40 +526,49 @@ class DriverImpl(Driver):
                         actor text not null,
                         action text not null,
                         attrib jsonb not null default '{{}}'::jsonb
-                    )"""
+                    )""",
             ]
         await self._ensure_pool()
         assert self._pool is not None
         async with self._pool.connection() as aconn:
             async with aconn.transaction():
-                for stmt in ddl:
-                    await aconn.execute(stmt)
+                async with aconn.cursor() as cur:
+                    for stmt in ddl:
+                        await cur.execute(stmt)
 
-    # ---------- Sync jobs Yugabyte -> Redis ----------
+    # -----------------------------------------------------------------------------
+    # Sync jobs Yugabyte -> Cache
+    # -----------------------------------------------------------------------------
 
     async def _start_sync_jobs(self) -> None:
         spec = self.cfg.get("sync", {}) or {}
-        jobs = spec.get("jobs", [])
-        for j in jobs:
-            if not isinstance(j, SyncJobSpec):
-                j = SyncJobSpec(**j)
-            self._tasks.append(asyncio.create_task(self._run_job(j)))
-
-        if not jobs:
+        jobs = list(spec.get("jobs") or [])
+        # If you used the simple flag in your manifest, create a default job
+        if not jobs and spec.get("enabled", None) is not False:
+            interval = int(spec.get("interval_seconds") or 60)
+            ttl = int(self.cfg.get("cache", {}).get("ttlSeconds", 600))
             schema = self._schema()
-            default = SyncJobSpec(
+            jobs = [SyncJobSpec(
                 name="tables",
                 key="tables",
                 mode="list",
-                intervalSeconds=60,
-                ttlSeconds=self.cfg["cache"].get("ttlSeconds", 600),
+                intervalSeconds=interval,
+                ttlSeconds=ttl,
                 query=(
                     "select table_schema||'.'||table_name as fqn "
                     "from information_schema.tables "
                     f"where table_schema in ('public','{schema}') order by 1"
                 ),
-            )
-            self._tasks.append(asyncio.create_task(self._run_job(default)))
+            ).model_dump()]
+
+        for j in jobs:
+            if not isinstance(j, SyncJobSpec):
+                j = SyncJobSpec(**j)
+            self._tasks.append(asyncio.create_task(self._run_job(j)))
+
+    async def _fetch_all(self, cur) -> List[Tuple]:
+        # psycopg async cursor: use fetchall
+        return await cur.fetchall()
 
     async def _run_job(self, job: SyncJobSpec) -> None:
         while True:
@@ -399,29 +576,38 @@ class DriverImpl(Driver):
                 await self._ensure_pool()
                 assert self._pool is not None
                 async with self._pool.connection() as aconn:
-                    rows = await aconn.execute(job.query)
-                    result = await rows.fetchall() if hasattr(rows, "fetchall") else rows
-                    if job.mode == "kv":
-                        d: Dict[str, Any] = {}
-                        for r in result:
-                            k = r[0]
-                            v = r[1]
-                            try:
-                                d[k] = v if isinstance(v, (dict, list)) else json.loads(v)
-                            except Exception:
-                                d[k] = v
-                        payload = d
-                    elif job.mode == "list":
-                        payload = [r[0] for r in result]
-                    else:
-                        if hasattr(result, "columns"):
-                            cols = [c.name for c in result.columns]
-                            payload = [dict(zip(cols, r)) for r in result]
-                        else:
-                            payload = [list(r) for r in result]
-                    self._cache_set(job.key, payload, ttl=job.ttlSeconds)
+                    async with aconn.cursor() as cur:
+                        await cur.execute(job.query)
+                        rows = await self._fetch_all(cur)
+
+                        if job.mode == "kv":
+                            d: Dict[str, Any] = {}
+                            for r in rows:
+                                k = r[0]
+                                v = r[1] if len(r) > 1 else None
+                                try:
+                                    d[k] = v if isinstance(v, (dict, list)) else json.loads(v)
+                                except Exception:
+                                    d[k] = v
+                            payload = d
+
+                        elif job.mode == "list":
+                            payload = [r[0] for r in rows]
+
+                        else:  # rows → list of dicts with column names, if available
+                            cols = [desc.name if hasattr(desc, "name") else desc[0] for desc in (cur.description or [])]
+                            if cols:
+                                payload = [dict(zip(cols, r)) for r in rows]
+                            else:
+                                payload = [list(r) for r in rows]
+
+                        self._cache_set(job.key, payload, ttl=job.ttlSeconds)
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                self._cache_set(f"job:{job.name}:error", {"error": f"{type(e).__name__}: {e}", "ts": time.time()}, ttl=job.ttlSeconds or 300)
+                self._cache_set(
+                    f"job:{job.name}:error",
+                    {"error": f"{type(e).__name__}: {e}", "ts": time.time()},
+                    ttl=job.ttlSeconds or 300
+                )
             await asyncio.sleep(max(5, job.intervalSeconds))
