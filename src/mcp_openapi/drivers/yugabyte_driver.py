@@ -224,7 +224,7 @@ class DriverImpl(Driver):
         self._db_username: Optional[str] = None
         self._db_password: Optional[str] = None
         self._db_lease_id: Optional[str] = None
-               self._db_lease_exp: Optional[float] = None
+        self._db_lease_exp: Optional[float] = None
 
         self._pool: Optional[AsyncConnectionPool] = None
         self._lock = asyncio.Lock()
