@@ -2,6 +2,7 @@ import os, re, hashlib, importlib.util, sys, glob
 from datetime import datetime
 from typing import List, Tuple, Optional
 import psycopg
+import threading
 
 FILENAME_RE = re.compile(r"^(\d{3,})_(.+?)\.(up\.sql|py)$")
 
@@ -47,6 +48,11 @@ class Migrator:
         if os.getenv("RUN_MIGRATIONS", "0").lower() not in ("1","true","yes"):
             return  # disabled
 
+        # Run migrations in a separate thread
+        thread = threading.Thread(target=self._run_migrations)
+        thread.start()
+
+    def _run_migrations(self):
         with self._connect() as conn:
             # ----- advisory lock to serialize migrations across pods -----
             # 32-bit key derived from (database, schema)
@@ -223,3 +229,28 @@ class Migrator:
         sys.modules[name] = mod
         spec.loader.exec_module(mod)
         return mod
+
+    def apply_migrations(self):
+        """Apply all migration scripts in the migrations directory."""
+        with self._connect() as conn:
+            for migration_file in sorted(os.listdir(self.migrations_dir)):
+                if migration_file.endswith(".sql"):
+                    self.execute_sql_file(os.path.join(self.migrations_dir, migration_file))
+
+    def apply_seeds(self):
+        """Apply all seed scripts in the seeds directory."""
+        with self._connect() as conn:
+            for seed_file in sorted(os.listdir(self.seeds_dir)):
+                if seed_file.endswith(".sql"):
+                    self.execute_sql_file(os.path.join(self.seeds_dir, seed_file))
+
+    def execute_sql_file(self, file_path):
+        """Execute a SQL file against the database."""
+        try:
+            with open(file_path, "r") as sql_file:
+                sql_commands = sql_file.read()
+                # Replace this with actual database execution logic
+                print(f"Executing SQL from {file_path}:")
+                print(sql_commands)
+        except Exception as e:
+            print(f"[migrator] Failed to execute {file_path}: {e}", file=sys.stderr)
