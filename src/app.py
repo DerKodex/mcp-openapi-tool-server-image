@@ -61,7 +61,17 @@ except Exception as e:
     print(f"[manifest] Failed to load manifest from {MANIFEST_PATH}: {e}", file=sys.stderr)
     MANIFEST = None
 
-
+# After MANIFEST is loaded:
+openapi_ns = (
+    (MANIFEST.get("spec", {}).get("openapiCache") or {}).get("namespace")
+    or (MANIFEST.get("metadata") or {}).get("name")
+    or "openapi"
+)
+openapi_ttl = int(
+    (MANIFEST.get("spec", {}).get("openapiCache") or {}).get("ttlSeconds")
+    or (MANIFEST.get("spec", {}).get("redis") or {}).get("default_ttl_seconds")
+    or 600
+)
 # Defaults for health state
 MIGRATIONS_DONE: bool = True
 MIGRATION_ERROR: str = ""
@@ -1272,9 +1282,9 @@ async def tools_list(server: str = Path(..., description="Server alias")):
 
 _original_openapi = app.openapi
 def custom_openapi():
-    cache_ns = os.getenv("OPENAPI_CACHE_NS", "openapi")
+    cache_ns = openapi_ns
     cache_key = "openapi_schema"
-    ttl = int(os.getenv("OPENAPI_CACHE_TTL", "600"))
+    ttl = openapi_ttl
 
     # Check cache first
     try:
@@ -1402,7 +1412,7 @@ async def synchronize_data_to_redis():
             print("[sync] Synchronizing data to Redis...")
             # Add your synchronization logic here
             # after cache.set(driver_name, "augmentations", rows, ttl):
-            cache.delete(os.getenv("OPENAPI_CACHE_NS", "openapi"), "openapi_schema")
+            cache.delete(openapi_ns, "openapi_schema")
             await asyncio.sleep(sync_interval)
         except Exception as e:
             print(f"[sync] FAILED: {e}", file=sys.stderr)
