@@ -1404,15 +1404,42 @@ async def initialize_app():
     # Start the periodic synchronization task
     asyncio.create_task(synchronize_data_to_redis())
 
-async def synchronize_data_to_redis():
-    """Periodically synchronize data to Redis."""
-    sync_interval = int(os.getenv("REDIS_SYNC_INTERVAL", "300"))  # Default: 5 minutes
+# In app.py, replace the existing synchronize_data_to_redis() stub with:
+
+async def synchronize_data_to_redis() -> None:
+    """
+    Periodically synchronize data to Redis.
+
+    This function relies on each driver’s sync jobs (e.g. the Yugabyte driver)
+    to refresh their data in Redis.  After waiting for the configured interval,
+    it invalidates the cached OpenAPI document so that it will be rebuilt on
+    the next request.
+    """
+    # Pull the interval from the manifest (spec.redis.default_ttl_seconds or fallback)
+    # or use REDIS_SYNC_INTERVAL as a last resort.  This keeps configuration
+    # entirely in the manifest if desired.
+    sync_interval = int(
+        (MANIFEST.get("spec", {}).get("redis") or {}).get("default_ttl_seconds", 300)
+    )
     while True:
         try:
             print("[sync] Synchronizing data to Redis...")
-            # Add your synchronization logic here
-            # after cache.set(driver_name, "augmentations", rows, ttl):
-            cache.delete(openapi_ns, "openapi_schema")
+
+            # Drivers' _run_job() coroutines are already running in the background
+            # (scheduled by the DriverRegistry), so we don't fetch data here.
+            # We simply wait for the interval and then invalidate the cached
+            # OpenAPI document so that any new augmentation data is picked up.
             await asyncio.sleep(sync_interval)
+
+            # Invalidate the cached /openapi.json so it will be rebuilt.
+            try:
+                REGISTRY.cache.delete(openapi_ns, "openapi_schema")
+                print(f"[sync] Cleared cached OpenAPI document in namespace {openapi_ns}")
+            except Exception as e:
+                print(f"[sync] Failed to delete cache entry: {e}", file=sys.stderr)
+
         except Exception as e:
+            # Catch exceptions in the loop to prevent it from exiting silently.
             print(f"[sync] FAILED: {e}", file=sys.stderr)
+            await asyncio.sleep(sync_interval)
+
