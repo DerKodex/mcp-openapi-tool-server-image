@@ -1300,23 +1300,56 @@ def custom_openapi():
     openapi_schema.update({**openapi_extra_blocks()})
     _inject_tool_operations(openapi_schema)
     # Merge augmentation data from Redis into each operation
+    
     try:
         cache = REGISTRY.cache
         for driver_name, d in REGISTRY.loaded.items():
-            # Augmentation entries should be cached under 'augmentations' per driver
-            aug_entries = cache.get(driver_name, "augmentations")  # type: ignore[attr-defined]
-            if not aug_entries:
-                continue
-            for row in aug_entries:
-                path = row.get("path")
-                method = (row.get("method") or "").lower()
-                ext = (
-                    row.get("extensions")
-                    or row.get("extension")
-                    or row.get("extensions_json")
-                )
-                if not path or not method or not isinstance(ext, dict):
+            base_rows = cache.get(driver_name, "augmentations_base") or []
+            usage_hints = cache.get(driver_name, "usage_hints") or []
+            param_hints = cache.get(driver_name, "param_hints") or []
+            examples = cache.get(driver_name, "examples") or []
+
+            # Group hints by augmentation_id for quick lookup
+            hints_by_aug = {}
+            for h in usage_hints:
+                hints_by_aug.setdefault(h["augmentation_id"], []).append(h["hint"])
+
+            params_by_aug = {}
+            for ph in param_hints:
+                params_by_aug.setdefault(ph["augmentation_id"], []).append(ph)
+
+            examples_by_aug = {}
+            for ex in examples:
+                examples_by_aug.setdefault(ex["augmentation_id"], []).append(ex)
+
+            for row in base_rows:
+                path = row["path"]
+                method = (row["method"] or "").lower()
+                if not path or not method:
                     continue
+
+                # Construct extensions dict from raw tables
+                ext = {
+                    "x-summary": row.get("summary"),
+                    "x-description": row.get("description"),
+                    "x-auth-required": row.get("auth_required"),
+                    "x-usage-hints": hints_by_aug.get(row["id"], []),
+                    "x-parameter-hints": {
+                        ph["name"]: {
+                            "type": ph["data_type"],
+                            "enum": ph["allowed_values"],
+                            "example": ph["example_value"],
+                            "default": ph["default_value"],
+                            "description": ph["description"],
+                        }
+                        for ph in params_by_aug.get(row["id"], [])
+                    },
+                    "x-examples": [
+                        {"user": ex["user_prompt"], "args": ex["args_json"]}
+                        for ex in examples_by_aug.get(row["id"], [])
+                    ],
+                }
+
                 op = (
                     openapi_schema
                     .get("paths", {})

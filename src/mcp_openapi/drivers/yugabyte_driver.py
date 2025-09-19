@@ -616,38 +616,53 @@ class DriverImpl(Driver):
             interval = int(spec.get("interval_seconds") or 60)
             ttl = int(self.cfg.get("cache", {}).get("ttlSeconds", 600))
             schema = self._schema()
-            jobs = [SyncJobSpec(
-                name="tables",
-                key="tables",
-                mode="list",
+            
+            # in yugabyte_driver._start_sync_jobs(), after computing interval and ttl
+            # remove or skip the old "augmentations" job
+            # add one job per table:
+
+            jobs.append(SyncJobSpec(
+                name="augmentations_base",
+                key="augmentations_base",
+                mode="rows",
+                intervalSeconds=interval,
+                ttlSeconds=ttl,
+                query="SELECT id, path, method, summary, description, auth_required FROM mcp_openapi_augmentations",
+            ).model_dump())
+
+            jobs.append(SyncJobSpec(
+                name="usage_hints",
+                key="usage_hints",
+                mode="rows",
+                intervalSeconds=interval,
+                ttlSeconds=ttl,
+                query="SELECT augmentation_id, hint FROM mcp_openapi_usage_hints",
+            ).model_dump())
+
+            jobs.append(SyncJobSpec(
+                name="param_hints",
+                key="param_hints",
+                mode="rows",
                 intervalSeconds=interval,
                 ttlSeconds=ttl,
                 query=(
-                    "select table_schema||'.'||table_name as fqn "
-                    "from information_schema.tables "
-                    f"where table_schema in ('public','{schema}') order by 1"
+                    "SELECT augmentation_id, name, data_type, allowed_values, "
+                    "example_value, default_value, description "
+                    "FROM mcp_openapi_param_hints"
                 ),
-            ).model_dump()]
-            
-        # Always include an augmentation sync job.  It pulls custom OpenAPI
-        # augmentation data from the mcp_openapi_augmentations table and caches
-        # it under the key 'augmentations' in this driver's namespace.
-        try:
-            interval = int(spec.get("interval_seconds") or 60)
-        except Exception:
-            interval = 60
-        ttl = int(self.cfg.get("cache", {}).get("ttlSeconds", 600))
-        jobs.append(SyncJobSpec(
-            name="augmentations",
-            key="augmentations",
-            mode="rows",
-            intervalSeconds=interval,
-            ttlSeconds=ttl,
-            query=(
-                "SELECT path, method, extensions_json AS extensions "
-                "FROM mcp_openapi_augmentations"
-            ),
-        ).model_dump())
+            ).model_dump())
+
+            jobs.append(SyncJobSpec(
+                name="examples",
+                key="examples",
+                mode="rows",
+                intervalSeconds=interval,
+                ttlSeconds=ttl,
+                query=(
+                    "SELECT augmentation_id, example_index, user_prompt, args_json "
+                    "FROM mcp_openapi_examples"
+                ),
+            ).model_dump())
 
         for j in jobs:
             if not isinstance(j, SyncJobSpec):
