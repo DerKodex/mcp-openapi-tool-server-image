@@ -18,6 +18,7 @@ import asyncio
 import importlib
 import inspect
 import json
+from linecache import cache
 import os
 import re
 import stat
@@ -28,6 +29,7 @@ import time
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, Mapping
 from urllib.parse import unquote
+from manifest_validator import validate_manifest_yaml  # import your validator
 
 from migrator import Migrator
 import httpx
@@ -48,12 +50,17 @@ MANIFEST_PATH = os.getenv("MANIFEST_PATH") or os.getenv("DRIVER_MANIFEST_PATH") 
 
 MANIFEST: Optional[Dict[str, Any]] = None
 try:
-    MANIFEST = load_manifest(MANIFEST_PATH)
-    # ensure the rest of the code knows where to find it (reload route, etc.)
+    txt = open(MANIFEST_PATH, "r").read()
+    validate_manifest_yaml(txt)          # raises if invalid
+    MANIFEST = load_manifest(MANIFEST_PATH)  # safe to parse after validation
     os.environ["DRIVER_MANIFEST_PATH"] = MANIFEST_PATH
+except ValidationError as ve:
+    print(f"[manifest] Invalid driver-manifest.yaml: {ve}", file=sys.stderr)
+    sys.exit(1)  # or raise to abort startup
 except Exception as e:
     print(f"[manifest] Failed to load manifest from {MANIFEST_PATH}: {e}", file=sys.stderr)
     MANIFEST = None
+
 
 # Defaults for health state
 MIGRATIONS_DONE: bool = True
@@ -1265,6 +1272,20 @@ async def tools_list(server: str = Path(..., description="Server alias")):
 
 _original_openapi = app.openapi
 def custom_openapi():
+    cache_ns = os.getenv("OPENAPI_CACHE_NS", "openapi")
+    cache_key = "openapi_schema"
+    ttl = int(os.getenv("OPENAPI_CACHE_TTL", "600"))
+
+    # Check cache first
+    try:
+        cached = REGISTRY.cache.get(cache_ns, cache_key)
+        if cached:
+            app.openapi_schema = cached
+            return cached
+    except Exception as e:
+        print(f"[openapi] cache lookup failed: {e}", file=sys.stderr)
+
+    # Compute the schema as before
     openapi_schema = _original_openapi()
     openapi_schema.update({**openapi_extra_blocks()})
     _inject_tool_operations(openapi_schema)
@@ -1296,8 +1317,14 @@ def custom_openapi():
                     _deep_merge(op, ext)
     except Exception as e:
         print(f"[openapi] failed to apply augmentation data: {e}", file=sys.stderr)
+        
+    try:
+        REGISTRY.cache.set(cache_ns, cache_key, openapi_schema, ttl_seconds=ttl)
+    except Exception as e:
+        print(f"[openapi] failed to cache schema: {e}", file=sys.stderr)
+
     app.openapi_schema = openapi_schema
-    return app.openapi_schema
+    return openapi_schema
 app.openapi = custom_openapi
 
 # =============================================================================
@@ -1374,6 +1401,8 @@ async def synchronize_data_to_redis():
         try:
             print("[sync] Synchronizing data to Redis...")
             # Add your synchronization logic here
+            # after cache.set(driver_name, "augmentations", rows, ttl):
+            cache.delete(os.getenv("OPENAPI_CACHE_NS", "openapi"), "openapi_schema")
             await asyncio.sleep(sync_interval)
         except Exception as e:
             print(f"[sync] FAILED: {e}", file=sys.stderr)
