@@ -72,6 +72,13 @@ openapi_ttl = int(
     or (MANIFEST.get("spec", {}).get("redis") or {}).get("default_ttl_seconds")
     or 600
 )
+sync_interval = int(
+    (MANIFEST.get("spec", {}) or {}).get("syncIntervalSeconds")
+    # fallback to OpenAPI cache TTL if syncIntervalSeconds isn't specified
+    or (MANIFEST.get("spec", {}).get("openapiCache") or {}).get("ttlSeconds")
+    # final fallback to default
+    or 300
+)
 # Defaults for health state
 MIGRATIONS_DONE: bool = True
 MIGRATION_ERROR: str = ""
@@ -1451,9 +1458,6 @@ async def synchronize_data_to_redis() -> None:
     # Pull the interval from the manifest (spec.redis.default_ttl_seconds or fallback)
     # or use REDIS_SYNC_INTERVAL as a last resort.  This keeps configuration
     # entirely in the manifest if desired.
-    sync_interval = int(
-        (MANIFEST.get("spec", {}).get("redis") or {}).get("default_ttl_seconds", 300)
-    )
     while True:
         try:
             print("[sync] Synchronizing data to Redis...")
