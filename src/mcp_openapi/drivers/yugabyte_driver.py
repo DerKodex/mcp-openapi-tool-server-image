@@ -629,7 +629,7 @@ class DriverImpl(Driver):
                 ),
             ).model_dump()]
             
-                # Always include an augmentation sync job.  It pulls custom OpenAPI
+        # Always include an augmentation sync job.  It pulls custom OpenAPI
         # augmentation data from the mcp_openapi_augmentations table and caches
         # it under the key 'augmentations' in this driver's namespace.
         try:
