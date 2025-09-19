@@ -628,6 +628,26 @@ class DriverImpl(Driver):
                     f"where table_schema in ('public','{schema}') order by 1"
                 ),
             ).model_dump()]
+            
+                # Always include an augmentation sync job.  It pulls custom OpenAPI
+        # augmentation data from the mcp_openapi_augmentations table and caches
+        # it under the key 'augmentations' in this driver's namespace.
+        try:
+            interval = int(spec.get("interval_seconds") or 60)
+        except Exception:
+            interval = 60
+        ttl = int(self.cfg.get("cache", {}).get("ttlSeconds", 600))
+        jobs.append(SyncJobSpec(
+            name="augmentations",
+            key="augmentations",
+            mode="rows",
+            intervalSeconds=interval,
+            ttlSeconds=ttl,
+            query=(
+                "SELECT path, method, extensions_json AS extensions "
+                "FROM mcp_openapi_augmentations"
+            ),
+        ).model_dump())
 
         for j in jobs:
             if not isinstance(j, SyncJobSpec):

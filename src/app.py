@@ -26,7 +26,7 @@ import textwrap
 import threading
 import time
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Mapping
 from urllib.parse import unquote
 
 from migrator import Migrator
@@ -185,6 +185,18 @@ def _schema_enums(schema: Dict[str, Any]) -> Dict[str, List[str]]:
     except Exception:
         pass
     return out
+
+def _deep_merge(dst: Dict[str, Any], src: Mapping[str, Any]) -> None:
+    """
+    Recursively merge the key/value pairs from ``src`` into ``dst``.
+
+    Nested dictionaries are merged; all other values replace the destination.
+    """
+    for k, v in src.items():
+        if isinstance(v, dict) and isinstance(dst.get(k), dict):
+            _deep_merge(dst[k], v)  # type: ignore[arg-type]
+        else:
+            dst[k] = v
 
 def _schema_fields(schema: Dict[str, Any]) -> List[str]:
     try:
@@ -1256,6 +1268,34 @@ def custom_openapi():
     openapi_schema = _original_openapi()
     openapi_schema.update({**openapi_extra_blocks()})
     _inject_tool_operations(openapi_schema)
+    # Merge augmentation data from Redis into each operation
+    try:
+        cache = REGISTRY.cache
+        for driver_name, d in REGISTRY.loaded.items():
+            # Augmentation entries should be cached under 'augmentations' per driver
+            aug_entries = cache.get(driver_name, "augmentations")  # type: ignore[attr-defined]
+            if not aug_entries:
+                continue
+            for row in aug_entries:
+                path = row.get("path")
+                method = (row.get("method") or "").lower()
+                ext = (
+                    row.get("extensions")
+                    or row.get("extension")
+                    or row.get("extensions_json")
+                )
+                if not path or not method or not isinstance(ext, dict):
+                    continue
+                op = (
+                    openapi_schema
+                    .get("paths", {})
+                    .get(path, {})
+                    .get(method)
+                )
+                if op and isinstance(op, dict):
+                    _deep_merge(op, ext)
+    except Exception as e:
+        print(f"[openapi] failed to apply augmentation data: {e}", file=sys.stderr)
     app.openapi_schema = openapi_schema
     return app.openapi_schema
 app.openapi = custom_openapi
