@@ -1377,50 +1377,6 @@ def custom_openapi():
     return openapi_schema
 app.openapi = custom_openapi
 
-# =============================================================================
-# Background thread for migrations and Redis synchronization
-# =============================================================================
-
-def run_migrations_and_sync():
-    """Run database migrations and periodically synchronize data into Redis."""
-    global MIGRATIONS_DONE, MIGRATION_ERROR
-
-    # Run migrations on startup
-    try:
-        if MANIFEST and MANIFEST["spec"].get("migrator", {}).get("run", False):
-            db_cfg = MANIFEST["spec"]["migrator"]["db"]
-            os.environ["DB_HOST"] = db_cfg.get("host", "localhost")
-            os.environ["DB_PORT"] = str(db_cfg.get("port", 5432))
-            os.environ["DB_NAME"] = db_cfg.get("name", "postgres")
-            os.environ["DB_SCHEMA"] = db_cfg.get("schema", "public")
-            os.environ["DB_SSLMODE"] = db_cfg.get("sslmode", "prefer")
-            os.environ["DB_USER_FILE"] = db_cfg.get("usernameFile", "")
-            os.environ["DB_PASS_FILE"] = db_cfg.get("passwordFile", "")
-            os.environ["DB_MIGRATIONS_DIR"] = db_cfg.get("migrationsDir", "/app/migrations")
-            os.environ["DB_SEEDS_DIR"] = db_cfg.get("seedsDir", "/app/seeds")
-            os.environ["RUN_MIGRATIONS"] = "1"
-            Migrator().run_on_startup()
-            MIGRATIONS_DONE = True
-            MIGRATION_ERROR = ""
-    except Exception as e:
-        MIGRATIONS_DONE = False
-        MIGRATION_ERROR = str(e)
-        print(f"[migrator] FAILED: {e}", file=sys.stderr)
-
-    # Periodically synchronize data into Redis
-    sync_interval = int(os.getenv("REDIS_SYNC_INTERVAL", "300"))  # Default: 5 minutes
-    while True:
-        try:
-            print("[sync] Synchronizing data into Redis...")
-            # Add your synchronization logic here
-            # Example: REGISTRY.cache.set("namespace", "key", {"data": "value"})
-        except Exception as e:
-            print(f"[sync] FAILED: {e}", file=sys.stderr)
-        time.sleep(sync_interval)
-
-# Start the background thread
-threading.Thread(target=run_migrations_and_sync, daemon=True).start()
-
 # Local dev
 if __name__ == "__main__":
     import uvicorn
