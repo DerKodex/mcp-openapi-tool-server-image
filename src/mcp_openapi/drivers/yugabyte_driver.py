@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import re
+import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple, Literal
 
@@ -21,7 +22,7 @@ except Exception as e:
 
 
 # -----------------------------------------------------------------------------
-# Config models (support BOTH your current file-cred style and Vault dynamic/static)
+# Config models
 # -----------------------------------------------------------------------------
 
 class VaultK8sAuth(BaseModel):
@@ -39,8 +40,6 @@ class VaultAppRoleAuth(BaseModel):
 
 
 class VaultDatabaseCfg(BaseModel):
-    # mode = "dynamic" -> GET <mount>/creds/<role>         (has lease)
-    # mode = "static"  -> GET <mount>/static-creds/<role>   (no lease; refetch on cadence)
     mount: str = "database"
     role: str
     mode: Literal["dynamic", "static"] = "dynamic"
@@ -56,25 +55,20 @@ class VaultSpec(BaseModel):
 class YugabyteSpec(BaseModel):
     host: str
     port: int = 5433
-    # Accept either "dbname" or "database"
     dbname: Optional[str] = None
     database: Optional[str] = None
-    # External key is "schema"; internally use db_schema to avoid pydantic warnings
     db_schema: Optional[str] = Field(
         default=None,
         validation_alias="schema",
         serialization_alias="schema",
     )
     sslmode: str = "prefer"
-    # Optional plaintext creds
     username: Optional[str] = None
     password: Optional[str] = None
-    # Optional file-based creds (your manifest)
     usernameFile: Optional[str] = None
     passwordFile: Optional[str] = None
     options: Dict[str, Any] = Field(default_factory=dict)
 
-    # allow population by alias and preserve alias on dumps
     model_config = ConfigDict(populate_by_name=True)
 
     def normalized_dbname(self) -> str:
@@ -82,7 +76,6 @@ class YugabyteSpec(BaseModel):
 
 
 class InitSpec(BaseModel):
-    # External key is "schema"; internally use target_schema to avoid pydantic warnings
     target_schema: Optional[str] = Field(
         default=None,
         validation_alias="schema",
@@ -115,39 +108,11 @@ class SyncJobSpec(BaseModel):
 
 class SyncSpec(BaseModel):
     jobs: List[SyncJobSpec] = Field(default_factory=list)
-    # Compatibility with your manifest (simple switch):
     enabled: Optional[bool] = None
     interval_seconds: Optional[int] = None
 
 
 class YugabyteDriverConfig(BaseModel):
-    """
-    Flexible config wrapper. Accepts either:
-
-    A) Your current style (as in the ConfigMap):
-       {
-         "yugabyte": {"host": "...", "port": 5433, "database": "mcp",
-                      "schema": "mcp_openapi_ro", "sslmode": "...",
-                      "usernameFile": "/vault/secrets/yb-username",
-                      "passwordFile": "/vault/secrets/yb-password",
-                      "options": {...}},
-         "pool": {"min": 1, "max": 8, "statementTimeoutMs": 60000},
-         "bootstrap": {"create_schema": true},    # mapped to init.createIfMissing
-         "sync": {"enabled": true, "interval_seconds": 15}
-       }
-
-    B) Vault dynamic or static credentials:
-       {
-         "vault": {
-           "address": "http://vault:8200",
-           "auth": {...},
-           "database": {"mount":"yugabyte-db","role":"mcp-yb-ro","mode":"static","renewBefore":120}
-         },
-         "yugabyte": {"host": "...", "port": 5433, "dbname": "mcp", "schema": "mcp_openapi_ro"},
-         "pool": {...},
-         "sync": {...}
-       }
-    """
     apiVersion: str = "mcp.openapi/v1alpha1"
     kind: str = "YugabyteDriverConfig"
     metadata: Dict[str, Any] = Field(default_factory=dict)
@@ -155,7 +120,6 @@ class YugabyteDriverConfig(BaseModel):
 
     def normalize(self) -> Dict[str, Any]:
         s = self.spec or {}
-        # Yugabyte block (required)
         if "yugabyte" not in s:
             raise ValueError("spec.yugabyte is required")
 
@@ -163,18 +127,16 @@ class YugabyteDriverConfig(BaseModel):
         pool = PoolSpec.model_validate(s.get("pool", {}))
         cache = CacheSpec.model_validate(s.get("cache", {}))
 
-        # Map your 'bootstrap' section if present
         init_in = s.get("init", {})
         if not init_in and "bootstrap" in s:
             b = s.get("bootstrap") or {}
             init_in = {
-                "schema": y.db_schema,  # keep external key name
+                "schema": y.db_schema,
                 "createIfMissing": bool(b.get("create_schema", True)),
                 "ddl": [],
             }
         init = InitSpec.model_validate(init_in)
 
-        # Sync: accept either detailed jobs, or simple enabled/interval_seconds
         sync = SyncSpec.model_validate(s.get("sync", {}))
 
         out: Dict[str, Any] = {
@@ -182,7 +144,7 @@ class YugabyteDriverConfig(BaseModel):
                 "host": y.host,
                 "port": y.port,
                 "dbname": y.normalized_dbname(),
-                "schema": y.db_schema,  # keep external key name
+                "schema": y.db_schema,
                 "sslmode": y.sslmode,
                 "username": y.username,
                 "password": y.password,
@@ -192,14 +154,12 @@ class YugabyteDriverConfig(BaseModel):
             },
             "pool": pool.model_dump(),
             "cache": cache.model_dump(),
-            "init": init.model_dump(by_alias=True),  # ensure "schema" key is emitted
+            "init": init.model_dump(by_alias=True),
             "sync": sync.model_dump(),
         }
 
-        # Optional Vault config (dynamic or static creds)
         if "vault" in s and s["vault"]:
             v = VaultSpec.model_validate(s["vault"]).model_dump()
-            # allow env override for address if present
             v["address"] = os.getenv("VAULT_ADDR", v["address"]).rstrip("/")
             out["vault"] = v
 
@@ -234,6 +194,11 @@ class DriverImpl(Driver):
         self._creds_mode: str = "static"  # "static" | "file" | "vault"
         self._file_creds_fingerprint: Optional[Tuple[str, str]] = None
 
+        # job starter state
+        self._jobs_watchers_started: bool = False
+        self._started_jobs: set[str] = set()
+        self._jobs_started_event: asyncio.Event = asyncio.Event()
+
     # ---------- helpers ----------
 
     def _default_schema(self) -> str:
@@ -256,18 +221,15 @@ class DriverImpl(Driver):
     # ---------- lifecycle ----------
 
     async def load(self, config: Dict[str, Any], cache: CacheAPI) -> None:
-        # 1) Normalize config (accept both formats)
+        # 1) Normalize config
         try:
             if "spec" in config:
                 self.cfg = YugabyteDriverConfig.model_validate(config).normalize()
             else:
-                # direct dict config (already normalized or your v1 style)
                 yg = config.get("yugabyte") or {}
-                # ensure dbname present
                 if "dbname" not in yg and "database" in yg:
                     yg = {**yg, "dbname": yg["database"]}
                 config["yugabyte"] = yg
-                # bridge bootstrap → init if needed
                 if "init" not in config and "bootstrap" in config:
                     b = config.get("bootstrap") or {}
                     config["init"] = {
@@ -275,7 +237,6 @@ class DriverImpl(Driver):
                         "createIfMissing": bool(b.get("create_schema", True)),
                         "ddl": [],
                     }
-                # fill missing blocks with defaults
                 config.setdefault("pool", {})
                 config.setdefault("cache", {})
                 config.setdefault("sync", {})
@@ -284,9 +245,7 @@ class DriverImpl(Driver):
                     kind="YugabyteDriverConfig",
                     spec=config
                 ).normalize()
-        except ValidationError as e:
-            raise RuntimeError(f"Yugabyte driver config invalid: {e}") from e
-        except ValueError as e:
+        except (ValidationError, ValueError) as e:
             raise RuntimeError(f"Yugabyte driver config invalid: {e}") from e
 
         # 2) Decide credentials mode
@@ -298,21 +257,25 @@ class DriverImpl(Driver):
         elif y.get("username") or y.get("password"):
             self._creds_mode = "static"
         else:
-            # Fall back to file paths commonly used in your Deployment (Vault agent-injected files)
             self._creds_mode = "file"
             y.setdefault("usernameFile", "/vault/secrets/yb-username")
             y.setdefault("passwordFile", "/vault/secrets/yb-password")
 
-        # 3) Ensure defaults
+        # 3) Ensure defaults and save cache
         self.cfg.setdefault("init", {})
         self.cfg["init"].setdefault("schema", self._default_schema())
-        # Save cache
         self.cache = cache
 
-        # 4) Pool + bootstrap + sync
+        # 4) Pool + bootstrap + start jobs (non-blocking)
         await self._ensure_pool()
         await self._ensure_schema()
         await self._start_sync_jobs()
+
+        print(
+            f"[driver:yugabyte] loaded instance='{self._instance_id}' "
+            f"db='{y['dbname']}' schema='{self._schema()}' mode='{self._creds_mode}'",
+            flush=True
+        )
 
     async def describe(self) -> Dict[str, Any]:
         return {
@@ -380,7 +343,7 @@ class DriverImpl(Driver):
             except Exception:
                 pass
 
-    # ---------- small cache helper ----------
+    # ---------- cache helpers ----------
 
     def _cache_set(self, key: str, value: Any, ttl: Optional[int] = None) -> None:
         assert self.cache is not None
@@ -442,7 +405,7 @@ class DriverImpl(Driver):
 
     def _vault_headers(self) -> Dict[str, str]:
         if not self._vault_token:
-            raise RuntimeError("Vault token missing (try checking Kubernetes auth role/policy)")
+            raise RuntimeError("Vault token missing (check Kubernetes/AppRole auth)")
         return {"X-Vault-Token": self._vault_token}
 
     async def _ensure_vault_token(self) -> None:
@@ -469,19 +432,16 @@ class DriverImpl(Driver):
         self._db_username = data["data"]["username"]
         self._db_password = data["data"]["password"]
 
-        # Lease semantics
         if mode == "dynamic":
             self._db_lease_id = data.get("lease_id")
             ldur = int(data.get("lease_duration", 3600))
             self._db_lease_exp = time.time() + max(60, ldur - 30)
         else:
-            # static-creds do not have a lease; just refetch on a cadence
             self._db_lease_id = None
             renew_before = int(db.get("renewBefore", 120))
             self._db_lease_exp = time.time() + max(60, renew_before)
 
     async def _renew_lease(self) -> bool:
-        # Only makes sense for dynamic creds; for static we always refetch
         if self._vault_db_mode() != "dynamic" or not self._db_lease_id:
             return False
         await self._ensure_vault_token()
@@ -513,7 +473,6 @@ class DriverImpl(Driver):
             "password": pwd,
             **opts,
         }
-        # psycopg DSN: key=value pairs (escaping simple)
         parts = [f"{k}={json.dumps(str(v))[1:-1]}" for k, v in params.items() if v is not None]
         return " ".join(parts)
 
@@ -522,7 +481,6 @@ class DriverImpl(Driver):
             need_new = False
             now = time.time()
 
-            # --- resolve credentials (unchanged) ---
             if self._creds_mode == "vault":
                 db_mode = self._vault_db_mode()
                 renew_before = int(self.cfg["vault"]["database"].get("renewBefore", 120))
@@ -552,45 +510,62 @@ class DriverImpl(Driver):
                     self._db_username, self._db_password = u, p
                     need_new = True
 
-            # also recreate if pool missing or closed
             if not self._pool or getattr(self._pool, "closed", False):
                 need_new = True
 
             if need_new:
-                # Build new pool first
                 dsn = self._dsn(self._db_username, self._db_password)  # type: ignore
                 p = self.cfg.get("pool", {})
-                kwargs = {"options": f"-c statement_timeout={int(p.get('statementTimeoutMs', 60000))} -c search_path={self._schema()}"}
+                kwargs = {
+                    "options": f"-c statement_timeout={int(p.get('statementTimeoutMs', 60000))} "
+                               f"-c search_path={self._schema()}"
+                }
                 new_pool = AsyncConnectionPool(
                     conninfo=dsn,
                     min_size=int(p.get("min", 1)),
                     max_size=int(p.get("max", 5)),
-                    max_idle=int(p.get("maxIdle", 300)),           # optional hardening
-                    timeout=int(p.get("acquireTimeout", 30)),      # optional hardening
+                    max_idle=int(p.get("maxIdle", 300)),
+                    timeout=int(p.get("acquireTimeout", 30)),
                     kwargs=kwargs,
                     open=False,
                 )
                 await new_pool.open()
 
-                # Swap atomically
+                # probe once (quietly)
+                try:
+                    async with new_pool.connection() as c:
+                        async with c.cursor() as cur:
+                            await cur.execute("SELECT 1;")
+                            await cur.fetchone()
+                except Exception as e:
+                    # Close the bad pool and re-raise
+                    with contextlib.suppress(Exception):
+                        await new_pool.close()
+                    raise
+
                 old_pool = self._pool
                 self._pool = new_pool
 
-                # Close old pool after a grace period so in-flight jobs finish
+                print(
+                    f"[driver:yugabyte] opened pool db='{self.cfg['yugabyte']['dbname']}' "
+                    f"schema='{self._schema()}' min={p.get('min',1)} max={p.get('max',5)}",
+                    flush=True
+                )
+
                 if old_pool and not getattr(old_pool, "closed", False):
                     async def _close_later(pool):
                         try:
                             await asyncio.sleep(int(p.get("closeGraceSeconds", 5)))
                         finally:
-                            # best-effort close
                             try:
                                 await pool.close()
+                                print("[driver:yugabyte] closed old pool", flush=True)
                             except Exception:
                                 pass
                     asyncio.create_task(_close_later(old_pool))
 
     # -----------------------------------------------------------------------------
-    # Schema bootstrap (lightweight; your app-level migrator does the heavy lifting)
+    # Schema bootstrap
     # -----------------------------------------------------------------------------
 
     async def _ensure_schema(self) -> None:
@@ -622,35 +597,30 @@ class DriverImpl(Driver):
                 async with aconn.cursor() as cur:
                     for stmt in ddl:
                         await cur.execute(stmt)
-                        
-    # key formatting
+        print(f"[driver:yugabyte] ensured schema '{schema}' base tables", flush=True)
+
+    # -----------------------------------------------------------------------------
+    # Key formatting for cache
+    # -----------------------------------------------------------------------------
+
     @staticmethod
     def make_ns_key(instance_id: str, job_name: str, schema_ver: str = "v1"):
-    # e.g., "mcp-openapi:{instance}:{dsn}:{schema}:{job}"
+        # e.g., "mcp_cache:{instance}:{schema_ver}:{job}"
         return f"mcp_cache:{instance_id}:{schema_ver}:{job_name}"
-    
-    
+
     # -----------------------------------------------------------------------------
-    # Helper functions
+    # Table wait helpers
     # -----------------------------------------------------------------------------
-    
+
     async def _table_exists(self, fqname: str) -> bool:
-        """
-        Returns True if `schema.table` exists. `fqname` should be 'schema.table' or just 'table'
-        if your search_path is set appropriately.
-        """
         pool = await self._ensure_pool()
-        async with pool.connection() as aconn:
+        async with pool.connection() as aconn:  # type: ignore[arg-type]
             async with aconn.cursor() as cur:
-                # to_regclass returns regclass or NULL
                 await cur.execute("SELECT to_regclass(%s) IS NOT NULL", (fqname,))
                 row = await cur.fetchone()
                 return bool(row and row[0])
 
     async def _wait_until_table(self, schema: str, table: str, timeout_s: int = 300, poll_s: int = 2) -> None:
-        """
-        Waits until schema.table exists. timeout_s <= 0 means wait forever.
-        """
         fq = f"{schema}.{table}" if schema else table
         deadline = None if timeout_s <= 0 else (time.time() + timeout_s)
         while True:
@@ -658,92 +628,66 @@ class DriverImpl(Driver):
                 if await self._table_exists(fq):
                     return
             except Exception:
-                # ignore transient pool/connection errors; loop again
                 pass
             if deadline and time.time() >= deadline:
                 raise TimeoutError(f"Table not found before timeout: {fq}")
             await asyncio.sleep(max(1, poll_s))
 
-    async def _spawn_job_when_ready(self, job: "SyncJobSpec", schema: str, table: str, timeout_s: int) -> None:
-        """
-        Waits for the table, logs a single timeout error if it takes too long,
-        then starts the job as soon as the table appears.
-        """
-        try:
-            await self._wait_until_table(schema, table, timeout_s=timeout_s)
-        except TimeoutError as e:
-            # Record once so you can see why it hasn't started yet
-            self._cache_set(
-                f"job:{job.name}:error",
-                {"error": str(e), "ts": time.time()},
-                ttl=job.ttlSeconds or 300
-            )
-            # Keep waiting indefinitely in the background
-            await self._wait_until_table(schema, table, timeout_s=0)
-
-        # Table exists now — start the job
-        self._tasks.append(asyncio.create_task(self._run_job(job)))
-
     # -----------------------------------------------------------------------------
     # Sync jobs Yugabyte -> Cache
     # -----------------------------------------------------------------------------
 
-    # helpers (keep yours)
-    # - self._wait_until_table(schema, table, timeout_s)
-    # - self._run_job(job)
-    # - self._cache_set(ns_key, ...)
-
     async def _start_sync_jobs(self) -> None:
         spec = self.cfg.get("sync", {}) or {}
         if spec.get("enabled", None) is False:
+            print("[driver:yugabyte] sync disabled by config", flush=True)
             return
 
         # avoid double-start if this gets called again
-        if getattr(self, "_jobs_watchers_started", False):
+        if self._jobs_watchers_started:
             return
-        self._jobs_watchers_started = True  # type: ignore[attr-defined]
+        self._jobs_watchers_started = True
 
         interval     = int(spec.get("interval_seconds") or 60)
         ttl          = int(self.cfg.get("cache", {}).get("ttlSeconds", 600))
         schema_ver   = "v1"
         schema       = (self._schema() or "public")
-        wait_timeout = int(spec.get("waitTableTimeoutSeconds", 120))  # per-attempt limit; we will retry silently
+        wait_timeout = int(spec.get("waitTableTimeoutSeconds", 120))  # per-attempt; we retry quietly
 
         defs = [
             ("augmentations_base", "mcp_openapi_augmentations",
-            "SELECT id, path, method, summary, description, auth_required FROM mcp_openapi_augmentations"),
+             "SELECT id, path, method, summary, description, auth_required FROM mcp_openapi_augmentations"),
             ("usage_hints", "mcp_openapi_usage_hints",
-            "SELECT augmentation_id, hint FROM mcp_openapi_usage_hints"),
+             "SELECT augmentation_id, hint FROM mcp_openapi_usage_hints"),
             ("param_hints", "mcp_openapi_param_hints",
-            "SELECT augmentation_id, name, data_type, allowed_values, example_value, default_value, description FROM mcp_openapi_param_hints"),
+             "SELECT augmentation_id, name, data_type, allowed_values, example_value, default_value, description FROM mcp_openapi_param_hints"),
             ("examples", "mcp_openapi_examples",
-            "SELECT augmentation_id, example_index, user_prompt, args_json FROM mcp_openapi_examples"),
+             "SELECT augmentation_id, example_index, user_prompt, args_json FROM mcp_openapi_examples"),
         ]
 
-        if not hasattr(self, "_started_jobs"):
-            self._started_jobs = set()                      # type: ignore[attr-defined]
-        if not hasattr(self, "_jobs_started_event"):
-            self._jobs_started_event = asyncio.Event()      # type: ignore[attr-defined]
-        total = len(defs)
+        print(f"[driver:yugabyte] starting {len(defs)} sync job watcher(s); interval={interval}s ttl={ttl}s", flush=True)
 
         async def _spawn_job_when_ready(job: "SyncJobSpec", schema: str, table: str, timeout_s: int) -> None:
-            # Quiet infinite retry: keep re-running the bounded waiter until success
+            table_fq = f"{schema}.{table}" if schema else table
+            print(f"[job:{job.name}] waiting for table '{table_fq}'...", flush=True)
+
+            # quiet infinite retry loop
             while True:
                 try:
                     await self._wait_until_table(schema, table, timeout_s=timeout_s)
-                    break  # table exists
+                    break
                 except TimeoutError:
-                    # no logging; brief pause avoids a tight loop
                     await asyncio.sleep(1)
 
-            if job.name not in self._started_jobs:          # type: ignore[attr-defined]
+            if job.name not in self._started_jobs:
                 task = asyncio.create_task(self._run_job(job))
                 self._tasks.append(task)
-                self._started_jobs.add(job.name)            # type: ignore[attr-defined]
-                if len(self._started_jobs) >= total:        # type: ignore[attr-defined]
-                    self._jobs_started_event.set()          # type: ignore[attr-defined]
+                self._started_jobs.add(job.name)
+                print(f"[job:{job.name}] table ready, job started; key='{job.key}'", flush=True)
+                if len(self._started_jobs) == len(defs):
+                    self._jobs_started_event.set()
+                    print("[driver:yugabyte] all sync jobs started", flush=True)
 
-        # launch watchers and return immediately
         for name, table, query in defs:
             job = SyncJobSpec(
                 name=name,
@@ -756,25 +700,18 @@ class DriverImpl(Driver):
             asyncio.create_task(_spawn_job_when_ready(job, schema, table, wait_timeout))
 
     async def wait_until_jobs_started(self, timeout_s: Optional[int] = None) -> bool:
-        """
-        If timeout_s is set, quietly retry waits until all jobs started.
-        Returns True only when the event is set.
-        """
         if timeout_s in (None, 0):
-            await self._jobs_started_event.wait()           # type: ignore[attr-defined]
+            await self._jobs_started_event.wait()
             return True
-
-        # quiet infinite retry on timeout
         while True:
             try:
-                await asyncio.wait_for(self._jobs_started_event.wait(), timeout_s)  # type: ignore[attr-defined]
+                await asyncio.wait_for(self._jobs_started_event.wait(), timeout_s)
                 return True
             except asyncio.TimeoutError:
-                # no logs; retry the wait
+                # silent retry
                 continue
 
     async def _fetch_all(self, cur) -> List[Tuple]:
-        # psycopg async cursor: use fetchall
         return await cur.fetchall()
 
     async def _run_job(self, job: SyncJobSpec) -> None:
@@ -796,7 +733,7 @@ class DriverImpl(Driver):
                                     d[k] = v if isinstance(v, (dict, list)) else json.loads(v)
                                 except Exception:
                                     d[k] = v
-                            payload = d
+                            payload: Any = d
 
                         elif job.mode == "list":
                             payload = [r[0] for r in rows]
@@ -809,14 +746,21 @@ class DriverImpl(Driver):
                                 payload = [list(r) for r in rows]
 
                         self._cache_set(job.key, payload, ttl=job.ttlSeconds)
+                        try:
+                            n = len(payload)  # type: ignore[arg-type]
+                        except Exception:
+                            n = None
+                        print(f"[job:{job.name}] cached payload -> key='{job.key}' rows={n}", flush=True)
+
             except asyncio.CancelledError:
+                print(f"[job:{job.name}] cancelled", flush=True)
                 break
+
             except Exception as e:
                 name = type(e).__name__
                 if name in {"PoolClosed", "PoolClosedError"}:
-                    # force fresh pool next tick
                     self._pool = None
-                self._cache_set(f"job:{job.name}:error",
-                                {"error": f"{name}: {e}", "ts": time.time()},
-                                ttl=job.ttlSeconds or 300)
+                # print to stdout instead of writing an error into Redis
+                print(f"[job:{job.name}] ERROR {name}: {e}", flush=True)
+
             await asyncio.sleep(max(5, job.intervalSeconds))
