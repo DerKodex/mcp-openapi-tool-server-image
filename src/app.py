@@ -1400,12 +1400,20 @@ def custom_openapi():
     # Merge augmentation data from Redis into each operation
     
     try:
-        cache = REGISTRY.cache
+        kv = REGISTRY.cache  # avoid shadowing
         for driver_name, d in REGISTRY.loaded.items():
-            base_rows = cache.get(driver_name, "augmentations_base") or []
-            usage_hints = cache.get(driver_name, "usage_hints") or []
-            param_hints = cache.get(driver_name, "param_hints") or []
-            examples = cache.get(driver_name, "examples") or []
+            def _k(job: str) -> str:
+                if hasattr(d.instance, "make_ns_key"):
+                    try:
+                        return d.instance.make_ns_key(REGISTRY.instance_id, job)  # schema_ver defaults to "v1"
+                    except Exception:
+                        pass
+                return job  # fallback to plain key
+
+            base_rows  = kv.get(driver_name, _k("augmentations_base")) or []
+            usage_hints = kv.get(driver_name, _k("usage_hints")) or []
+            param_hints = kv.get(driver_name, _k("param_hints")) or []
+            examples    = kv.get(driver_name, _k("examples")) or []
 
             # Group hints by augmentation_id for quick lookup
             hints_by_aug = {}
