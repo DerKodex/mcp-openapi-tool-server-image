@@ -698,11 +698,16 @@ class DriverImpl(Driver):
         if spec.get("enabled", None) is False:
             return
 
+        # avoid double-start if this gets called again
+        if getattr(self, "_jobs_watchers_started", False):
+            return
+        self._jobs_watchers_started = True  # type: ignore[attr-defined]
+
         interval     = int(spec.get("interval_seconds") or 60)
         ttl          = int(self.cfg.get("cache", {}).get("ttlSeconds", 600))
         schema_ver   = "v1"
         schema       = (self._schema() or "public")
-        wait_timeout = int(spec.get("waitTableTimeoutSeconds", 120))  # log once, then wait forever
+        wait_timeout = int(spec.get("waitTableTimeoutSeconds", 120))  # per-attempt limit; we will retry silently
 
         defs = [
             ("augmentations_base", "mcp_openapi_augmentations",
@@ -715,7 +720,6 @@ class DriverImpl(Driver):
             "SELECT augmentation_id, example_index, user_prompt, args_json FROM mcp_openapi_examples"),
         ]
 
-        # readiness state
         if not hasattr(self, "_started_jobs"):
             self._started_jobs = set()                      # type: ignore[attr-defined]
         if not hasattr(self, "_jobs_started_event"):
@@ -723,25 +727,23 @@ class DriverImpl(Driver):
         total = len(defs)
 
         async def _spawn_job_when_ready(job: "SyncJobSpec", schema: str, table: str, timeout_s: int) -> None:
-            try:
-                await self._wait_until_table(schema, table, timeout_s=timeout_s)
-            except TimeoutError as e:
-                self._cache_set(f"job:{job.name}:error",
-                                {"error": str(e), "ts": time.time()},
-                                ttl=job.ttlSeconds or 300)
-                # keep waiting quietly
-                await self._wait_until_table(schema, table, timeout_s=0)
+            # Quiet infinite retry: keep re-running the bounded waiter until success
+            while True:
+                try:
+                    await self._wait_until_table(schema, table, timeout_s=timeout_s)
+                    break  # table exists
+                except TimeoutError:
+                    # no logging; brief pause avoids a tight loop
+                    await asyncio.sleep(1)
 
-            # start once
             if job.name not in self._started_jobs:          # type: ignore[attr-defined]
                 task = asyncio.create_task(self._run_job(job))
                 self._tasks.append(task)
                 self._started_jobs.add(job.name)            # type: ignore[attr-defined]
-                # signal when all 4 have started
                 if len(self._started_jobs) >= total:        # type: ignore[attr-defined]
                     self._jobs_started_event.set()          # type: ignore[attr-defined]
 
-        # launch watchers and RETURN (don’t await here)
+        # launch watchers and return immediately
         for name, table, query in defs:
             job = SyncJobSpec(
                 name=name,
@@ -754,12 +756,22 @@ class DriverImpl(Driver):
             asyncio.create_task(_spawn_job_when_ready(job, schema, table, wait_timeout))
 
     async def wait_until_jobs_started(self, timeout_s: Optional[int] = None) -> bool:
-        """Optional: call this elsewhere if you *want* to block until all jobs started."""
-        try:
-            await asyncio.wait_for(self._jobs_started_event.wait(), timeout_s)  # type: ignore[attr-defined]
+        """
+        If timeout_s is set, quietly retry waits until all jobs started.
+        Returns True only when the event is set.
+        """
+        if timeout_s in (None, 0):
+            await self._jobs_started_event.wait()           # type: ignore[attr-defined]
             return True
-        except asyncio.TimeoutError:
-            return False
+
+        # quiet infinite retry on timeout
+        while True:
+            try:
+                await asyncio.wait_for(self._jobs_started_event.wait(), timeout_s)  # type: ignore[attr-defined]
+                return True
+            except asyncio.TimeoutError:
+                # no logs; retry the wait
+                continue
 
     async def _fetch_all(self, cur) -> List[Tuple]:
         # psycopg async cursor: use fetchall
