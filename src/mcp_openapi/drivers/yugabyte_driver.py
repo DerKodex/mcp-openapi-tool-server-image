@@ -605,10 +605,10 @@ class DriverImpl(Driver):
                         await cur.execute(stmt)
                         
     # key formatting
-                        
+    @staticmethod
     def make_ns_key(instance_id: str, dsn_fingerprint: str, job_name: str, schema_ver: str = "v1"):
     # e.g., "mcp-openapi:{instance}:{dsn}:{schema}:{job}"
-        return f"mcp-openapi:{instance_id}:{dsn_fingerprint}:{schema_ver}:{job_name}"
+        return f"mcp_cache:{instance_id}:{dsn_fingerprint}:{schema_ver}:{job_name}"
 
 
     # -----------------------------------------------------------------------------
