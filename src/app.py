@@ -36,10 +36,101 @@ import httpx
 from fastapi import Body, FastAPI, HTTPException, Path, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from mcp_openapi.manifest_loader import load_manifest
 from mcp_openapi.driver_loader import REGISTRY, RedisCache, InMemoryCache  # type: ignore
+
+
+## Advisory lock
+# --- Concurrency-safe migration wrapper for Yugabyte/Postgres -----------------
+# Ensures only one pod runs migrations at a time, with retries on transient DDL conflicts.
+
+def _patch_migrator_with_lock_and_retry():
+    import hashlib, random, time
+    import psycopg
+    from psycopg import errors as pg_errors
+
+    # Keep a reference to the original Migrator._run_migrations (used by run_on_startup)
+    if not hasattr(Migrator, "_original_run_migrations"):
+        Migrator._original_run_migrations = Migrator._run_migrations  # type: ignore[attr-defined]
+
+    def _should_retry(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        if isinstance(exc, pg_errors.SerializationFailure):
+            return True
+        needles = (
+            "could not serialize access",
+            "conflict with concurrently committed",
+            "catalog version mismatch",
+            "try again",
+        )
+        return any(n in msg for n in needles)
+
+    def _dsn_from_env() -> str:
+        host = os.environ.get("DB_HOST", "localhost")
+        port = os.environ.get("DB_PORT", "5432")
+        name = os.environ.get("DB_NAME", "postgres")
+        sslmode = os.environ.get("DB_SSLMODE", "prefer")
+        user = ""
+        pwd = ""
+        if os.environ.get("DB_USER_FILE"):
+            try:
+                user = open(os.environ["DB_USER_FILE"], "r").read().strip()
+            except Exception:
+                pass
+        if os.environ.get("DB_PASS_FILE"):
+            try:
+                pwd = open(os.environ["DB_PASS_FILE"], "r").read().strip()
+            except Exception:
+                pass
+        parts = [f"host={host}", f"port={port}", f"dbname={name}", f"sslmode={sslmode}"]
+        if user:
+            parts.append(f"user={user}")
+        if pwd:
+            parts.append(f"password={pwd}")
+        return " ".join(parts)
+
+    def _lock_key() -> int:
+        # Stable 31-bit key derived from connection identity
+        base = f"{os.environ.get('DB_HOST','')}:{os.environ.get('DB_PORT','')}:{os.environ.get('DB_NAME','')}"
+        h = hashlib.blake2b(base.encode("utf-8"), digest_size=8).hexdigest()
+        return int(h, 16) % (2**31)
+
+    def _run_with_lock_and_retry(self):  # type: ignore[no-redef]
+        dsn = _dsn_from_env()
+        key = _lock_key()
+        attempts = 0
+        delay = 0.5
+        max_attempts = 8
+
+        while True:
+            attempts += 1
+            try:
+                # Acquire a *database* advisory lock so only one pod migrates at a time
+                with psycopg.connect(dsn, autocommit=True) as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT pg_advisory_lock(%s);", (key,))
+                        try:
+                            # Run original migrator
+                            return self._original_run_migrations()
+                        finally:
+                            cur.execute("SELECT pg_advisory_unlock(%s);", (key,))
+
+            except Exception as e:
+                if not _should_retry(e) or attempts >= max_attempts:
+                    raise
+                # Exponential backoff with jitter
+                jitter = random.random() * 0.3
+                time.sleep(min(5.0, delay) + jitter)
+                delay *= 2
+
+    # Monkey-patch the Migrator to the safe version
+    Migrator._run_migrations = _run_with_lock_and_retry  # type: ignore[assignment]
+
+# Activate the patch immediately (before startup hook below invokes run_on_startup)
+_patch_migrator_with_lock_and_retry()
+
 
 # =============================================================================
 # Manifest: load once, make it the source of truth

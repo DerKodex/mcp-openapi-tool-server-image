@@ -48,7 +48,7 @@ class DbConfig(BaseModel):
     host: str
     port: int
     name: str
-    schema: str
+    db_schema: str = Field("public", alias="schema")
     sslmode: str
     usernameFile: Optional[str] = None
     passwordFile: Optional[str] = None
