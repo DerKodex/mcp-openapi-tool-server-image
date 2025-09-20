@@ -18,7 +18,6 @@ import asyncio
 import importlib
 import inspect
 import json
-from linecache import cache
 import os
 import re
 import stat
@@ -1235,7 +1234,7 @@ async def tool_try(tool: str, dryrun: Optional[bool] = Query(False)):
     return await tool_dispatch_get(server="mcp", tool_name=tool, dryrun=dryrun)
 
 # =============================================================================
-# OpenAPI augmentation (unchanged except for version and minor comments)
+# OpenAPI augmentation
 # =============================================================================
 
 def _inject_tool_operations(openapi_schema: Dict[str, Any]) -> None:
@@ -1398,7 +1397,7 @@ def custom_openapi():
     openapi_schema.update({**openapi_extra_blocks()})
     _inject_tool_operations(openapi_schema)
     # Merge augmentation data from Redis into each operation
-    
+
     try:
         kv = REGISTRY.cache  # avoid shadowing
         for driver_name, d in REGISTRY.loaded.items():
@@ -1410,7 +1409,7 @@ def custom_openapi():
                         pass
                 return job  # fallback to plain key
 
-            base_rows  = kv.get(driver_name, _k("augmentations_base")) or []
+            base_rows   = kv.get(driver_name, _k("augmentations_base")) or []
             usage_hints = kv.get(driver_name, _k("usage_hints")) or []
             param_hints = kv.get(driver_name, _k("param_hints")) or []
             examples    = kv.get(driver_name, _k("examples")) or []
@@ -1466,7 +1465,7 @@ def custom_openapi():
                     _deep_merge(op, ext)
     except Exception as e:
         print(f"[openapi] failed to apply augmentation data: {e}", file=sys.stderr)
-        
+
     try:
         REGISTRY.cache.set(cache_ns, cache_key, openapi_schema, ttl_seconds=ttl)
     except Exception as e:
@@ -1499,39 +1498,17 @@ async def initialize_app():
     # Start the periodic synchronization task
     asyncio.create_task(synchronize_data_to_redis())
 
-# In app.py, replace the existing synchronize_data_to_redis() stub with:
-
+# Periodic invalidation so /openapi.json picks up refreshed augmentation cache
 async def synchronize_data_to_redis() -> None:
-    """
-    Periodically synchronize data to Redis.
-
-    This function relies on each driver’s sync jobs (e.g. the Yugabyte driver)
-    to refresh their data in Redis.  After waiting for the configured interval,
-    it invalidates the cached OpenAPI document so that it will be rebuilt on
-    the next request.
-    """
-    # Pull the interval from the manifest (spec.redis.default_ttl_seconds or fallback)
-    # or use REDIS_SYNC_INTERVAL as a last resort.  This keeps configuration
-    # entirely in the manifest if desired.
     while True:
         try:
-            print("[sync] Synchronizing data to Redis...")
-
-            # Drivers' _run_job() coroutines are already running in the background
-            # (scheduled by the DriverRegistry), so we don't fetch data here.
-            # We simply wait for the interval and then invalidate the cached
-            # OpenAPI document so that any new augmentation data is picked up.
+            print("[sync] Synchronizing data to Redis...", flush=True)
             await asyncio.sleep(sync_interval)
-
-            # Invalidate the cached /openapi.json so it will be rebuilt.
             try:
                 REGISTRY.cache.delete(openapi_ns, "openapi_schema")
-                print(f"[sync] Cleared cached OpenAPI document in namespace {openapi_ns}")
+                print(f"[sync] Cleared cached OpenAPI document in namespace {openapi_ns}", flush=True)
             except Exception as e:
                 print(f"[sync] Failed to delete cache entry: {e}", file=sys.stderr)
-
         except Exception as e:
-            # Catch exceptions in the loop to prevent it from exiting silently.
             print(f"[sync] FAILED: {e}", file=sys.stderr)
             await asyncio.sleep(sync_interval)
-

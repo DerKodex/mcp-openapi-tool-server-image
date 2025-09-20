@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -15,7 +16,7 @@ from pydantic import BaseModel, Field, ValidationError, ConfigDict
 from mcp_openapi.driver_base import CacheAPI, Driver
 
 try:
-    import psycopg  # noqa: F401  # imported to ensure psycopg is present
+    import psycopg  # noqa: F401
     from psycopg_pool import AsyncConnectionPool
 except Exception as e:
     raise RuntimeError("psycopg[pool] is required for yugabyte_driver") from e
@@ -67,7 +68,7 @@ class YugabyteSpec(BaseModel):
     password: Optional[str] = None
     usernameFile: Optional[str] = None
     passwordFile: Optional[str] = None
-    options: Dict[str, Any] = Field(default_factory=dict)
+    options: Dict[str, Any] = Field(default_factory=list | dict if False else dict)  # keep dict
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -531,14 +532,13 @@ class DriverImpl(Driver):
                 )
                 await new_pool.open()
 
-                # probe once (quietly)
+                # probe once (quietly). If this fails, close the new pool and raise
                 try:
                     async with new_pool.connection() as c:
                         async with c.cursor() as cur:
                             await cur.execute("SELECT 1;")
                             await cur.fetchone()
-                except Exception as e:
-                    # Close the bad pool and re-raise
+                except Exception:
                     with contextlib.suppress(Exception):
                         await new_pool.close()
                     raise
@@ -613,8 +613,9 @@ class DriverImpl(Driver):
     # -----------------------------------------------------------------------------
 
     async def _table_exists(self, fqname: str) -> bool:
-        pool = await self._ensure_pool()
-        async with pool.connection() as aconn:  # type: ignore[arg-type]
+        await self._ensure_pool()
+        assert self._pool is not None
+        async with self._pool.connection() as aconn:
             async with aconn.cursor() as cur:
                 await cur.execute("SELECT to_regclass(%s) IS NOT NULL", (fqname,))
                 row = await cur.fetchone()
@@ -628,6 +629,7 @@ class DriverImpl(Driver):
                 if await self._table_exists(fq):
                     return
             except Exception:
+                # ignore transient errors
                 pass
             if deadline and time.time() >= deadline:
                 raise TimeoutError(f"Table not found before timeout: {fq}")
