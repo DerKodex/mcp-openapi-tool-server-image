@@ -522,7 +522,7 @@ class DriverImpl(Driver):
             need_new = False
             now = time.time()
 
-            # Resolve credentials for each mode
+            # --- resolve credentials (unchanged) ---
             if self._creds_mode == "vault":
                 db_mode = self._vault_db_mode()
                 renew_before = int(self.cfg["vault"]["database"].get("renewBefore", 120))
@@ -530,7 +530,6 @@ class DriverImpl(Driver):
                     await self._fetch_vault_db_creds()
                     need_new = True
                 elif (self._db_lease_exp - now) <= max(30, renew_before):
-                    # dynamic -> try renew; static -> force refetch
                     if db_mode == "dynamic":
                         if not await self._renew_lease():
                             await self._fetch_vault_db_creds()
@@ -553,22 +552,42 @@ class DriverImpl(Driver):
                     self._db_username, self._db_password = u, p
                     need_new = True
 
-            if need_new or not self._pool or self._pool.closed:
-                if self._pool and not self._pool.closed:
-                    await self._pool.close()
+            # also recreate if pool missing or closed
+            if not self._pool or getattr(self._pool, "closed", False):
+                need_new = True
 
+            if need_new:
+                # Build new pool first
                 dsn = self._dsn(self._db_username, self._db_password)  # type: ignore
-                p = self.cfg["pool"]
-                # Pool kwargs allow passing libpq options; apply statement_timeout
+                p = self.cfg.get("pool", {})
                 kwargs = {"options": f"-c statement_timeout={int(p.get('statementTimeoutMs', 60000))}"}
-                self._pool = AsyncConnectionPool(
+                new_pool = AsyncConnectionPool(
                     conninfo=dsn,
                     min_size=int(p.get("min", 1)),
                     max_size=int(p.get("max", 5)),
+                    max_idle=int(p.get("maxIdle", 300)),           # optional hardening
+                    timeout=int(p.get("acquireTimeout", 30)),      # optional hardening
                     kwargs=kwargs,
                     open=False,
                 )
-                await self._pool.open()
+                await new_pool.open()
+
+                # Swap atomically
+                old_pool = self._pool
+                self._pool = new_pool
+
+                # Close old pool after a grace period so in-flight jobs finish
+                if old_pool and not getattr(old_pool, "closed", False):
+                    async def _close_later(pool):
+                        try:
+                            await asyncio.sleep(int(p.get("closeGraceSeconds", 5)))
+                        finally:
+                            # best-effort close
+                            try:
+                                await pool.close()
+                            except Exception:
+                                pass
+                    asyncio.create_task(_close_later(old_pool))
 
     # -----------------------------------------------------------------------------
     # Schema bootstrap (lightweight; your app-level migrator does the heavy lifting)
@@ -717,9 +736,11 @@ class DriverImpl(Driver):
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                self._cache_set(
-                    f"job:{job.name}:error",
-                    {"error": f"{type(e).__name__}: {e}", "ts": time.time()},
-                    ttl=job.ttlSeconds or 300
-                )
+                name = type(e).__name__
+                if name in {"PoolClosed", "PoolClosedError"}:
+                    # force fresh pool next tick
+                    self._pool = None
+                self._cache_set(f"job:{job.name}:error",
+                                {"error": f"{name}: {e}", "ts": time.time()},
+                                ttl=job.ttlSeconds or 300)
             await asyncio.sleep(max(5, job.intervalSeconds))
