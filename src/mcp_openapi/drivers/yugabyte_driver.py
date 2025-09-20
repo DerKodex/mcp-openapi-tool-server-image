@@ -688,16 +688,21 @@ class DriverImpl(Driver):
     # Sync jobs Yugabyte -> Cache
     # -----------------------------------------------------------------------------
 
+    # helpers (keep yours)
+    # - self._wait_until_table(schema, table, timeout_s)
+    # - self._run_job(job)
+    # - self._cache_set(ns_key, ...)
+
     async def _start_sync_jobs(self) -> None:
         spec = self.cfg.get("sync", {}) or {}
         if spec.get("enabled", None) is False:
             return
 
-        interval    = int(spec.get("interval_seconds") or 60)
-        ttl         = int(self.cfg.get("cache", {}).get("ttlSeconds", 600))
-        schema_ver  = "v1"
-        schema      = (self._schema() or "public")
-        wait_timeout = int(spec.get("waitTableTimeoutSeconds", 120))   # log once, then wait indefinitely
+        interval     = int(spec.get("interval_seconds") or 60)
+        ttl          = int(self.cfg.get("cache", {}).get("ttlSeconds", 600))
+        schema_ver   = "v1"
+        schema       = (self._schema() or "public")
+        wait_timeout = int(spec.get("waitTableTimeoutSeconds", 120))  # log once, then wait forever
 
         defs = [
             ("augmentations_base", "mcp_openapi_augmentations",
@@ -710,28 +715,33 @@ class DriverImpl(Driver):
             "SELECT augmentation_id, example_index, user_prompt, args_json FROM mcp_openapi_examples"),
         ]
 
-        # ensure guard exists
+        # readiness state
         if not hasattr(self, "_started_jobs"):
-            self._started_jobs = set()  # type: ignore[attr-defined]
+            self._started_jobs = set()                      # type: ignore[attr-defined]
+        if not hasattr(self, "_jobs_started_event"):
+            self._jobs_started_event = asyncio.Event()      # type: ignore[attr-defined]
+        total = len(defs)
 
         async def _spawn_job_when_ready(job: "SyncJobSpec", schema: str, table: str, timeout_s: int) -> None:
-            # wait for table (timeout -> log once, then wait forever)
             try:
                 await self._wait_until_table(schema, table, timeout_s=timeout_s)
             except TimeoutError as e:
                 self._cache_set(f"job:{job.name}:error",
                                 {"error": str(e), "ts": time.time()},
                                 ttl=job.ttlSeconds or 300)
+                # keep waiting quietly
                 await self._wait_until_table(schema, table, timeout_s=0)
 
-            # start exactly once
-            if job.name not in self._started_jobs:  # type: ignore[attr-defined]
+            # start once
+            if job.name not in self._started_jobs:          # type: ignore[attr-defined]
                 task = asyncio.create_task(self._run_job(job))
                 self._tasks.append(task)
-                self._started_jobs.add(job.name)  # type: ignore[attr-defined]
+                self._started_jobs.add(job.name)            # type: ignore[attr-defined]
+                # signal when all 4 have started
+                if len(self._started_jobs) >= total:        # type: ignore[attr-defined]
+                    self._jobs_started_event.set()          # type: ignore[attr-defined]
 
-        # build the four jobs
-        starters = []
+        # launch watchers and RETURN (don’t await here)
         for name, table, query in defs:
             job = SyncJobSpec(
                 name=name,
@@ -741,11 +751,15 @@ class DriverImpl(Driver):
                 ttlSeconds=ttl,
                 query=query,
             )
-            # run all four waiters concurrently, but **block** until each has started its job
-            starters.append(_spawn_job_when_ready(job, schema, table, wait_timeout))
+            asyncio.create_task(_spawn_job_when_ready(job, schema, table, wait_timeout))
 
-        # ⬇️ This await makes the method run until *all 4* jobs have actually been started
-        await asyncio.gather(*starters)
+    async def wait_until_jobs_started(self, timeout_s: Optional[int] = None) -> bool:
+        """Optional: call this elsewhere if you *want* to block until all jobs started."""
+        try:
+            await asyncio.wait_for(self._jobs_started_event.wait(), timeout_s)  # type: ignore[attr-defined]
+            return True
+        except asyncio.TimeoutError:
+            return False
 
     async def _fetch_all(self, cur) -> List[Tuple]:
         # psycopg async cursor: use fetchall
