@@ -603,6 +603,13 @@ class DriverImpl(Driver):
                 async with aconn.cursor() as cur:
                     for stmt in ddl:
                         await cur.execute(stmt)
+                        
+    # key formatting
+                        
+    def make_ns_key(instance_id: str, dsn_fingerprint: str, job_name: str, schema_ver: str = "v1"):
+    # e.g., "mcp-openapi:{instance}:{dsn}:{schema}:{job}"
+        return f"mcp-openapi:{instance_id}:{dsn_fingerprint}:{schema_ver}:{job_name}"
+
 
     # -----------------------------------------------------------------------------
     # Sync jobs Yugabyte -> Cache
@@ -615,6 +622,8 @@ class DriverImpl(Driver):
         if not jobs and spec.get("enabled", None) is not False:
             interval = int(spec.get("interval_seconds") or 60)
             ttl = int(self.cfg.get("cache", {}).get("ttlSeconds", 600))
+            dsn_fp = re.sub(r"\s+", " ", self._dsn(self._db_username or "user", "****")).strip()  # type: ignore
+            schema_ver = "v1"
             schema = self._schema()
             
             # in yugabyte_driver._start_sync_jobs(), after computing interval and ttl
@@ -623,7 +632,7 @@ class DriverImpl(Driver):
 
             jobs.append(SyncJobSpec(
                 name="augmentations_base",
-                key="augmentations_base",
+                key=self.make_ns_key(self._instance_id, dsn_fp, "augmentations_base", schema_ver),
                 mode="rows",
                 intervalSeconds=interval,
                 ttlSeconds=ttl,
@@ -632,7 +641,7 @@ class DriverImpl(Driver):
 
             jobs.append(SyncJobSpec(
                 name="usage_hints",
-                key="usage_hints",
+                key=self.make_ns_key(self._instance_id, dsn_fp, "usage_hints", schema_ver),
                 mode="rows",
                 intervalSeconds=interval,
                 ttlSeconds=ttl,
@@ -641,7 +650,7 @@ class DriverImpl(Driver):
 
             jobs.append(SyncJobSpec(
                 name="param_hints",
-                key="param_hints",
+                key=self.make_ns_key(self._instance_id, dsn_fp, "param_hints", schema_ver),
                 mode="rows",
                 intervalSeconds=interval,
                 ttlSeconds=ttl,
@@ -654,7 +663,7 @@ class DriverImpl(Driver):
 
             jobs.append(SyncJobSpec(
                 name="examples",
-                key="examples",
+                key=self.make_ns_key(self._instance_id, dsn_fp, "examples", schema_ver),
                 mode="rows",
                 intervalSeconds=interval,
                 ttlSeconds=ttl,
