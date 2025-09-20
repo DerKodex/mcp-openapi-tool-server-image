@@ -560,7 +560,7 @@ class DriverImpl(Driver):
                 # Build new pool first
                 dsn = self._dsn(self._db_username, self._db_password)  # type: ignore
                 p = self.cfg.get("pool", {})
-                kwargs = {"options": f"-c statement_timeout={int(p.get('statementTimeoutMs', 60000))}"}
+                kwargs = {"options": f"-c statement_timeout={int(p.get('statementTimeoutMs', 60000))} -c search_path={self._schema()}"}
                 new_pool = AsyncConnectionPool(
                     conninfo=dsn,
                     min_size=int(p.get("min", 1)),
