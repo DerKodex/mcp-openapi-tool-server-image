@@ -628,7 +628,61 @@ class DriverImpl(Driver):
     def make_ns_key(instance_id: str, job_name: str, schema_ver: str = "v1"):
     # e.g., "mcp-openapi:{instance}:{dsn}:{schema}:{job}"
         return f"mcp_cache:{instance_id}:{schema_ver}:{job_name}"
+    
+    
+    # -----------------------------------------------------------------------------
+    # Helper functions
+    # -----------------------------------------------------------------------------
+    
+    async def _table_exists(self, fqname: str) -> bool:
+        """
+        Returns True if `schema.table` exists. `fqname` should be 'schema.table' or just 'table'
+        if your search_path is set appropriately.
+        """
+        pool = await self._ensure_pool()
+        async with pool.connection() as aconn:
+            async with aconn.cursor() as cur:
+                # to_regclass returns regclass or NULL
+                await cur.execute("SELECT to_regclass(%s) IS NOT NULL", (fqname,))
+                row = await cur.fetchone()
+                return bool(row and row[0])
 
+    async def _wait_until_table(self, schema: str, table: str, timeout_s: int = 300, poll_s: int = 2) -> None:
+        """
+        Waits until schema.table exists. timeout_s <= 0 means wait forever.
+        """
+        fq = f"{schema}.{table}" if schema else table
+        deadline = None if timeout_s <= 0 else (time.time() + timeout_s)
+        while True:
+            try:
+                if await self._table_exists(fq):
+                    return
+            except Exception:
+                # ignore transient pool/connection errors; loop again
+                pass
+            if deadline and time.time() >= deadline:
+                raise TimeoutError(f"Table not found before timeout: {fq}")
+            await asyncio.sleep(max(1, poll_s))
+
+    async def _spawn_job_when_ready(self, job: "SyncJobSpec", schema: str, table: str, timeout_s: int) -> None:
+        """
+        Waits for the table, logs a single timeout error if it takes too long,
+        then starts the job as soon as the table appears.
+        """
+        try:
+            await self._wait_until_table(schema, table, timeout_s=timeout_s)
+        except TimeoutError as e:
+            # Record once so you can see why it hasn't started yet
+            self._cache_set(
+                f"job:{job.name}:error",
+                {"error": str(e), "ts": time.time()},
+                ttl=job.ttlSeconds or 300
+            )
+            # Keep waiting indefinitely in the background
+            await self._wait_until_table(schema, table, timeout_s=0)
+
+        # Table exists now — start the job
+        self._tasks.append(asyncio.create_task(self._run_job(job)))
 
     # -----------------------------------------------------------------------------
     # Sync jobs Yugabyte -> Cache
@@ -636,65 +690,38 @@ class DriverImpl(Driver):
 
     async def _start_sync_jobs(self) -> None:
         spec = self.cfg.get("sync", {}) or {}
-        jobs = list(spec.get("jobs") or [])
-        # If you used the simple flag in your manifest, create a default job
-        if not jobs and spec.get("enabled", None) is not False:
-            interval = int(spec.get("interval_seconds") or 60)
-            ttl = int(self.cfg.get("cache", {}).get("ttlSeconds", 600))
-            schema_ver = "v1"
-            schema = self._schema()
-            
-            # in yugabyte_driver._start_sync_jobs(), after computing interval and ttl
-            # remove or skip the old "augmentations" job
-            # add one job per table:
+        if spec.get("enabled", None) is False:
+            return
 
-            jobs.append(SyncJobSpec(
-                name="augmentations_base",
-                key=self.make_ns_key(self._instance_id, "augmentations_base", schema_ver),
+        interval = int(spec.get("interval_seconds") or 60)
+        ttl = int(self.cfg.get("cache", {}).get("ttlSeconds", 600))
+        schema_ver = "v1"
+        schema = self._schema() or "public"
+        # how long we’re willing to wait before logging a “still waiting” error
+        wait_timeout = int(spec.get("waitTableTimeoutSeconds", 120))
+
+        defs = [
+            ("augmentations_base", "mcp_openapi_augmentations",
+            "SELECT id, path, method, summary, description, auth_required FROM mcp_openapi_augmentations"),
+            ("usage_hints", "mcp_openapi_usage_hints",
+            "SELECT augmentation_id, hint FROM mcp_openapi_usage_hints"),
+            ("param_hints", "mcp_openapi_param_hints",
+            "SELECT augmentation_id, name, data_type, allowed_values, example_value, default_value, description FROM mcp_openapi_param_hints"),
+            ("examples", "mcp_openapi_examples",
+            "SELECT augmentation_id, example_index, user_prompt, args_json FROM mcp_openapi_examples"),
+        ]
+
+        for name, table, query in defs:
+            job = SyncJobSpec(
+                name=name,
+                key=self.make_ns_key(self._instance_id, name, schema_ver),
                 mode="rows",
                 intervalSeconds=interval,
                 ttlSeconds=ttl,
-                query="SELECT id, path, method, summary, description, auth_required FROM mcp_openapi_augmentations",
-            ).model_dump())
-
-            jobs.append(SyncJobSpec(
-                name="usage_hints",
-                key=self.make_ns_key(self._instance_id, "usage_hints", schema_ver),
-                mode="rows",
-                intervalSeconds=interval,
-                ttlSeconds=ttl,
-                query="SELECT augmentation_id, hint FROM mcp_openapi_usage_hints",
-            ).model_dump())
-
-            jobs.append(SyncJobSpec(
-                name="param_hints",
-                key=self.make_ns_key(self._instance_id, "param_hints", schema_ver),
-                mode="rows",
-                intervalSeconds=interval,
-                ttlSeconds=ttl,
-                query=(
-                    "SELECT augmentation_id, name, data_type, allowed_values, "
-                    "example_value, default_value, description "
-                    "FROM mcp_openapi_param_hints"
-                ),
-            ).model_dump())
-
-            jobs.append(SyncJobSpec(
-                name="examples",
-                key=self.make_ns_key(self._instance_id, "examples", schema_ver),
-                mode="rows",
-                intervalSeconds=interval,
-                ttlSeconds=ttl,
-                query=(
-                    "SELECT augmentation_id, example_index, user_prompt, args_json "
-                    "FROM mcp_openapi_examples"
-                ),
-            ).model_dump())
-
-        for j in jobs:
-            if not isinstance(j, SyncJobSpec):
-                j = SyncJobSpec(**j)
-            self._tasks.append(asyncio.create_task(self._run_job(j)))
+                query=query,
+            )
+            # Wait per table, then start the job when ready
+            asyncio.create_task(self._spawn_job_when_ready(job, schema, table, timeout_s=wait_timeout))
 
     async def _fetch_all(self, cur) -> List[Tuple]:
         # psycopg async cursor: use fetchall
