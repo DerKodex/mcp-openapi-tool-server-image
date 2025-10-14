@@ -9,7 +9,8 @@ CREATE TABLE mcp_openapi_augmentations (
 
 CREATE TABLE mcp_openapi_usage_hints (
   augmentation_id INTEGER NOT NULL REFERENCES mcp_openapi_augmentations(id) ON DELETE CASCADE,
-  hint            TEXT NOT NULL
+  hint            TEXT NOT NULL,
+  id              SERIAL PRIMARY KEY
 );
 
 CREATE TABLE mcp_openapi_param_hints (
